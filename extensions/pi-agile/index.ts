@@ -282,11 +282,12 @@ You make ALL decisions. Extension only runs tools and persists data.`;
   // Tool: agile_discover — run discovery, return raw output
   pi.registerTool({
     name: "agile_discover",
+    label: "agile_discover",
     description: "Run codebase discovery (linters, coverage, TODOs, security). Returns raw output for the agent to analyze and decide which findings become tasks.",
-    params: Type.Object({
+    parameters: Type.Object({
       scope: Type.Optional(Type.Array(Type.String(), { description: "Glob patterns to scan. Defaults to project scope." })),
     }),
-    handler: async (params, ctx) => {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const workDir = ctx.cwd;
       const project = loadProjectConfig(workDir);
       const scope = (params.scope as string[]) ?? extractScope(project);
@@ -304,11 +305,12 @@ You make ALL decisions. Extension only runs tools and persists data.`;
   // Tool: agile_start_sprint — initialize a new sprint
   pi.registerTool({
     name: "agile_start_sprint",
+    label: "agile_start_sprint",
     description: "Initialize a new sprint. Call after creating tasks in bd. Returns sprint state.",
-    params: Type.Object({
+    parameters: Type.Object({
       task_ids: Type.Array(Type.String(), { description: "bd task IDs included in this sprint" }),
     }),
-    handler: async (params, ctx) => {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const workDir = ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
       const project = loadProjectConfig(workDir);
@@ -337,13 +339,14 @@ You make ALL decisions. Extension only runs tools and persists data.`;
   // Tool: agile_delegate_task — delegate worker + reviewer for one task
   pi.registerTool({
     name: "agile_delegate_task",
+    label: "agile_delegate_task",
     description: "Delegate a single task to a worker subagent (implements on feature branch), then a reviewer subagent (reviews diff). Returns review verdict. Requires pi-subagents RPC bridge.",
-    params: Type.Object({
+    parameters: Type.Object({
       bd_id: Type.String({ description: "bd task ID" }),
       title: Type.String({ description: "Task title" }),
       description: Type.Optional(Type.String({ description: "Task description from bd" })),
     }),
-    handler: async (params, ctx) => {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const workDir = ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
       const project = loadProjectConfig(workDir);
@@ -545,11 +548,12 @@ ${workerSummary.slice(0, 1000)}`;
   // Tool: agile_merge_task — merge approved task branch to main
   pi.registerTool({
     name: "agile_merge_task",
+    label: "agile_merge_task",
     description: "Merge an approved task's feature branch to main (squash merge). Run main checks (lint + test). Call only after agile_delegate_task returns 'approved'.",
-    params: Type.Object({
+    parameters: Type.Object({
       bd_id: Type.String({ description: "bd task ID to merge" }),
     }),
-    handler: async (params, ctx) => {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const workDir = ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
       const bdId = params.bd_id as string;
@@ -608,9 +612,10 @@ ${workerSummary.slice(0, 1000)}`;
   // Tool: agile_retrospective — compute velocity, build stop-check message
   pi.registerTool({
     name: "agile_retrospective",
+    label: "agile_retrospective",
     description: "Complete current sprint: compute velocity, save sprint summary to knowledge, build stop-check message. Agent reads velocity and decides whether to stop or continue.",
-    params: Type.Object({}),
-    handler: async (_params, ctx) => {
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const workDir = ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
       const sprint = runtime.store.getCurrent();
@@ -667,8 +672,9 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
   // Tool: agile_knowledge — append/read knowledge entries
   pi.registerTool({
     name: "agile_knowledge",
+    label: "agile_knowledge",
     description: "Append a knowledge entry (lesson, dead_end, pattern) or read all entries. Used for cross-sprint memory.",
-    params: Type.Object({
+    parameters: Type.Object({
       action: Type.Union([Type.Literal("append"), Type.Literal("read")], { description: "append or read" }),
       type: Type.Optional(Type.Union([
         Type.Literal("lesson"), Type.Literal("dead_end"),
@@ -677,7 +683,7 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
       finding: Type.Optional(Type.String({ description: "Text content for append" })),
       do_not_retry: Type.Optional(Type.String({ description: "For dead_end: what not to retry" })),
     }),
-    handler: async (params, ctx) => {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const workDir = ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
       const action = params.action as string;
