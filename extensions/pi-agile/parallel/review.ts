@@ -161,12 +161,14 @@ ${constraints || "(none specified)"}
 ${deadEnds || "(none recorded yet)"}
 
 ## Instructions
-1. Implement the change on this feature branch.
-2. Follow existing code patterns.
-3. Add or update tests for all changed code.
-4. Ensure code passes linting and type-checking.
+1. Implement ONLY the change needed to satisfy the acceptance criteria.
+2. Follow existing code patterns and conventions.
+3. Add or update tests for ALL changed code.
+4. Verify your code works: run linting and tests before committing.
 5. Commit with conventional commit format (feat:, fix:, refactor:, test:, docs:).
 6. Do NOT merge to main — the orchestrator handles merge after review.
+7. Do NOT modify files outside the project scope.
+8. Keep changes minimal — no refactoring beyond what the task requires.
 
 ## Returns
 Return a summary of changes made: files modified, approach taken, lines of code.`;

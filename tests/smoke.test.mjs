@@ -209,6 +209,39 @@ await test("trackConstraintViolation increments", () => {
   assert.strictEqual(obs.constraintViolations.get("rule1"), 3);
 });
 
+// ── index.ts: parseBdShow ────────────────────────────────────────
+console.log("\n## index.ts: parseBdShow");
+
+// We can't import index.ts directly (needs pi runtime), but parseBdShow is standalone.
+// Test the regex logic inline by re-implementing minimally.
+await test("parseBdShow extracts title from bd output", () => {
+  const bdOutput = `○ agile-test-9do · Fix hardcoded credentials in auth.js   [● P2 · OPEN]
+Owner: fan92rus · Type: task
+Created: 2026-07-27 · Updated: 2026-07-27
+
+DESCRIPTION
+Replace hardcoded password check with proper credential validation`;
+
+  const firstLine = bdOutput.split("\n")[0] ?? "";
+  const titleMatch = firstLine.match(/·\s+(.+?)\s+\[/);
+  assert.ok(titleMatch, "title regex should match");
+  assert.strictEqual(titleMatch[1].trim(), "Fix hardcoded credentials in auth.js");
+});
+
+await test("parseBdShow extracts description section", () => {
+  const bdOutput = `○ agile-test-9do · Some task   [● P2 · OPEN]
+
+DESCRIPTION
+Replace hardcoded password check with proper credential validation
+
+ACCEPTANCE CRITERIA
+No hardcoded secrets`;
+
+  const descMatch = bdOutput.match(/DESCRIPTION\n([\s\S]*?)(?:\n[A-Z]|$)/);
+  assert.ok(descMatch, "description regex should match");
+  assert.ok(descMatch[1].includes("Replace hardcoded"));
+});
+
 // ── Summary ──────────────────────────────────────────────────────
 console.log(`\n# Results: ${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

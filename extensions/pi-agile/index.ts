@@ -185,6 +185,37 @@ async function gitMergeSquash(pi: ExtensionAPI, workDir: string, branch: string)
 }
 
 // ---------------------------------------------------------------------------
+/** Parse `bd show <id>` output to extract title, description, acceptance criteria. */
+function parseBdShow(output: string): { title?: string; description?: string; acceptanceCriteria?: string } {
+  // Example bd show output:
+  //   ○ agile-test-9do · Fix hardcoded credentials in auth.js   [● P2 · OPEN]
+  //   Owner: fan92rus · Type: task
+  //   Created: 2026-07-27 · Updated: 2026-07-27
+  //
+  //   DESCRIPTION
+  //   Replace hardcoded password check with proper credential validation
+  //
+  //   ACCEPTANCE CRITERIA
+  //   No hardcoded secrets
+
+  const result: { title?: string; description?: string; acceptanceCriteria?: string } = {};
+
+  // Title is on first line after · separator
+  const firstLine = output.split("\n")[0] ?? "";
+  const titleMatch = firstLine.match(/·\s+(.+?)\s+\[/);
+  if (titleMatch) result.title = titleMatch[1].trim();
+
+  // Description is after DESCRIPTION header
+  const descMatch = output.match(/DESCRIPTION\n([\s\S]*?)(?:\n\n\n|$|\n[A-Z])/);
+  if (descMatch) result.description = descMatch[1].trim();
+
+  // Acceptance criteria is after ACCEPTANCE CRITERIA header
+  const accMatch = output.match(/ACCEPTANCE CRITERIA\n([\s\S]*?)(?:\n\n\n|$|\n[A-Z])/);
+  if (accMatch) result.acceptanceCriteria = accMatch[1].trim();
+
+  return result;
+}
+
 // Extension runtime state
 // ---------------------------------------------------------------------------
 
@@ -227,6 +258,110 @@ const runtimeStore = new Map<string, AgileRuntime>();
 // Extension registration
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// System prompt — detailed workflow + bd CLI cheatsheet
+// ---------------------------------------------------------------------------
+
+const SYSTEM_PROMPT_WORKFLOW = `
+
+## bd CLI Task Tracker
+
+bd is the task tracker. Tasks ("beads") have IDs like \`abc-9do\`.
+
+### Creating tasks
+\`\`\`bash
+bd create "Title" -d "Description"                    # basic
+bd create "Title" -d "Description" --acceptance "Criteria"  # with acceptance criteria
+\`\`\`
+
+### Viewing tasks
+\`\`\`bash
+bd ready              # tasks ready to work on (no blockers)
+bd show <id>          # full task details
+bd list --status open # all open tasks
+\`\`\`
+
+### Claiming and completing
+\`\`\`bash
+bd update <id> --claim   # mark in_progress (done automatically by agile_delegate_task)
+bd close <id>            # close when done (done automatically by agile_merge_task)
+\`\`\`
+
+### Dependencies
+\`\`\`bash
+bd link <child-id> <parent-id>   # child blocks on parent (parent must finish first)
+bd children <id>                 # show child tasks
+\`\`\`
+
+### Priority
+\`\`\`bash
+bd priority <id> high    # set priority: high, medium, low
+\`\`\`
+
+## Workflow
+
+### Phase 1: Discovery
+1. Call \`agile_discover\` tool — returns raw lint/coverage/TODO/security output
+2. Read ALL output carefully
+3. Identify findings that are actionable tasks:
+   - Each TODO/FIXME is a potential task
+   - Each lint error is a potential task
+   - Group related issues into one task (don't create 10 tasks for 10 TODOs in one file)
+   - A task should be completable in <100 LOC change
+
+### Phase 2: Task Creation
+1. For each finding, create a task:
+   \`\`\`bash
+   bd create "Fix hardcoded credentials in auth.js" -d "Replace hardcoded password check with proper validation" --acceptance "No hardcoded secrets, credentials validated via config/env"
+   \`\`\`
+2. Write CLEAR descriptions — workers only see title + description + acceptance criteria
+3. Use dependencies when task B needs task A done first:
+   \`\`\`bash
+   bd link <task-b-id> <task-a-id>
+   \`\`\`
+4. Set priority on important tasks:
+   \`\`\`bash
+   bd priority <id> high
+   \`\`\`
+
+### Phase 3: Sprint Planning
+1. Run \`bd ready\` to see available tasks
+2. Select tasks for this sprint (respect max_tasks_per_sprint)
+3. Call \`agile_start_sprint\` with the task IDs
+4. The sprint is now active
+
+### Phase 4: Sprint Execution
+For each task in the sprint:
+1. Call \`agile_delegate_task\` with just the bd_id — the tool reads task details from bd
+2. The tool delegates a worker subagent (implements on feature branch) then a reviewer subagent
+3. Read the review verdict:
+   - **approved** → call \`agile_merge_task\` to merge to main
+   - **rework** → read action_items, call \`agile_delegate_task\` again for rework
+   - **blocked** → task is fundamentally flawed, move to next task
+4. Repeat until all tasks done/blocked
+
+### Phase 5: Retrospective
+1. Call \`agile_retrospective\` — returns velocity metrics + stop-check message
+2. Formulate lessons learned (what worked, what didn't)
+3. Record lessons:
+   \`\`\`bash
+   agile_knowledge(action="append", type="lesson", finding="Auth module uses custom error classes")
+   \`\`\`
+4. Read stop-check message
+5. Run stop criteria check commands yourself (via bash)
+6. Decide: stop (criteria met) or continue (start next sprint)
+
+## Key Rules
+
+1. **ONE task per agile_delegate_task call** — don't batch
+2. **Worker needs context** — write detailed descriptions in bd, workers only see title + description
+3. **Constraints are TEXT** — read them above, enforce by reasoning, reject violations
+4. **Git workflow** — feature branch per task (\`feat/<bd-id>\`), conventional commits only
+5. **Merge only after approved review** — never merge rework or blocked
+6. **Record dead-ends** — if a task is blocked, record WHY via agile_knowledge so future sprints avoid it
+
+You make ALL decisions. Extension only runs tools and persists data.`;
+
 export default function piAgileExtension(pi: ExtensionAPI): void {
 
   // Initialize RPC client for subagent delegation
@@ -259,18 +394,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     if (constraints) extra += `\n## Constraints (MUST follow)\n${constraints}\n`;
     if (knowledgeText) extra += `\n## Knowledge from Previous Sprints\n${knowledgeText}\n`;
 
-    extra += `\n## Workflow
-1. Call agile_discover to get discovery results (lint, coverage, security, TODOs)
-2. Read the raw output and decide which findings should become tasks
-3. Create tasks in bd: bd create "title" --description "description"
-4. Call agile_start_sprint to initialize a new sprint
-5. For each task: call agile_delegate_task → get review verdict
-6. If verdict is "approved": call agile_merge_task
-7. Call agile_retrospective to get velocity + stop-check message
-8. Check stop criteria yourself (run metric commands via bash)
-9. If stop criteria met → stop. If not → next sprint.
-
-You make ALL decisions. Extension only runs tools and persists data.`;
+    extra += SYSTEM_PROMPT_WORKFLOW;
 
     event.systemPrompt = event.systemPrompt + extra;
   });
@@ -319,9 +443,16 @@ You make ALL decisions. Extension only runs tools and persists data.`;
       const sprintId = runtime.store.findLastSprintId(workDir) + 1;
       const sprint = runtime.store.create(workDir, sprintId, meta.goal);
 
-      // Add tasks to sprint state
+      // Add tasks to sprint state (read titles from bd)
       for (const bdId of params.task_ids as string[]) {
-        runtime.store.addTask(sprint, { bd_id: bdId, title: `(task ${bdId})`, status: "backlog" });
+        const bdOutput = await execText(pi, "bd", ["show", bdId], workDir, 10_000);
+        const parsed = parseBdShow(bdOutput);
+        runtime.store.addTask(sprint, {
+          bd_id: bdId,
+          title: parsed.title ?? `(task ${bdId})`,
+          description: parsed.description,
+          status: "backlog",
+        });
       }
 
       runtime.currentSprintId = sprintId;
@@ -340,11 +471,11 @@ You make ALL decisions. Extension only runs tools and persists data.`;
   pi.registerTool({
     name: "agile_delegate_task",
     label: "agile_delegate_task",
-    description: "Delegate a single task to a worker subagent (implements on feature branch), then a reviewer subagent (reviews diff). Returns review verdict. Requires pi-subagents RPC bridge.",
+    description: "Delegate a single task to a worker subagent (implements on feature branch), then a reviewer subagent (reviews diff). Returns review verdict. Task title and description are read from bd automatically — just pass bd_id.",
     parameters: Type.Object({
-      bd_id: Type.String({ description: "bd task ID" }),
-      title: Type.String({ description: "Task title" }),
-      description: Type.Optional(Type.String({ description: "Task description from bd" })),
+      bd_id: Type.String({ description: "bd task ID (e.g. agile-test-9do)" }),
+      title: Type.Optional(Type.String({ description: "Override task title (normally read from bd)" })),
+      description: Type.Optional(Type.String({ description: "Override task description (normally read from bd)" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const workDir = ctx.cwd;
@@ -359,8 +490,19 @@ You make ALL decisions. Extension only runs tools and persists data.`;
       }
 
       const bdId = params.bd_id as string;
-      const title = params.title as string;
-      const description = (params.description as string) ?? "";
+
+      // Read task details from bd if not provided
+      let title = params.title as string | undefined;
+      let description = (params.description as string) ?? "";
+      let acceptanceCriteria: string | undefined;
+
+      if (!title) {
+        const bdOutput = await execText(pi, "bd", ["show", bdId], workDir, 10_000);
+        const parsed = parseBdShow(bdOutput);
+        title = parsed.title ?? `(task ${bdId})`;
+        description = parsed.description ?? description;
+        acceptanceCriteria = parsed.acceptanceCriteria;
+      }
       const branch = `feat/${bdId}`;
 
       // 1. Create feature branch
@@ -372,7 +514,7 @@ You make ALL decisions. Extension only runs tools and persists data.`;
       const deadEnds = runtime.knowledge.formatDeadEnds();
 
       // 3. Delegate worker via RPC
-      const workerTaskText = buildWorkerTask(title, description, undefined, constraints, deadEnds);
+      const workerTaskText = buildWorkerTask(title, description, acceptanceCriteria, constraints, deadEnds);
       const workerOutput = path.join(workDir, ".agile", `worker-${bdId}.txt`);
 
       let worker: SpawnedWorker;
