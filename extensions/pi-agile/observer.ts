@@ -164,7 +164,11 @@ function checkAllTasksExhausted(state: SprintState): ObserverSteer | null {
   return {
     type: "all_tasks_exhausted",
     severity: "info",
-    message: `All ${state.tasks.length} tasks are exhausted (${totalDone} done, ${totalBlocked} blocked). Run discovery to find new tasks, or end the sprint.`,
+    message: `All ${state.tasks.length} tasks are exhausted (${totalDone} done, ${totalBlocked} blocked).\n` +
+      `1. Run \`agile_discover\` to scan the codebase for remaining issues\n` +
+      `2. Review results against project constraints (scope, max tasks from .agile/project.yaml)\n` +
+      `3. Create tasks for the next sprint via \`bd create\` with clear acceptance criteria\n` +
+      `4. Call \`agile_start_sprint\` to initialize the next sprint, or end here`,
   };
 }
 

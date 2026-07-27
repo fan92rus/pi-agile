@@ -1372,6 +1372,10 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         }
         runtime.knowledge.save(workDir);
         runtime.store.save(workDir, sprint);
+
+        // Run observer after task transition
+        const _observerSteers = runSprintObserver(sprint, runtime.observerState, DEFAULT_OBSERVER_CONFIG, workDir);
+        // Observer steers are advisory for the agent — verdict is the primary output
       }
 
       // 7. Format verdict for agent
@@ -1455,6 +1459,7 @@ ${workerSummary.slice(0, 1000)}`;
 
       // Update sprint state
       const sprint = runtime.store.getCurrent();
+      let observerBlock = "";
       if (sprint) {
         runtime.store.markDone(sprint, bdId);
         trackTaskTransition(runtime.observerState, bdId, "done");
@@ -1468,6 +1473,12 @@ ${workerSummary.slice(0, 1000)}`;
         });
         runtime.knowledge.save(workDir);
         runtime.store.save(workDir, sprint);
+
+        // Run observer after task completion
+        const steers = runSprintObserver(sprint, runtime.observerState, DEFAULT_OBSERVER_CONFIG, workDir);
+        if (steers.length > 0) {
+          observerBlock = "\n\n## Observer\n" + steers.map(s => `[${s.severity}] ${s.message}`).join("\n");
+        }
       }
 
       // Delete feature branch
@@ -1478,7 +1489,7 @@ ${workerSummary.slice(0, 1000)}`;
       return {
         content: [{
           type: "text" as const,
-          text: `✅ Task ${bdId} merged to main.\n\n## Main Checks Output\n${checksOutput.trim() || "(no lint config or test runner found — verify manually)"}`,
+          text: `✅ Task ${bdId} merged to main.${observerBlock}\n\n## Main Checks Output\n${checksOutput.trim() || "(no lint config or test runner found — verify manually)"}`,
         }],
       };
     },
