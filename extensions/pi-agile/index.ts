@@ -343,6 +343,8 @@ async function delegateTaskInWorktree(
   await gitCreateBranch(pi, workDir, branch);
 
   for (let round = 1; round <= MAX_REWORK_ROUNDS; round++) {
+    try { pi.notify(`[${bdId}] Round ${round}/${MAX_REWORK_ROUNDS}`, "info"); } catch {}
+
     const workerOutput = path.join(workDir, ".agile", `worker-${bdId}-r${round}.txt`);
     const reviewerOutput = path.join(workDir, ".agile", `review-${bdId}-r${round}.txt`);
 
@@ -362,6 +364,7 @@ async function delegateTaskInWorktree(
     // 2. Spawn worker
     const workerTaskText = buildWorkerTask(meta.title, meta.description, meta.acceptanceCriteria, constraints, deadEnds, feedbackText);
     onProgress?.(`${bdId} (r${round}): spawning worker...`);
+    try { pi.notify(`[${bdId}] R${round}: worker starting...`, "info"); } catch {}
 
     let worker: SpawnedWorker;
     try {
@@ -379,6 +382,7 @@ async function delegateTaskInWorktree(
     }
 
     onProgress?.(`${bdId} (r${round}): worker started...`);
+    try { pi.notify(`[${bdId}] R${round}: worker running...`, "info"); } catch {}
     const workerDone = await pollWithProgress(pi, workDir, rpc_, worker.runId, workerOutput, `worker-${bdId}-r${round}`, (s: string) => onProgress?.(`${bdId}: ${s}`));
     if (!workerDone) {
       return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `worker r${round} timeout` };
@@ -387,6 +391,7 @@ async function delegateTaskInWorktree(
     try { if (fs.existsSync(workerOutput)) currentWorkerSummary = fs.readFileSync(workerOutput, "utf8"); } catch {}
 
     // 3. Get diff
+    try { pi.notify(`[${bdId}] R${round}: worker done, getting diff...`, "info"); } catch {}
     currentDiff = await gitDiff(pi, workDir, `main...${branch}`);
     if (!currentDiff.trim()) {
       if (round > 1) {
@@ -399,6 +404,7 @@ async function delegateTaskInWorktree(
     // 4. Spawn reviewer
     const reviewerTaskText = buildReviewerTask(meta.title, meta.description, currentDiff, constraints, patterns, reviewDepth);
     onProgress?.(`${bdId} (r${round}): spawning reviewer...`);
+    try { pi.notify(`[${bdId}] R${round}: reviewer starting...`, "info"); } catch {}
 
     let reviewer: SpawnedWorker;
     try {
@@ -423,6 +429,7 @@ async function delegateTaskInWorktree(
 
     overallVerdict = parseReviewVerdict(verdictText);
     reviews.push({ round, action_items: overallVerdict.action_items ?? [], lessons: overallVerdict.lessons ?? [] });
+    try { pi.notify(`[${bdId}] R${round}: ${overallVerdict.status}`, "info"); } catch {}
 
     // 5. Decision: approved→ready; blocked→stop; rework→continue
     if (overallVerdict.status === "approved" || overallVerdict.status === "blocked") {
