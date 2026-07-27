@@ -24,6 +24,39 @@ export interface DiscoveryResult {
   scriptsFound: string[];
 }
 
+/**
+ * Find a bash executable that understands Windows paths.
+ * On Windows, prefers Git Bash over WSL2 bash (which can't access D:\\).
+ * On Unix, just returns 'bash'.
+ */
+function getBashExecutable(): string {
+  if (process.platform !== "win32") return "bash";
+
+  // Check common Git Bash locations
+  const candidates = [
+    "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+    "C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe",
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+
+  // Check via PROGRAMFILES env var
+  const pf = process.env.PROGRAMFILES || "C:\\Program Files";
+  const viaEnv = path.join(pf, "Git", "usr", "bin", "bash.exe");
+  if (fs.existsSync(viaEnv)) return viaEnv;
+
+  // Fallback: 'bash' from PATH (might be WSL2 or Git Bash)
+  return "bash";
+}
+
+/** Get the bash command for running a script (quoted path to bash exe). */
+function bashCommand(scriptPath: string): string {
+  const bash = getBashExecutable();
+  const quoted = bash.includes(" ") ? `"${bash}"` : bash;
+  return `${quoted} "${scriptPath.replace(/\\/g, "/")}"`;
+}
+
 /** Try running a command with a timeout. Returns stdout on success, or error text. */
 function tryExecSync(cmd: string, workDir: string, timeoutMs = 60_000): string {
   try {
@@ -337,7 +370,7 @@ export function validateCheckScripts(workDir: string, created: string[]): string
   for (const script of created) {
     const scriptPath = path.join(checksDir, script).replace(/\\/g, "/");
     try {
-      const out = execSync(`bash "${scriptPath}"`, { cwd: workDir, timeout: 30000, encoding: "utf8", maxBuffer: 50 * 1024 });
+      const out = execSync(bashCommand(scriptPath), { cwd: workDir, timeout: 30000, encoding: "utf8", maxBuffer: 50 * 1024 });
       const lines = out.trim().split("\n").filter(l => !l.startsWith("METRIC"));
       const nonMetric = lines.filter(l => l.trim()).join("\n").slice(0, 500);
       results.push(`## ${script}\n${nonMetric || "(no output)"}`);
@@ -370,7 +403,7 @@ export function runChecks(workDir: string): DiscoveryResult {
     const name = script.replace(/\.sh$/, "");
     scriptsFound.push(name);
 
-    const raw = tryExecSync(`bash "${path.join(checksDir, script)}"`, workDir, 120_000);
+    const raw = tryExecSync(bashCommand(path.join(checksDir, script)), workDir, 120_000);
 
     // Parse METRIC lines and split from report text
     const reportLines: string[] = [];
