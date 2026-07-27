@@ -142,6 +142,7 @@ export function buildChainAgentTask(
   taskDescription: string,
   acceptanceCriteria: string | undefined,
   constraints: string,
+  patterns: string,
   chainContext: { agent: string; output: string }[],
 ): string {
   const priorContext = chainContext.length > 0
@@ -201,7 +202,9 @@ ${taskDescription}
 ## Acceptance Criteria
 ${acceptanceCriteria ?? "Change resolves the issue described above."}
 ## Project Constraints (MUST follow)
-${constraints || "(none specified)"}${priorContext}
+${constraints || "(none specified)"}
+## Known Codebase Patterns
+${patterns || "(none recorded yet)"}${priorContext}
 
 ${prompts[agent] ?? `You are a ${agent} agent supporting this task. Explore the codebase and provide relevant context for the next agent.`}
 
@@ -217,6 +220,7 @@ export function buildWorkerTask(
   taskDescription: string,
   acceptanceCriteria: string | undefined,
   constraints: string,
+  patterns: string,
   deadEnds: string,
   feedback?: string,
   chainContext?: { agent: string; output: string }[],
@@ -237,6 +241,8 @@ ${acceptanceCriteria ?? "Change resolves the issue described above."}
 
 ## Project Constraints (MUST follow)
 ${constraints || "(none specified)"}
+## Known Codebase Patterns (follow these)
+${patterns || "(none recorded yet)"}
 
 ## Known Dead-Ends (do NOT repeat these approaches)
 ${deadEnds || "(none recorded yet)"}

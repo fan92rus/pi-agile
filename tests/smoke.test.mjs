@@ -137,7 +137,7 @@ await test("SprintStore findLastSprintId", () => {
 // ── review.ts ────────────────────────────────────────────────────
 console.log("\n## review.ts");
 
-const { buildReviewerTask, buildWorkerTask, parseReviewVerdict } = await importModule(path.join("parallel", "review.ts"));
+const { buildChainAgentTask, buildReviewerTask, buildWorkerTask, parseReviewVerdict } = await importModule(path.join("parallel", "review.ts"));
 
 await test("buildWorkerTask includes constraints and dead-ends", () => {
   const task = buildWorkerTask("Fix bug", "Fix the bug", undefined, "rule1", "deadend1");
@@ -171,6 +171,31 @@ await test("parseReviewVerdict falls back on bad JSON", () => {
 await test("parseReviewVerdict detects blocked", () => {
   const verdict = parseReviewVerdict('{"status":"blocked","dimensions":{},"action_items":["fundamental flaw"],"lessons":[]}');
   assert.strictEqual(verdict.status, "blocked");
+});
+
+await test("buildChainAgentTask includes patterns and agent prompt", () => {
+  const task = buildChainAgentTask("scout", "Refactor auth", "Make it secure", undefined, "rule1", "pattern1", []);
+  assert.ok(task.includes("scout"));
+  assert.ok(task.includes("Refactor auth"));
+  assert.ok(task.includes("rule1"));
+  assert.ok(task.includes("pattern1"));
+  assert.ok(task.includes("key files and functions"));
+  assert.ok(task.includes("Do NOT write code"));
+});
+
+await test("buildChainAgentTask passes chain context", () => {
+  const ctx = [{ agent: "researcher", output: "Use bcrypt" }];
+  const task = buildChainAgentTask("planner", "Add auth", "desc", "auth works", "c1", "p1", ctx);
+  assert.ok(task.includes("researcher"));
+  assert.ok(task.includes("Use bcrypt"));
+  assert.ok(task.includes("sequential sub-steps"));
+});
+
+await test("buildWorkerTask includes patterns section", () => {
+  const task = buildWorkerTask("Fix", "desc", undefined, "c1", "p1", "dead1");
+  assert.ok(task.includes("Known Codebase Patterns"));
+  assert.ok(task.includes("p1"));
+  assert.ok(task.includes("dead1"));
 });
 
 // ── observer.ts ──────────────────────────────────────────────────

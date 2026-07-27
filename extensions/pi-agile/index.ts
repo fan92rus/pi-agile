@@ -399,7 +399,7 @@ async function delegateTaskInWorktree(
     try { pi.notify(`[${bdId}] Chain: ${agent} starting...`, "info"); } catch {}
     onProgress?.(`${bdId}: chain agent ${agent}...`);
     const agentOutput = path.join(workDir, ".agile", `${agent}-${bdId}.txt`);
-    const agentTaskText = buildChainAgentTask(agent, meta.title, meta.description, meta.acceptanceCriteria, constraints, chainOutputs);
+    const agentTaskText = buildChainAgentTask(agent, meta.title, meta.description, meta.acceptanceCriteria, constraints, patterns, chainOutputs);
     let spawned: SpawnedWorker;
     try {
       spawned = await rpc_.spawn({
@@ -442,7 +442,7 @@ async function delegateTaskInWorktree(
     }
 
     // 3. Spawn worker (with chain context)
-    const workerTaskText = buildWorkerTask(meta.title, meta.description, meta.acceptanceCriteria, constraints, deadEnds, feedbackText, chainOutputs.length > 0 ? chainOutputs : undefined);
+    const workerTaskText = buildWorkerTask(meta.title, meta.description, meta.acceptanceCriteria, constraints, patterns, deadEnds, feedbackText, chainOutputs.length > 0 ? chainOutputs : undefined);
     onProgress?.(`${bdId} (r${round}): spawning worker...`);
     try { pi.notify(`[${bdId}] R${round}: worker starting...`, "info"); } catch {}
 
@@ -1214,6 +1214,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       const deadEnds = runtime.knowledge.formatDeadEnds();
       const chains = getChainConfig(workDir);
       const taskChain = (params.chain as string[] | undefined) ?? chains.default ?? ["worker", "reviewer"];
+      const patterns = runtime.knowledge.formatPatterns();
 
       // 2b. Run chain agents before worker (scout, researcher, planner, etc.)
       const chainOutputs: { agent: string; output: string }[] = [];
@@ -1221,7 +1222,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       for (const agent of preWorker) {
         try { pi.notify(`[${bdId}] Chain: ${agent} starting...`, "info"); } catch {}
         const agentOutput = path.join(workDir, ".agile", `${agent}-${bdId}.txt`);
-        const agentTaskText = buildChainAgentTask(agent, title, description, acceptanceCriteria, constraints, chainOutputs);
+        const agentTaskText = buildChainAgentTask(agent, title, description, acceptanceCriteria, constraints, patterns, chainOutputs);
         try {
           const spawned = await rpc.spawn({
             agent, model: getAgentModel(workDir, agent),
@@ -1240,7 +1241,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       }
 
       // 3. Delegate worker via RPC
-      const workerTaskText = buildWorkerTask(title, description, acceptanceCriteria, constraints, deadEnds, undefined, chainOutputs.length > 0 ? chainOutputs : undefined);
+      const workerTaskText = buildWorkerTask(title, description, acceptanceCriteria, constraints, patterns, deadEnds, undefined, chainOutputs.length > 0 ? chainOutputs : undefined);
       const workerOutput = path.join(workDir, ".agile", `worker-${bdId}.txt`);
 
       let worker: SpawnedWorker;
@@ -1289,7 +1290,6 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       }
 
       // 5. Delegate reviewer via RPC
-      const patterns = runtime.knowledge.formatPatterns();
       const reviewerTaskText = buildReviewerTask(title, description, diff, constraints, patterns, meta.reviewDepth as "deep" | "standard");
       const reviewerOutput = path.join(workDir, ".agile", `review-${bdId}.txt`);
 
