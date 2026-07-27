@@ -261,30 +261,327 @@ async function gitMergeSquash(pi: ExtensionAPI, workDir: string, branch: string,
 
 // ---------------------------------------------------------------------------
 /** Parse `bd show <id>` output to extract title, description, acceptance criteria. */
-function parseBdShow(output: string): { title?: string; description?: string; acceptanceCriteria?: string } {
-  // Example bd show output:
-  //   ○ agile-test-9do · Fix hardcoded credentials in auth.js   [● P2 · OPEN]
-  //   Owner: fan92rus · Type: task
-  //   Created: 2026-07-27 · Updated: 2026-07-27
-  //
-  //   DESCRIPTION
-  //   Replace hardcoded password check with proper credential validation
-  //
-  //   ACCEPTANCE CRITERIA
-  //   No hardcoded secrets
+/** Checkout default branch (main or master) */
+async function gitCheckoutMain(pi: ExtensionAPI, workDir: string): Promise<string> {
+  const branchResult = await pi.exec("git", ["branch", "--list"], { cwd: workDir, timeout: 5_000 });
+  const branchList = (branchResult.stdout ?? "") + (branchResult.stderr ?? "");
+  const defaultBranch = branchList.includes("main") ? "main" : "master";
+  await pi.exec("git", ["checkout", defaultBranch], { cwd: workDir, timeout: 15_000 });
+  return defaultBranch;
+}
 
+/**
+ * Full task lifecycle in a worktree directory:
+ * create branch → spawn worker → poll → spawn reviewer → poll → parse verdict
+ * Returns {bdId, status, verdict, diff, branch} or {bdId, status: "error", error}.
+ */
+async function delegateTaskInWorktree(
+  pi: ExtensionAPI,
+  rpc_: RpcClient,
+  workDir: string,
+  bdId: string,
+  meta: { title: string; description: string; acceptanceCriteria?: string },
+  constraints: string,
+  deadEnds: string,
+  patterns: string,
+  reviewDepth: "deep" | "standard",
+  onProgress?: (status: string) => void,
+): Promise<{
+  bdId: string;
+  verdict: ReturnType<typeof parseReviewVerdict>;
+  diff: string;
+  branch: string;
+  workerSummary?: string;
+  reviews?: { round: number; action_items: string[]; lessons: string[] }[];
+  error?: string;
+}> {
+  const branch = `feat/${bdId}`;
+  const MAX_REWORK_ROUNDS = 3;
+  const reviews: { round: number; action_items: string[]; lessons: string[] }[] = [];
+  let currentDiff = "";
+  let currentWorkerSummary = "";
+  let overallVerdict: ReturnType<typeof parseReviewVerdict> = { status: "rework", dimensions: {}, action_items: [], lessons: [] };
+
+  // 1. Create feature branch (assumes on main)
+  await gitCreateBranch(pi, workDir, branch);
+
+  for (let round = 1; round <= MAX_REWORK_ROUNDS; round++) {
+    const workerOutput = path.join(workDir, ".agile", `worker-${bdId}-r${round}.txt`);
+    const reviewerOutput = path.join(workDir, ".agile", `review-${bdId}-r${round}.txt`);
+
+    // Build feedback from previous review (for round > 1)
+    let feedbackText: string | undefined;
+    if (round > 1 && reviews.length > 0) {
+      const prev = reviews[reviews.length - 1];
+      feedbackText = `Round ${round - 1} review found:\n`;
+      if (prev.action_items.length > 0) {
+        feedbackText += "Action items to fix:\n";
+        prev.action_items.forEach((ai: string) => { feedbackText += `  - ${ai}\n`; });
+      }
+      feedbackText += "\nFix these issues, then re-run tests and commit again.";
+      onProgress?.(`${bdId}: rework round ${round}...`);
+    }
+
+    // 2. Spawn worker
+    const workerTaskText = buildWorkerTask(meta.title, meta.description, meta.acceptanceCriteria, constraints, deadEnds, feedbackText);
+    onProgress?.(`${bdId} (r${round}): spawning worker...`);
+
+    let worker: SpawnedWorker;
+    try {
+      worker = await rpc_.spawn({
+        agent: "worker",
+        model: getAgentModel(workDir, "worker"),
+        task: workerTaskText,
+        cwd: workDir,
+        context: "fresh",
+        output: workerOutput,
+        outputMode: "file-only",
+      }, 30_000);
+    } catch (e: unknown) {
+      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `spawn worker r${round}: ${e instanceof Error ? e.message : String(e)}` };
+    }
+
+    onProgress?.(`${bdId} (r${round}): worker started...`);
+    const workerDone = await pollWithProgress(pi, workDir, rpc_, worker.runId, workerOutput, `worker-${bdId}-r${round}`, (s: string) => onProgress?.(`${bdId}: ${s}`));
+    if (!workerDone) {
+      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `worker r${round} timeout` };
+    }
+
+    try { if (fs.existsSync(workerOutput)) currentWorkerSummary = fs.readFileSync(workerOutput, "utf8"); } catch {}
+
+    // 3. Get diff
+    currentDiff = await gitDiff(pi, workDir, `main...${branch}`);
+    if (!currentDiff.trim()) {
+      if (round > 1) {
+        overallVerdict = { status: "rework", dimensions: {}, action_items: ["Worker reverted all changes after rework feedback."], lessons: [] };
+        return { bdId, verdict: overallVerdict, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: "no diff after rework" };
+      }
+      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: "", branch, workerSummary: currentWorkerSummary, reviews, error: "no diff produced" };
+    }
+
+    // 4. Spawn reviewer
+    const reviewerTaskText = buildReviewerTask(meta.title, meta.description, currentDiff, constraints, patterns, reviewDepth);
+    onProgress?.(`${bdId} (r${round}): spawning reviewer...`);
+
+    let reviewer: SpawnedWorker;
+    try {
+      reviewer = await rpc_.spawn({
+        agent: "reviewer",
+        model: getAgentModel(workDir, "reviewer"),
+        task: reviewerTaskText,
+        cwd: workDir,
+        context: "fresh",
+        output: reviewerOutput,
+        outputMode: "file-only",
+      }, 30_000);
+    } catch (e: unknown) {
+      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `spawn reviewer r${round}: ${e instanceof Error ? e.message : String(e)}` };
+    }
+
+    onProgress?.(`${bdId} (r${round}): reviewer started...`);
+    await pollWithProgress(pi, workDir, rpc_, reviewer.runId, reviewerOutput, `reviewer-${bdId}-r${round}`, (s: string) => onProgress?.(`${bdId}: ${s}`));
+
+    let verdictText = "";
+    try { if (fs.existsSync(reviewerOutput)) verdictText = fs.readFileSync(reviewerOutput, "utf8"); } catch {}
+
+    overallVerdict = parseReviewVerdict(verdictText);
+    reviews.push({ round, action_items: overallVerdict.action_items ?? [], lessons: overallVerdict.lessons ?? [] });
+
+    // 5. Decision: approved→ready; blocked→stop; rework→continue
+    if (overallVerdict.status === "approved" || overallVerdict.status === "blocked") {
+      break;
+    }
+  }
+
+  return { bdId, verdict: overallVerdict, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews };
+}
+
+/**
+ * Parallel batch: create worktrees, delegate each task in its own worktree.
+ * Each task runs independent worker→reviewer→rework loop.
+ * Approved tasks auto-merged. Worktrees cleaned up.
+ */
+async function delegateBatchParallel(
+  pi: ExtensionAPI,
+  rpc_: RpcClient,
+  mainWorkDir: string,
+  tasks: { bdId: string; meta: { title: string; description: string; acceptanceCriteria?: string } }[],
+  constraints: string,
+  deadEnds: string,
+  patterns: string,
+  reviewDepth: "deep" | "standard",
+  onProgress?: (status: string) => void,
+): Promise<{
+  results: Awaited<ReturnType<typeof delegateTaskInWorktree>>[];
+}> {
+  const parentDir = path.dirname(mainWorkDir);
+  const repoName = path.basename(mainWorkDir);
+
+  // 1. Ensure on main
+  const mainBranch = await gitCheckoutMain(pi, mainWorkDir);
+
+  // 2. Create worktrees for each task
+  const worktrees: string[] = [];
+  try {
+    for (const t of tasks) {
+      const wtDir = path.join(parentDir, `${repoName}-${t.bdId}`);
+      await pi.exec("git", ["worktree", "add", "-b", `feat/${t.bdId}`, wtDir, mainBranch], { cwd: mainWorkDir, timeout: 30_000 });
+      worktrees.push(wtDir);
+      onProgress?.(`${t.bdId}: worktree created`);
+    }
+  } catch (e: unknown) {
+    for (const wt of worktrees) {
+      try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
+      try { fs.rmSync(wt, { recursive: true, force: true }); } catch {}
+    }
+    throw e;
+  }
+
+  // 3. Run ALL tasks in parallel — each its own worktree, each has its own loop
+  onProgress?.("Running all tasks in parallel...");
+  const taskPromises = tasks.map((t, i) =>
+    delegateTaskInWorktree(pi, rpc_, worktrees[i], t.bdId, t.meta, constraints, deadEnds, patterns, reviewDepth, onProgress)
+  );
+  const results = await Promise.all(taskPromises);
+
+  // 4. For approved tasks: merge to main
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (r.verdict.status === "approved" && !r.error) {
+      onProgress?.(`${r.bdId}: approved, merging...`);
+      try {
+        const mergeResult = await gitMergeSquash(pi, worktrees[i], r.branch, `feat: merge ${r.bdId}`);
+        if (mergeResult) r.error = `merge failed: ${mergeResult}`;
+      } catch (e: unknown) {
+        r.error = `merge error: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+  }
+
+  // 5. Clean up worktrees
+  onProgress?.("Cleaning up worktrees...");
+  for (const wt of worktrees) {
+    try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
+    try { fs.rmSync(wt, { recursive: true, force: true }); } catch {}
+  }
+
+  return { results };
+}
+
+/**
+ * Batch mode handler: reads task details from bd, delegates in parallel,
+ * merges approved, returns formatted summary to agent.
+ */
+async function executeBatchTasks(
+  pi: ExtensionAPI,
+  rpc_: RpcClient,
+  workDir: string,
+  bdIds: string[],
+  runtime: AgileRuntime,
+  onUpdate: (text: string) => void,
+): Promise<{ content: { type: "text"; text: string }[] }> {
+  const project = loadProjectConfig(workDir);
+  const meta = extractProjectMeta(project);
+  const constraints = loadConstraintsText(workDir);
+  const patterns = runtime.knowledge.formatPatterns();
+  const deadEnds = runtime.knowledge.formatDeadEnds();
+
+  onUpdate("Reading task details from bd...");
+
+  // Read all task details from bd
+  const tasks: { bdId: string; meta: { title: string; description: string; acceptanceCriteria?: string } }[] = [];
+  for (const bdId of bdIds) {
+    const bdOutput = await execText(pi, "bd", ["show", bdId], workDir, 10_000);
+    const parsed = parseBdShow(bdOutput);
+    tasks.push({
+      bdId,
+      meta: {
+        title: parsed.title ?? `(task ${bdId})`,
+        description: parsed.description ?? "",
+        acceptanceCriteria: parsed.acceptanceCriteria,
+      },
+    });
+  }
+
+  onUpdate(`Delegating ${tasks.length} tasks in parallel...`);
+
+  const { results } = await delegateBatchParallel(
+    pi, rpc_, workDir, tasks, constraints, deadEnds, patterns,
+    meta.reviewDepth as "deep" | "standard",
+    (status: string) => onUpdate(status),
+  );
+
+  // Update sprint state
+  const sprint = runtime.store.getCurrent(workDir);
+  const lines: string[] = ["# Batch Results\n"];
+  const approved: string[] = [];
+  const rework: string[] = [];
+  const blocked: string[] = [];
+  const errored: string[] = [];
+
+  for (const r of results) {
+    if (r.error) {
+      errored.push(r.bdId);
+      lines.push(`## ${r.bdId}: \u274c ERROR`);
+      lines.push(r.error);
+      lines.push("");
+    } else if (r.verdict.status === "approved") {
+      approved.push(r.bdId);
+      if (sprint) runtime.store.markDone(sprint, r.bdId);
+      lines.push(`## ${r.bdId}: \u2705 APPROVED`);
+      lines.push(`Merged to main.`);
+      if (r.reviews && r.reviews.length > 0) {
+        lines.push(`Rounds: ${r.reviews.length}`);
+        r.reviews.forEach((rev, i) => {
+          if (rev.lessons.length > 0) lines.push(`  Lessons r${i + 1}: ${rev.lessons.join("; ")}`);
+        });
+      }
+      lines.push("");
+    } else if (r.verdict.status === "rework") {
+      rework.push(r.bdId);
+      if (sprint) runtime.store.markRework(sprint, r.bdId, `rework after ${r.reviews?.length ?? 0} rounds`);
+      lines.push(`## ${r.bdId}: \u26a0\ufe0f REWORK`);
+      lines.push(`Action items:`);
+      (r.verdict.action_items ?? []).forEach((ai: string) => lines.push(`  - ${ai}`));
+      lines.push("");
+    } else if (r.verdict.status === "blocked") {
+      blocked.push(r.bdId);
+      if (sprint) runtime.store.markBlocked(sprint, r.bdId, r.verdict.action_items?.join("; "));
+      lines.push(`## ${r.bdId}: \u26d4 BLOCKED`);
+      (r.verdict.action_items ?? []).forEach((ai: string) => lines.push(`  - ${ai}`));
+      lines.push("");
+    }
+  }
+
+  // Summary line
+  lines.push("---");
+  lines.push(`Approved: ${approved.length} | Rework: ${rework.length} | Blocked: ${blocked.length} | Errors: ${errored.length}`);
+  if (rework.length > 0) {
+    lines.push("");
+    lines.push("\u26a0\ufe0f REWORK tasks need fixes. Read action_items above, then call agile_delegate_task again with bd_id for each.");
+  }
+
+  return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+}
+
+/** Parse `bd show <id>` output to extract title, description, acceptance criteria.
+ *  Example output:
+ *    ○ agile-test-9do · Task title   [● P2 · OPEN]
+ *    DESCRIPTION
+ *    Task description text
+ *    ACCEPTANCE CRITERIA
+ *    Criteria text
+ */
+function parseBdShow(output: string): { title?: string; description?: string; acceptanceCriteria?: string } {
   const result: { title?: string; description?: string; acceptanceCriteria?: string } = {};
 
-  // Title is on first line after · separator
   const firstLine = output.split("\n")[0] ?? "";
   const titleMatch = firstLine.match(/·\s+(.+?)\s+\[/);
   if (titleMatch) result.title = titleMatch[1].trim();
 
-  // Description is after DESCRIPTION header
   const descMatch = output.match(/DESCRIPTION\n([\s\S]*?)(?:\n\n\n|$|\n[A-Z])/);
   if (descMatch) result.description = descMatch[1].trim();
 
-  // Acceptance criteria is after ACCEPTANCE CRITERIA header
   const accMatch = output.match(/ACCEPTANCE CRITERIA\n([\s\S]*?)(?:\n\n\n|$|\n[A-Z])/);
   if (accMatch) result.acceptanceCriteria = accMatch[1].trim();
 
@@ -654,12 +951,13 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "agile_delegate_task",
     label: "agile_delegate_task",
-    description: "Delegate a single task to a worker subagent (implements on feature branch), then a reviewer subagent (reviews diff). Returns review verdict. Task title and description are read from bd automatically — just pass bd_id.",
+    description: "Delegate task(s) to worker+reviewer subagents. Single: pass bd_id. Parallel batch: pass bd_ids[] — each task gets its own worktree, parallel workers, independent rework loops (up to 3 rounds). Title/description auto-read from bd.",
     parameters: Type.Object({
-      bd_id: Type.String({ description: "bd task ID (e.g. agile-test-9do)" }),
+      bd_id: Type.Optional(Type.String({ description: "Single task ID (e.g. agile-test-9do). Mutually exclusive with bd_ids." })),
+      bd_ids: Type.Optional(Type.Array(Type.String(), { description: "Multiple task IDs for parallel batch. Mutually exclusive with bd_id." })),
       cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })),
-      title: Type.Optional(Type.String({ description: "Override task title (normally read from bd)" })),
-      description: Type.Optional(Type.String({ description: "Override task description (normally read from bd)" })),
+      title: Type.Optional(Type.String({ description: "Override task title (normally read from bd). Single mode only." })),
+      description: Type.Optional(Type.String({ description: "Override task description (normally read from bd). Single mode only." })),
     }),
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       const workDir = (params.cwd as string) || ctx.cwd;
@@ -668,6 +966,21 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         const gate = assertAgileActive(runtime);
         if (gate) return gate;
       }
+      const bdIds = params.bd_ids as string[] | undefined;
+      const singleBdId = params.bd_id as string | undefined;
+
+      // BATCH MODE: bd_ids[] provided → parallel worktree delegation
+      if (bdIds && bdIds.length > 0) {
+        if (singleBdId) {
+          return { content: [{ type: "text" as const, text: "❌ Cannot use both bd_id and bd_ids. Use one or the other." }] };
+        }
+        return await executeBatchTasks(pi, rpc, workDir, bdIds, runtime, onUpdate);
+      }
+
+      if (!singleBdId) {
+        return { content: [{ type: "text" as const, text: "❌ Provide bd_id (single task) or bd_ids[] (parallel batch)." }] };
+      }
+
       const project = loadProjectConfig(workDir);
       const meta = extractProjectMeta(project);
 

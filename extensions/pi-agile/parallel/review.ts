@@ -145,6 +145,7 @@ export function buildWorkerTask(
   acceptanceCriteria: string | undefined,
   constraints: string,
   deadEnds: string,
+  feedback?: string,
 ): string {
   return `# Task: ${taskTitle}
 
@@ -160,6 +161,7 @@ ${constraints || "(none specified)"}
 ## Known Dead-Ends (do NOT repeat these approaches)
 ${deadEnds || "(none recorded yet)"}
 
+${feedback ? "## Rework Feedback (from previous review)\n" + feedback + "\n" : ""}
 ## Instructions
 1. Implement ONLY the change needed to satisfy the acceptance criteria.
 2. Follow existing code patterns and conventions.
