@@ -1,8 +1,13 @@
 /**
  * discovery.ts — Multi-source codebase analysis
  *
- * Returns RAW output from all discovery sources.
- * Extension DOES NOT parse into structured candidates.
+ * Primary: runs .agile/checks/*.sh scripts written by the project agent.
+ * Each script can output METRIC key=value lines (parsed into structured metrics)
+ * and free-form text (returned as report).
+ *
+ * Fallback: hardcoded detectors for common ecosystems when no scripts exist.
+ *
+ * Extension DOES NOT parse findings into structured candidates.
  * The agent reads the raw output and decides what tasks to create.
  */
 
@@ -11,28 +16,266 @@ import * as path from "node:path";
 import { execSync } from "node:child_process";
 
 export interface DiscoveryResult {
-  lint: string;
-  coverage: string;
-  complexity: string;
-  todos: string;
-  security: string;
-  scout: string;
+  /** Parsed METRIC lines from all scripts */
+  metrics: Record<string, number>;
+  /** Free-text reports per script */
+  reports: Record<string, string>;
+  /** Script names that were run */
+  scriptsFound: string[];
 }
 
-/** Try running a command with a timeout. Returns stdout on success, or error text on failure. */
-function tryExecSync(cmd: string, workDir: string, timeoutMs = 30_000): string {
+/** Try running a command with a timeout. Returns stdout on success, or error text. */
+function tryExecSync(cmd: string, workDir: string, timeoutMs = 60_000): string {
   try {
-    return execSync(cmd, { cwd: workDir, timeout: timeoutMs, encoding: "utf8", maxBuffer: 2 * 1024 * 1024 });
+    return execSync(cmd, { cwd: workDir, timeout: timeoutMs, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
   } catch (e: unknown) {
     if (e && typeof e === "object" && "stdout" in e) {
       return String((e as { stdout: string }).stdout);
+    }
+    if (e && typeof e === "object" && "stderr" in e && (e as { stderr: string }).stderr) {
+      return String((e as { stderr: string }).stderr);
     }
     return `[discovery error] ${e instanceof Error ? e.message : String(e)}`;
   }
 }
 
-/** Detect if a package.json exists and what linter/coverage tools are available. */
-function detectProjectTools(workDir: string): { hasEslint: boolean; hasJest: boolean; hasTypeScript: boolean } {
+// ─── Ecosystem detection ────────────────────────────────────────────────
+
+export interface EcosystemInfo {
+  language: string;
+  tools: { name: string; check: string; install: string }[];
+  configFiles: string[];
+}
+
+export function detectEcosystem(workDir: string): EcosystemInfo | null {
+  if (fs.existsSync(path.join(workDir, "go.mod"))) {
+    return {
+      language: "go",
+      tools: [
+        { name: "golangci-lint", check: "golangci-lint run ./...", install: "go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest" },
+        { name: "go test", check: "go test -cover ./...", install: "(built-in)" },
+      ],
+      configFiles: [".golangci.yml", ".golangci.yaml"],
+    };
+  }
+
+  if (fs.existsSync(path.join(workDir, "Cargo.toml"))) {
+    return {
+      language: "rust",
+      tools: [
+        { name: "cargo clippy", check: "cargo clippy -- -D warnings", install: "rustup component add clippy" },
+        { name: "cargo test", check: "cargo test", install: "(built-in)" },
+        { name: "cargo fmt", check: "cargo fmt --check", install: "rustup component add rustfmt" },
+      ],
+      configFiles: ["rustfmt.toml", ".clippy.toml"],
+    };
+  }
+
+  // .NET / C#
+  if (fs.readdirSync(workDir).some(f => f.endsWith(".csproj") || f.endsWith(".sln"))) {
+    return {
+      language: "dotnet",
+      tools: [
+        { name: "dotnet format", check: "dotnet format --verify-no-changes", install: "dotnet tool install -g dotnet-format" },
+        { name: "dotnet test", check: "dotnet test", install: "(built-in)" },
+      ],
+      configFiles: [".editorconfig"],
+    };
+  }
+
+  // Python
+  const pythonFiles = ["pyproject.toml", "setup.py", "requirements.txt", "Pipfile"];
+  if (pythonFiles.some(f => fs.existsSync(path.join(workDir, f)))) {
+    return {
+      language: "python",
+      tools: [
+        { name: "ruff", check: "ruff check .", install: "pip install ruff" },
+        { name: "pytest", check: "pytest --cov", install: "pip install pytest pytest-cov" },
+      ],
+      configFiles: ["pyproject.toml (ruff section)", ".ruff.toml"],
+    };
+  }
+
+  // Ruby
+  if (fs.existsSync(path.join(workDir, "Gemfile"))) {
+    return {
+      language: "ruby",
+      tools: [
+        { name: "rubocop", check: "rubocop", install: "gem install rubocop" },
+        { name: "rspec", check: "rspec", install: "gem install rspec" },
+      ],
+      configFiles: [".rubocop.yml"],
+    };
+  }
+
+  // Java
+  if (fs.existsSync(path.join(workDir, "pom.xml")) || fs.existsSync(path.join(workDir, "build.gradle"))) {
+    return {
+      language: "java",
+      tools: [
+        { name: "mvn test", check: "mvn test", install: "(mvn wrapper or system install)" },
+      ],
+      configFiles: ["checkstyle.xml"],
+    };
+  }
+
+  // JS/TS — most common, fallback
+  if (fs.existsSync(path.join(workDir, "package.json"))) {
+    return {
+      language: "js/ts",
+      tools: [
+        { name: "eslint", check: "npx eslint . --format compact", install: "npm install --save-dev eslint" },
+        { name: "vitest/jest", check: "npx vitest run --reporter=verbose || npx jest --passWithNoTests", install: "npm install --save-dev vitest" },
+      ],
+      configFiles: ["eslint.config.js", ".eslintrc.js"],
+    };
+  }
+
+  return null;
+}
+
+// ─── Script generation ─────────────────────────────────────────────────
+
+/**
+ * Generate .agile/checks/*.sh template scripts for the detected ecosystem.
+ * Returns a summary of what was created and what needs manual setup.
+ */
+export function initChecks(workDir: string): { created: string[]; warnings: string[] } {
+  const checksDir = path.join(workDir, ".agile", "checks");
+  fs.mkdirSync(checksDir, { recursive: true });
+
+  const ecosystem = detectEcosystem(workDir);
+  const created: string[] = [];
+  const warnings: string[] = [];
+
+  // Always create todos.sh (works for any language, minimal deps)
+  const todosScript = `#!/bin/bash
+# .agile/checks/todos.sh — Scan for TODO/FIXME/HACK/XXX markers
+# Adjust extensions as needed for your project.
+
+EXTENSIONS=".ts .js .jsx .tsx .go .py .rs .java .rb .php .cs .c .cpp .h"
+PATTERNS="TODO|FIXME|HACK|XXX"
+EXCLUDE="./node_modules/*:./.git/*:./dist/*:./target/*:./__pycache__/*:./build/*:./.agile/*"
+
+for ext in $EXTENSIONS; do
+  find . -name "*$ext" -not -path "./node_modules/*" -not -path "./.git/*" \\
+       -not -path "./dist/*" -not -path "./target/*" -not -path "./__pycache__/*" \\
+       -not -path "./build/*" -not -path "./.agile/*" 2>/dev/null | while read -r f; do
+    grep -HnE "$PATTERNS" "$f" 2>/dev/null
+  done
+done
+
+TODO=$(grep -rn "TODO" . --include="*.ts" --include="*.js" --include="*.go" --include="*.py" --include="*.rs" --include="*.java" --include="*.rb" --include="*.php" --include="*.cs" 2>/dev/null | grep -cv "node_modules\|\.git\|dist\|target\|__pycache__" || echo 0)
+FIXME=$(grep -rn "FIXME\|HACK" . --include="*.ts" --include="*.js" --include="*.go" --include="*.py" --include="*.rs" --include="*.java" --include="*.rb" --include="*.php" --include="*.cs" 2>/dev/null | grep -cv "node_modules\|\.git\|dist\|target\|__pycache__" || echo 0)
+echo ""
+echo "METRIC todo_count=$TODO"
+echo "METRIC fixme_count=$FIXME"
+`;
+
+  fs.writeFileSync(path.join(checksDir, "todos.sh"), todosScript, "utf8");
+  created.push("todos.sh");
+
+  if (ecosystem) {
+    // Lint script
+    const lintChecks = ecosystem.tools.filter(t =>
+      t.name.includes("lint") || t.name === "eslint" || t.name === "ruff" ||
+      t.name.includes("clippy") || t.name.includes("format") ||
+      t.name.includes("rubocop") || t.name.includes("checkstyle")
+    );
+    if (lintChecks.length > 0) {
+      let lintContent = "#!/bin/bash\n# .agile/checks/lint.sh — Lint checker\n# Adjust paths and flags to match your project.\n\n";
+      for (const tool of lintChecks) {
+        const metricName = tool.name.replace(/[^a-zA-Z0-9_]/g, "_");
+        lintContent += `# Tool: ${tool.name}\n# Install: ${tool.install}\n`;
+        lintContent += `if command -v ${tool.name.split(" ")[0]} &>/dev/null; then\n`;
+        lintContent += `  echo "--- ${tool.name} ---"\n`;
+        lintContent += `  ${tool.check} 2>/dev/null || true\n`;
+        lintContent += `  ${tool.check} 2>&1 | grep -cE "error|warning" | awk '{print "METRIC ${metricName}_errors=" $1}' || echo "METRIC ${metricName}_errors=0"\n`;
+        lintContent += `else\n`;
+        lintContent += `  echo "# ${tool.name} not installed — run: ${tool.install}"\n`;
+        lintContent += `fi\n\n`;
+      }
+      fs.writeFileSync(path.join(checksDir, "lint.sh"), lintContent, "utf8");
+      created.push("lint.sh");
+    }
+
+    // Coverage / test script
+    const testTools = ecosystem.tools.filter(t =>
+      t.name.includes("test") || t.name.includes("jest") || t.name.includes("vitest") ||
+      t.name.includes("pytest") || t.name.includes("rspec") || t.name.includes("mvn")
+    );
+    if (testTools.length > 0) {
+      let covContent = "#!/bin/bash\n# .agile/checks/coverage.sh — Test coverage\n# Adjust to match your test runner.\n\n";
+      for (const tool of testTools) {
+        covContent += `# Tool: ${tool.name}\n# Install: ${tool.install}\n`;
+        covContent += `if command -v ${tool.name.split(" ")[0]} &>/dev/null; then\n`;
+        covContent += `  echo "--- ${tool.name} ---"\n`;
+        covContent += `  ${tool.check} 2>/dev/null || true\n`;
+        covContent += `else\n`;
+        covContent += `  echo "# ${tool.name} not installed — run: ${tool.install}"\n`;
+        covContent += `fi\n\n`;
+      }
+      fs.writeFileSync(path.join(checksDir, "coverage.sh"), covContent, "utf8");
+      created.push("coverage.sh");
+    }
+
+    // Check tool availability for warnings
+    for (const tool of ecosystem.tools) {
+      const cmd = tool.name.split(" ")[0];
+      try {
+        execSync(`${cmd} --version 2>/dev/null || ${cmd} version 2>/dev/null`, { cwd: workDir, timeout: 5000, encoding: "utf8" });
+      } catch {
+        warnings.push(`⚠️  \`${tool.name}\` not found. Install: \`${tool.install}\``);
+      }
+    }
+  }
+
+  // chmod +x (best-effort, fails silently on Windows)
+  try {
+    execSync(`chmod +x "${checksDir}"/*.sh`, { timeout: 3000, encoding: "utf8" });
+  } catch { /* not required on all platforms */ }
+
+  return { created, warnings };
+}
+
+// ─── Check runner ──────────────────────────────────────────────────────
+
+/**
+ * Run all scripts in .agile/checks/, parse METRIC lines, collect reports.
+ */
+function runChecks(workDir: string): DiscoveryResult {
+  const checksDir = path.join(workDir, ".agile", "checks");
+  const scripts = fs.readdirSync(checksDir).filter(f => f.endsWith(".sh"));
+
+  const metrics: Record<string, number> = {};
+  const reports: Record<string, string> = {};
+  const scriptsFound: string[] = [];
+
+  for (const script of scripts) {
+    const name = script.replace(/\.sh$/, "");
+    scriptsFound.push(name);
+
+    const raw = tryExecSync(`bash "${path.join(checksDir, script)}"`, workDir, 120_000);
+
+    // Parse METRIC lines and split from report text
+    const reportLines: string[] = [];
+    for (const line of raw.split("\n")) {
+      const m = line.match(/^METRIC\s+(\w[\w.]+)\s*=\s*([\d.]+)\s*$/);
+      if (m) {
+        metrics[m[1]] = parseFloat(m[2]);
+      } else {
+        reportLines.push(line);
+      }
+    }
+    reports[name] = reportLines.join("\n").trim();
+  }
+
+  return { metrics, reports, scriptsFound };
+}
+
+// ─── Fallback hardcoded detectors ──────────────────────────────────────
+
+function detectTool(workDir: string) {
   const pkgPath = path.join(workDir, "package.json");
   if (!fs.existsSync(pkgPath)) return { hasEslint: false, hasJest: false, hasTypeScript: false };
 
@@ -54,16 +297,15 @@ function buildScopeGlobs(scope: string[]): string {
 }
 
 async function runLinters(workDir: string, scope: string[]): Promise<string> {
-  const tools = detectProjectTools(workDir);
+  const tools = detectTool(workDir);
   const output: string[] = [];
 
   if (tools.hasEslint) {
     const scopeStr = buildScopeGlobs(scope);
-    output.push(`--- ESLint (${scopeStr}) ---`);
+    output.push("--- ESLint ---");
     output.push(tryExecSync(`npx eslint ${scopeStr} -f compact 2>&1 || true`, workDir));
   }
 
-  // Check for golangci-lint
   if (fs.existsSync(path.join(workDir, "go.mod"))) {
     output.push("--- golangci-lint ---");
     output.push(tryExecSync("golangci-lint run ./... 2>&1 || true", workDir));
@@ -73,7 +315,7 @@ async function runLinters(workDir: string, scope: string[]): Promise<string> {
 }
 
 async function runCoverage(workDir: string, scope: string[]): Promise<string> {
-  const tools = detectProjectTools(workDir);
+  const tools = detectTool(workDir);
 
   if (tools.hasJest) {
     const scopeStr = buildScopeGlobs(scope);
@@ -95,8 +337,7 @@ async function runComplexity(workDir: string, _scope: string[]): Promise<string>
 }
 
 async function scanTODOs(workDir: string, scope: string[]): Promise<string> {
-  // Cross-platform TODO scanning using Node.js (no grep dependency)
-  const extensions = [".ts", ".js", ".jsx", ".tsx", ".go", ".py", ".rs", ".java", ".rb", ".php", ".c", ".cpp", ".h"];
+  const extensions = [".ts", ".js", ".jsx", ".tsx", ".go", ".py", ".rs", ".java", ".rb", ".php", ".c", ".cpp", ".h", ".cs"];
   const patterns = ["TODO", "FIXME", "HACK", "XXX"];
   const results: string[] = [];
 
@@ -108,15 +349,13 @@ async function scanTODOs(workDir: string, scope: string[]): Promise<string> {
       return;
     }
     for (const entry of entries) {
-      // Skip node_modules, .git, dist, build
-      if (["node_modules", ".git", "dist", "build", ".next", "target", "__pycache__"].includes(entry.name)) continue;
+      if (["node_modules", ".git", "dist", "build", ".next", "target", "__pycache__", ".agile"].includes(entry.name)) continue;
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         scanDir(fullPath);
       } else if (entry.isFile()) {
         const ext = path.extname(entry.name).toLowerCase();
         if (!extensions.includes(ext)) continue;
-        // Check if file is in scope
         const relPath = path.relative(workDir, fullPath).replace(/\\/g, "/");
         const inScope = scope.length === 0 || scope.some((s) => {
           const glob = s.replace(/\*\*/g, "").replace(/\*/g, "");
@@ -124,6 +363,8 @@ async function scanTODOs(workDir: string, scope: string[]): Promise<string> {
         });
         if (!inScope) continue;
         try {
+          const stat = fs.statSync(fullPath);
+          if (stat.size > 1024 * 1024) continue; // skip files > 1MB
           const content = fs.readFileSync(fullPath, "utf-8");
           const lines = content.split("\n");
           for (let i = 0; i < lines.length; i++) {
@@ -141,37 +382,43 @@ async function scanTODOs(workDir: string, scope: string[]): Promise<string> {
 }
 
 async function runSecurityScan(workDir: string, scope: string[]): Promise<string> {
-  if (fs.existsSync(path.join(workDir, ".semgrep.yml")) || fs.existsSync(path.join(workDir, ".semgrep"))) {
-    const scopeStr = buildScopeGlobs(scope);
-    return tryExecSync(`semgrep scan --config p/default ${scopeStr} --json 2>&1 || true`, workDir);
-  }
-  return "(no semgrep config found)";
+  const scopeStr = buildScopeGlobs(scope);
+  return tryExecSync(`semgrep scan --config p/default ${scopeStr} --json 2>&1 || true`, workDir);
 }
 
-async function agentCodeReview(workDir: string, scope: string[]): Promise<string> {
-  // This is a placeholder — in production, the extension delegates to a scout subagent.
-  // The agent reads the raw codebase and provides findings.
-  // For now, return a message that the agent should perform code review manually.
-  return `[scout-subagent] Agent code review was not delegated.
-The main agent should review the codebase in scope (${scope.join(", ")}) 
-and identify improvement areas.`;
-}
+// ─── Public API ─────────────────────────────────────────────────────────
 
 /**
- * Run ALL discovery sources in parallel.
- * Returns raw output — the agent reads and decides what to create tasks for.
+ * Run discovery.
+ *
+ * Primary: runs .agile/checks/*.sh scripts.
+ * Fallback: hardcoded detectors when no checks directory exists or it's empty.
  */
 export async function runDiscovery(workDir: string, scope: string[]): Promise<DiscoveryResult> {
-  const [lint, coverage, complexity, todos, security, scout] = await Promise.all([
+  const checksDir = path.join(workDir, ".agile", "checks");
+
+  // Primary path: run .agile/checks/ scripts
+  if (fs.existsSync(checksDir)) {
+    const scripts = fs.readdirSync(checksDir).filter(f => f.endsWith(".sh"));
+    if (scripts.length > 0) {
+      return runChecks(workDir);
+    }
+  }
+
+  // Fallback: no scripts — use hardcoded detectors
+  const [lint, coverage, complexity, todos, security] = await Promise.all([
     runLinters(workDir, scope),
     runCoverage(workDir, scope),
     runComplexity(workDir, scope),
     scanTODOs(workDir, scope),
     runSecurityScan(workDir, scope),
-    agentCodeReview(workDir, scope),
   ]);
 
-  return { lint, coverage, complexity, todos, security, scout };
+  return {
+    metrics: {},
+    reports: { lint, coverage, complexity, todos, security },
+    scriptsFound: [],
+  };
 }
 
 /**
@@ -180,23 +427,31 @@ export async function runDiscovery(workDir: string, scope: string[]): Promise<Di
 export function formatDiscoveryResult(result: DiscoveryResult): string {
   const parts: string[] = [];
 
-  if (result.lint && result.lint !== "(no linter found)") {
-    parts.push("## Lint Results\n" + result.lint.slice(0, 4000));
+  // Metrics summary
+  const metricKeys = Object.keys(result.metrics);
+  if (metricKeys.length > 0) {
+    parts.push("## Metrics");
+    for (const key of metricKeys.sort()) {
+      parts.push(`  ${key} = ${result.metrics[key]}`);
+    }
+    parts.push("");
   }
-  if (result.coverage && !result.coverage.startsWith("(no coverage")) {
-    parts.push("## Coverage Results\n" + result.coverage.slice(0, 4000));
+
+  // Text reports
+  for (const [name, report] of Object.entries(result.reports)) {
+    if (!report || report.startsWith("(no ")) continue;
+    const heading = name.charAt(0).toUpperCase() + name.slice(1);
+    const truncated = report.length > 3000
+      ? report.slice(0, 3000) + `\n... (truncated, ${report.length - 3000} more chars)`
+      : report;
+    parts.push(`## ${heading} Results\n${truncated}`);
   }
-  if (result.complexity && !result.complexity.startsWith("(no complexity")) {
-    parts.push("## Complexity Results\n" + result.complexity.slice(0, 2000));
-  }
-  if (result.todos && result.todos !== "(no TODOs found)") {
-    parts.push("## TODO/FIXME/HACK\n" + result.todos.slice(0, 3000));
-  }
-  if (result.security && !result.security.startsWith("(no semgrep")) {
-    parts.push("## Security Results\n" + result.security.slice(0, 3000));
-  }
-  if (result.scout && !result.scout.startsWith("[scout-subagent]")) {
-    parts.push("## Scout Findings\n" + result.scout.slice(0, 3000));
+
+  // Notice when using fallback
+  if (result.scriptsFound.length === 0 && metricKeys.length === 0) {
+    parts.push("## ℹ️  No .agile/checks/ Scripts");
+    parts.push("Run `/agile init-checks` to generate template scripts for your project ecosystem.");
+    parts.push("Scripts give you full control over discovery — custom metrics, any language, any tool.");
   }
 
   return parts.length > 0 ? parts.join("\n\n") : "(no discovery results)";

@@ -15,6 +15,7 @@ const AGILE_SUBCOMMANDS: { value: string; label: string; description: string }[]
   { value: "config", label: "config", description: "Show current configuration" },
   { value: "model", label: "model <role> <model>", description: "Set agent model: model worker zai-glm/glm-5.2" },
   { value: "observer", label: "observer", description: "Toggle observer on/off" },
+  { value: "init-checks", label: "init-checks", description: "Generate/update .agile/checks/ scripts for your project ecosystem" },
 ];
 
 /** Filter subcommands by prefix for autocomplete. */

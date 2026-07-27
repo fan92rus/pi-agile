@@ -22,7 +22,7 @@ import * as path from "node:path";
 
 import { KnowledgeBase } from "./parallel/knowledge.ts";
 import { SprintStore, type SprintState, type SprintTask, type SprintVelocity } from "./parallel/sprint.ts";
-import { runDiscovery, formatDiscoveryResult } from "./parallel/discovery.ts";
+import { runDiscovery, formatDiscoveryResult, initChecks, detectEcosystem, type EcosystemInfo } from "./parallel/discovery.ts";
 import { buildChainAgentTask, buildReviewerTask, buildWorkerTask, parseReviewVerdict } from "./parallel/review.ts";
 import { RpcClient, type SpawnedWorker } from "./parallel/rpc.ts";
 import {
@@ -1090,11 +1090,35 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       const scope = (params.scope as string[]) ?? extractScope(project);
 
       const result = await runDiscovery(workDir, scope);
+      const eco = detectEcosystem(workDir);
       const text = formatDiscoveryResult(result);
 
+      // Detect missing tools and recommend setup
+      let missingBlock = "";
+      if (eco) {
+        const missing = eco.tools.filter(t => {
+          try {
+            require("child_process").execSync(t.name.split(" ")[0] + " --version", { cwd: workDir, timeout: 3000, encoding: "utf8" });
+            return false;
+          } catch {
+            try {
+              require("child_process").execSync(t.name.split(" ")[0] + " version", { cwd: workDir, timeout: 3000, encoding: "utf8" });
+              return false;
+            } catch {
+              return true;
+            }
+          }
+        });
+        if (missing.length > 0) {
+          missingBlock = "## \u2699\ufe0f Tools Not Found\n" +
+            "Run /agile init-checks to generate scripts, or install manually:\n" +
+            missing.map(t => "- " + t.name + ": `" + t.install + "`").join("\n") + "\n\n";
+        }
+      }
+
       return {
-        content: [{ type: "text" as const, text: `# Discovery Results\n\n${text}` }],
-        details: { sourceCount: 6 },
+        content: [{ type: "text" as const, text: `# Discovery Results\n\n${missingBlock}${text}` }],
+        details: { scriptsFound: result.scriptsFound, metricCount: Object.keys(result.metrics).length },
       };
     },
   });
@@ -1760,7 +1784,30 @@ do_not_do:
           ctx.ui.notify("⚠ Not a git repo. Run git init first.", "error");
         }
 
-        ctx.ui.notify(lines.join("\n") + `\n\n✅ Setup complete! Configs created in ${agileDir}/\n\nNext: /agile on`, "info");
+        // 8. Generate .agile/checks/ scripts
+        ctx.ui.notify("Generating discovery scripts...", "info");
+        const checksResult = initChecks(workDir);
+        const eco = detectEcosystem(workDir);
+        let checksMsg = `\nCreated ${checksResult.created.length} check script(s): ${checksResult.created.join(", ")}`;
+        if (eco) checksMsg += ` (detected: ${eco.language})`;
+        if (checksResult.warnings.length > 0) {
+          checksMsg += `\n\n⚠ Setup needed:\n${checksResult.warnings.join("\n")}`;
+        }
+
+        ctx.ui.notify(lines.join("\n") + `\n${checksMsg}\n\n✅ Setup complete! Configs created in ${agileDir}/\n\nNext: /agile on`, "info");
+        return;
+      }
+
+      if (command === "init-checks") {
+        const checksResult = initChecks(workDir);
+        const eco = detectEcosystem(workDir);
+        let msg = `Created ${checksResult.created.length} check script(s): ${checksResult.created.join(", ")}`;
+        if (eco) msg += ` (detected: ${eco.language})`;
+        if (checksResult.warnings.length > 0) {
+          msg += `\n\n⚠ Setup needed:\n${checksResult.warnings.join("\n")}`;
+          msg += `\n\nInstall the missing tools, then run \`agile_discover\` to validate.`;
+        }
+        ctx.ui.notify(msg, "info");
         return;
       }
 
@@ -2178,11 +2225,13 @@ function agileHelp(): string {
 
 \`/agile on\`       — Enable agile mode (tools + system prompt active)
 \`/agile off\`      — Disable agile mode
-\`/agile setup\`    — Run setup wizard (creates .agile/project.yaml + constraints.yaml)
+\`/agile setup\`    — Run setup wizard (creates .agile/project.yaml + constraints.yaml + check scripts)
+\`/agile init-checks\` — Generate/update .agile/checks/ scripts for your project ecosystem
 \`/agile status\`   — Show current sprint status
 \`/agile stop\`     — Graceful stop
 \`/agile config\`   — Show configuration
 \`/agile observer\` — Toggle observer on/off
+\`/agile model\`    — Set agent models (worker, reviewer, scout, researcher, planner)
 
 ## Workflow
 1. \`/agile setup\` — configure project
