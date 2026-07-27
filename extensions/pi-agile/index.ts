@@ -21,7 +21,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { KnowledgeBase } from "./parallel/knowledge.ts";
-import { SprintStore, type SprintState } from "./parallel/sprint.ts";
+import { SprintStore, type SprintState, type SprintTask, type SprintVelocity } from "./parallel/sprint.ts";
 import { runDiscovery, formatDiscoveryResult } from "./parallel/discovery.ts";
 import { buildChainAgentTask, buildReviewerTask, buildWorkerTask, parseReviewVerdict } from "./parallel/review.ts";
 import { RpcClient, type SpawnedWorker } from "./parallel/rpc.ts";
@@ -1525,23 +1525,7 @@ ${workerSummary.slice(0, 1000)}`;
 
       // Build retrospective text
       const v = sprint.velocity;
-      const retroText = `# Sprint ${sprint.id} Retrospective
-
-## Velocity
-- Attempted: ${v.attempted}
-- Done: ${v.done}
-- Rework: ${v.rework}
-- Blocked: ${v.blocked}
-- Avg review rounds: ${v.avg_review_rounds.toFixed(1)}
-
-## Your Tasks
-1. Formulate lessons learned from this sprint
-2. Record them via \`agile_knowledge({ action: "append", type: "lesson", finding: "..." })\`
-3. Read the stop-check message below
-4. Run stop criteria check commands yourself
-5. Decide: stop or continue to next sprint
-
-${buildStopCheckMessage(workDir, sprint.id)}`;
+      const retroText = buildRetrospectiveText(sprint, workDir, v, runtime.knowledge);
 
       return {
         content: [{ type: "text" as const, text: retroText }],
@@ -1963,6 +1947,199 @@ ${conditionLines}
 Run the check commands yourself and decide if criteria are met.
 If met → stop (do not start next sprint).
 If not met → start next sprint.`;
+}
+
+/**
+ * Build a structured retrospective with per-task breakdown, trends,
+ * dead-end analysis, lessons, recommendations, and self-reflection.
+ */
+function buildRetrospectiveText(
+  sprint: SprintState,
+  workDir: string,
+  v: SprintVelocity,
+  knowledge: KnowledgeBase,
+): string {
+
+  // ── Per-task breakdown ──
+  const taskLines = sprint.tasks.map((t: SprintTask) => {
+    const icon = t.status === "done" ? "✅" : t.status === "blocked" ? "🚫" : t.status === "rework" ? "🔄" : "⏳";
+    const verdict = t.final_verdict ? ` verdict: ${t.final_verdict}` : "";
+    return `  ${icon} ${t.bd_id}: ${t.title} — ${t.status}${verdict} (${t.review_rounds} review rounds)`;
+  }).join("\n");
+
+  // ── Previous sprint comparison ──
+  let trendLine = "";
+  for (let i = sprint.id - 1; i >= 0; i--) {
+    const agileDir = path.join(workDir, ".agile");
+    const f = path.join(agileDir, `sprint-${i}.json`);
+    if (fs.existsSync(f)) {
+      try {
+        const prev = JSON.parse(fs.readFileSync(f, "utf8")) as { velocity?: SprintVelocity };
+        const pv = prev.velocity;
+        if (pv) {
+          const doneDelta = v.done - pv.done;
+          const reworkDelta = v.rework - pv.rework;
+          trendLine = `
+## Trend vs Sprint ${i}
+- Done: ${v.done} (${doneDelta >= 0 ? "+" : ""}${doneDelta} vs ${pv.done})
+- Rework: ${v.rework} (${reworkDelta >= 0 ? "+" : ""}${reworkDelta} vs ${pv.rework})
+- Avg review rounds: ${v.avg_review_rounds.toFixed(1)} vs ${pv.avg_review_rounds?.toFixed(1) ?? "?"}
+`;
+        }
+      } catch {}
+      break; // only first previous sprint
+    }
+  }
+
+  // ── Rework & Blocked Analysis ──
+  const problemTasks = sprint.tasks.filter((t: SprintTask) => t.status === "rework" || t.status === "blocked");
+  let reworkAnalysis = "";
+  if (problemTasks.length > 0) {
+    reworkAnalysis = `
+## Rework & Blocked Analysis
+${problemTasks.slice(0, 3).map((t: SprintTask) => {
+  const agileDir = path.join(workDir, ".agile");
+  let items: string[] = [];
+  try {
+    const files = fs.readdirSync(agileDir).filter(f => f.startsWith(`review-${t.bd_id}`));
+    items = files.flatMap(f => {
+      try {
+        const content = fs.readFileSync(path.join(agileDir, f), "utf8");
+        const verdict = parseReviewVerdict(content);
+        return verdict.action_items;
+      } catch { return []; }
+    });
+  } catch {}
+  const itemsText = items.length > 0 ? items.map(a => `    - ${a}`).join("\n") : "    (no action items extracted)";
+  return `  ${t.bd_id}: ${t.title} [${t.status}]\n${itemsText}`;
+}).join("\n")}
+`;
+  }
+
+  // ── Lessons from knowledge ──
+  const allLessons = knowledge.getByType("lesson").slice(-10);
+  const knowledgeSummary = allLessons.length > 0
+    ? `
+## Lessons Learned This Sprint
+${allLessons.map((l: { finding?: string }) => `  - ${l.finding ?? "(no text)"}`).join("\n")}
+`
+    : "";
+
+  // ── Recommendations ──
+  const recs: string[] = [];
+  if (v.blocked > 0) {
+    recs.push(`🔴 ${v.blocked} task(s) blocked — review do_not_retry in knowledge, consider splitting`);
+  }
+  if (v.rework > v.done && v.done > 0) {
+    recs.push(`🔄 Rework (${v.rework}) exceeds done (${v.done}) — tasks may be too complex or need scout in chain`);
+  }
+  if (v.avg_review_rounds > 2) {
+    recs.push(`👁️ High avg review rounds (${v.avg_review_rounds.toFixed(1)}) — improve task descriptions or check worker model quality`);
+  }
+  if (v.done === 0 && sprint.tasks.length > 0) {
+    recs.push(`⚠️ Nothing completed — check task sizing, tool setup, and worker spawn timeout`);
+  }
+  const recsText = recs.length > 0 ? `
+## Recommendations
+${recs.join("\n")}
+` : "";
+
+  // ── Self-Reflection (context-dependent) ──
+  const ref: string[] = ["## Self-Reflection (answer before proceeding)\n"];
+  ref.push(`This sprint had ${v.attempted} tasks: ${v.done} done, ${v.rework} rework, ${v.blocked} blocked, ` +
+    `${v.avg_review_rounds.toFixed(1)} avg review rounds. Go through each section and write your analysis.`);
+
+  // 1. Process (always)
+  ref.push(`\n### 1. Process\n` +
+    `- Which tasks were straightforward and which dragged? For each dragged task: was the problem in planning, implementation, or review?\n` +
+    `- Did the agent chain help or hurt? Would a different chain have changed any outcome?\n` +
+    `- Were task descriptions detailed enough? Did workers go off-target or miss acceptance criteria?\n` +
+    `- What specific tool call or parameter would you change if replaying this sprint?`);
+
+  // 2. Blocked (conditional)
+  if (v.blocked > 0) {
+    const blockedList = sprint.tasks.filter((t: SprintTask) => t.status === "blocked").map((t: SprintTask) => `${t.bd_id} (${t.title})`).join(", ");
+    ref.push(`\n### 2. Blocked Tasks — ${blockedList}\n` +
+      `- Is each blockade a fundamental dead-end or a solvable problem that needs re-scoping?\n` +
+      `- Could the block have been detected earlier (task creation, scout, planning) rather than after implementation?\n` +
+      `- For each blocked task: split, change approach, or defer? Be specific about the next action.`);
+  }
+
+  // 3. Rework overhead (conditional)
+  if (v.rework > v.done && v.done > 0) {
+    ref.push(`\n### 3. Rework Overhead\n` +
+      `Rework (${v.rework}) outpaces completed work (${v.done}). Which cause fits best?\n` +
+      `- **Task too large**: keep LOC limit lower or split more aggressively\n` +
+      `- **AC unclear**: acceptance criteria didn't capture edge cases — need more detail\n` +
+      `- **Chain mismatch**: worker lacked context (no scout, no patterns) → reviewer caught what scout should have\n` +
+      `- **Knowledge gap**: constraints/patterns not in .agile/knowledge.jsonl → worker didn't know the rules\n` +
+      `Pick ONE and commit to a concrete change for next sprint.`);
+  }
+
+  // 4. Review bottleneck (conditional)
+  if (v.avg_review_rounds > 2) {
+    ref.push(`\n### 4. Review Bottleneck\n` +
+      `Reviews averaged ${v.avg_review_rounds.toFixed(1)} rounds. Consider:\n` +
+      `- **Worker model**: is the model capable enough? Check if rework items are about correctness vs style\n` +
+      `- **Spec clarity**: did workers deviate because AC was ambiguous?\n` +
+      `- **Premature review**: was the worker asked to review half-baked changes? (worker must commit only green tests)\n` +
+      `- **Reviewer too strict**: optional style preferences vs genuine constraint violations?\n` +
+      `Pick the dominant cause and decide one change.`);
+  }
+
+  // 5. Zero completion (conditional)
+  if (v.done === 0 && sprint.tasks.length > 0) {
+    ref.push(`\n### 5. Zero Completion\n` +
+      `No tasks completed — red flag. Root causes to check:\n` +
+      `- **Over-estimation**: tasks too large for one sprint? Next time 1-2 trivial tasks max\n` +
+      `- **Setup issues**: missing tools, failing tests, worker couldn't run the project?\n` +
+      `- **Wrong scope**: tasks touched out-of-scope files and got blocked\n` +
+      `- **Infrastructure**: worker timeouts, spawn failures — increase spawn_timeout in config\n` +
+      `Diagnose root cause and decide: re-scope, increase timeout, or fix setup before next sprint.`);
+  }
+
+  // 6. Trajectory (conditional on having previous sprint)
+  if (trendLine) {
+    ref.push(`\n### 6. Trajectory\n` +
+      `Compare this sprint (${v.done} done, ${v.rework} rework) to the previous sprint.\n` +
+      `- If improving: what changed? Is this sustainable or a lucky sprint?\n` +
+      `- If declining: is the codebase harder to change (tech debt) or are tasks genuinely harder?\n` +
+      `- Is velocity stable enough to plan, or is variance too high?`);
+  }
+
+  // 7. What worked (conditional on having done > 0)
+  if (v.done > 0) {
+    ref.push(`\n### 7. What Worked\n` +
+      `- Identify 1-2 practices that contributed to successful tasks.\n` +
+      `- Should these be recorded as patterns in .agile/knowledge.jsonl?\n` +
+      `- Anything to start doing (new chain, better descriptions, pre-discovery)?`);
+  }
+
+  // 8. Decision
+  ref.push(`\n### 8. Decision\n` +
+    `After answering the questions above:\n` +
+    `- **Continue**: start next sprint with the improvements you identified\n` +
+    `- **Stop**: criteria met or direction needs re-evaluation\n` +
+    `\n**Before deciding, record at least one lesson via:**\n` +
+    `\`agile_knowledge({ action: "append", type: "lesson", finding: "..." })\``);
+
+  const reflectionText = ref.join("\n");
+
+  return `# Sprint ${sprint.id} Retrospective
+
+## Velocity
+- Attempted: ${v.attempted}
+- Done: ${v.done}
+- Rework: ${v.rework}
+- Blocked: ${v.blocked}
+- Avg review rounds: ${v.avg_review_rounds.toFixed(1)}
+
+## Task Breakdown
+${taskLines}
+${trendLine}${reworkAnalysis}${knowledgeSummary}${recsText}
+${reflectionText}
+
+${buildStopCheckMessage(workDir, sprint.id)}`;
 }
 
 // ---------------------------------------------------------------------------
