@@ -858,15 +858,24 @@ ${workerSummary.slice(0, 1000)}`;
         };
       }
 
-      // Run main checks (lint + test)
-      const project = loadProjectConfig(workDir);
-      const scope = extractScope(project);
+      // Run main checks (test, optionally lint)
       let checksOutput = "";
-      checksOutput += await execText(pi, "npx", ["eslint", ...scope], workDir, 60_000);
+
+      // Only run eslint if config exists
+      const hasEslint = [".eslintrc", ".eslintrc.js", ".eslintrc.json", ".eslintrc.yaml", "eslint.config.js", "eslint.config.mjs"]
+        .some((f) => fs.existsSync(path.join(workDir, f)));
+      if (hasEslint) {
+        const result = await execText(pi, "npx", ["eslint", "."], workDir, 60_000);
+        if (result.trim()) checksOutput += `## Lint\n${result.slice(0, 1000)}\n\n`;
+      }
+
+      // Run tests
       if (fs.existsSync(path.join(workDir, "package.json"))) {
-        checksOutput += await execText(pi, "npm", ["test"], workDir, 120_000);
+        const result = await execText(pi, "npm", ["test"], workDir, 120_000);
+        if (result.trim()) checksOutput += `## Tests\n${result.slice(0, 2000)}`;
       } else if (fs.existsSync(path.join(workDir, "go.mod"))) {
-        checksOutput += await execText(pi, "go", ["test", "./..."], workDir, 120_000);
+        const result = await execText(pi, "go", ["test", "./..."], workDir, 120_000);
+        if (result.trim()) checksOutput += `## Tests\n${result.slice(0, 2000)}`;
       }
 
       // Update sprint state
@@ -894,7 +903,7 @@ ${workerSummary.slice(0, 1000)}`;
       return {
         content: [{
           type: "text" as const,
-          text: `✅ Task ${bdId} merged to main.\n\n## Main Checks Output\n${checksOutput.slice(0, 2000) || "(no checks run)"}`,
+          text: `✅ Task ${bdId} merged to main.\n\n## Main Checks Output\n${checksOutput.trim() || "(no lint config or test runner found — verify manually)"}`,
         }],
       };
     },

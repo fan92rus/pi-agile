@@ -164,11 +164,15 @@ ${deadEnds || "(none recorded yet)"}
 1. Implement ONLY the change needed to satisfy the acceptance criteria.
 2. Follow existing code patterns and conventions.
 3. Add or update tests for ALL changed code.
-4. Verify your code works: run linting and tests before committing.
-5. Commit with conventional commit format (feat:, fix:, refactor:, test:, docs:).
-6. Do NOT merge to main — the orchestrator handles merge after review.
-7. Do NOT modify files outside the project scope.
-8. Keep changes minimal — no refactoring beyond what the task requires.
+4. Run the tests to verify your code works.
+5. **IMPORTANT: Commit your changes**
+   - \`git add -A && git commit -m "feat: <description of change>"\`
+   - Use conventional commit format (feat:, fix:, refactor:, test:, docs:).
+   - Only commit the files you changed for this task.
+   - Do NOT merge to main — the orchestrator handles merge after review.
+6. Do NOT modify files outside the project scope.
+7. Keep changes minimal — no refactoring beyond what the task requires.
+8. Do NOT close the bd task (bd close) — the orchestrator does that after merge.
 
 ## Returns
 Return a summary of changes made: files modified, approach taken, lines of code.`;
