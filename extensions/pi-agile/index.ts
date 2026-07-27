@@ -1803,12 +1803,26 @@ do_not_do:
         ctx.ui.notify(lines.join("\n") + checksMsg + "\n\n\u2705 Setup complete! Configs created in " + agileDir + "/", "info");
 
         // Trigger agent to edit scripts and start discovery
-        const setupAgentMsg = `Project configured in .agile/. Next steps:
-1. Read and edit .agile/checks/*.sh scripts — fix commands and paths for this project
-2. Install any missing tools
-3. Run agile_discover to validate
-4. Create tasks in bd from discovery results
-5. Call agile_start_sprint to begin`;
+        const ecoLang = eco ? eco.language : "unknown";
+        const setupAgentMsg = `/agile setup complete. Project configured in .agile/ (ecosystem: ${ecoLang}).
+
+You MUST now:
+1. READ the generated scripts in .agile/checks/ and FIX them for this project:
+   - lint.sh: verify linter command, flags, config file, and target paths
+   - coverage.sh: verify test runner points to the right project/solution file
+   - todos.sh: verify file extensions match your languages
+2. INSTALL missing tools (npm install, pip install, etc.)
+3. RUN agile_discover — every section must produce real output
+4. If a section is empty or errors, fix the script and re-run
+5. Create tasks in bd from discovery results (bd create "title" -d "desc")
+6. Call agile_start_sprint to begin the sprint
+
+Common fixes:
+- dotnet: dotnet test needs .sln path (dotnet test src/Project.sln)
+- js/ts: eslint needs eslint.config.js, vitest needs vitest.config.ts
+- python: ruff needs pyproject.toml, pytest needs to find tests
+
+Do NOT create tasks until agile_discover works.`;
         await pi.sendUserMessage(setupAgentMsg, { deliverAs: "followUp" });
         return;
       }
@@ -1840,8 +1854,27 @@ do_not_do:
         ctx.ui.notify(msg, "info");
 
         // Trigger agent to edit and validate the scripts
-        const agentMsg = `Check scripts created in .agile/checks/: ${checksResult.created.join(", ")}.
-Read each script, fix the commands and paths for this project, install any missing tools, then run agile_discover to validate they produce real output.`;
+        const ecoLang = eco ? eco.language : "unknown";
+        const ecoTools = eco ? eco.tools.map((t: any) => t.name).join(", ") : "none";
+        const agentMsg = `/agile init-checks created ${checksResult.created.length} scripts in .agile/checks/ (ecosystem: ${ecoLang}, tools: ${ecoTools}).
+
+You MUST now:
+1. READ each script: ${checksResult.created.map((s: string) => "`.agile/checks/" + s + "`").join(", ")}
+2. FIX commands and paths for THIS project — the scripts are templates, not final:
+   - todos.sh: check the file extensions match your languages
+   - lint.sh: verify the linter command works (correct flags, config file, target paths)
+   - coverage.sh: verify the test command points to the right project/solution file
+3. INSTALL missing tools if needed (npm install, pip install, dotnet, etc.)
+4. RUN agile_discover to validate — every section should produce real output, not "(not configured)"
+5. If a section returns empty or errors, fix the script and re-run agile_discover
+
+Common fixes by ecosystem:
+- dotnet: "dotnet test" needs the .sln or .csproj path, e.g. dotnet test src/Project.sln
+- js/ts: npx eslint needs a config (eslint.config.js), npx vitest needs vitest.config.ts
+- go: golangci-lint needs .golangci.yml, go test runs from module root
+- python: ruff needs pyproject.toml config, pytest needs to find tests
+
+Do NOT proceed to task creation until agile_discover returns meaningful results.`;
         await pi.sendUserMessage(agentMsg, { deliverAs: "followUp" });
         return;
       }
