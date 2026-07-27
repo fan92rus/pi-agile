@@ -42,6 +42,6 @@
     "package.json"
   ],
   "scripts": {
-    "test": "echo \"Tests: TBD\""
+    "test": "node --experimental-strip-types tests/smoke.test.mjs"
   }
 }
