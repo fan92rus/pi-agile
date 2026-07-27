@@ -233,7 +233,17 @@ echo "METRIC fixme_count=$FIXME"
       covContent += `# Tool: ${tool.name}\n# Install: ${tool.install}\n`;
       covContent += `if command -v ${tool.name.split(" ")[0]} &>/dev/null; then\n`;
       covContent += `  echo "--- ${tool.name} ---"\n`;
-      covContent += `  ${tool.check} 2>/dev/null || true\n`;
+      // dotnet test needs the solution/project path when not in src dir
+      if (tool.name === "dotnet test") {
+        covContent += `  SLN=\$(find . -name "*.sln" -not -path "./.agile/*" 2>/dev/null | head -1)\n`;
+        covContent += `  if [ -n "\$SLN" ]; then\n`;
+        covContent += `    ${tool.check} "\$SLN" 2>/dev/null || true\n`;
+        covContent += `  else\n`;
+        covContent += `    ${tool.check} 2>/dev/null || true\n`;
+        covContent += `  fi\n`;
+      } else {
+        covContent += `  ${tool.check} 2>/dev/null || true\n`;
+      }
       covContent += `else\n`;
       covContent += `  echo "# ${tool.name} not installed — run: ${tool.install}"\n`;
       covContent += `fi\n\n`;
@@ -275,12 +285,80 @@ echo "METRIC fixme_count=$FIXME"
   return { created, warnings };
 }
 
+// ─── Auto-install ────────────────────────────────────────────────────────
+
+/**
+ * Try to install missing ecosystem tools via package manager.
+ * Returns lists of what was installed and what still needs manual setup.
+ */
+export function autoInstallTools(workDir: string, ecosystem: EcosystemInfo | null): { installed: string[]; failed: string[] } {
+  if (!ecosystem) return { installed: [], failed: [] };
+
+  const installed: string[] = [];
+  const failed: string[] = [];
+
+  for (const tool of ecosystem.tools) {
+    const cmd = tool.name.split(" ")[0];
+    // Check if already installed
+    try {
+      execSync(`${cmd} --version`, { cwd: workDir, timeout: 5000, encoding: "utf8", stdio: ["ignore", "ignore", "pipe"] });
+      continue;
+    } catch { /* need install */ }
+
+    const installCmd = tool.install;
+    if (installCmd.startsWith("npm") || installCmd.startsWith("pip") || installCmd.startsWith("go")) {
+      try {
+        execSync(installCmd, { cwd: workDir, timeout: 120000, encoding: "utf8", stdio: ["ignore", "ignore", "pipe"] });
+        installed.push(tool.name);
+        continue;
+      } catch {
+        failed.push(tool.name);
+        continue;
+      }
+    }
+    // tools that ship with SDK (dotnet format, go test) — mark as needing SDK
+    if (installCmd === "(built-in)" || installCmd === "(included in .NET SDK)") {
+      failed.push(tool.name + " (needs SDK installed)");
+      continue;
+    }
+    failed.push(tool.name);
+  }
+
+  return { installed, failed };
+}
+
+/**
+ * Validate generated checks scripts by running them and collecting output.
+ */
+export function validateCheckScripts(workDir: string, created: string[]): string[] {
+  const checksDir = path.join(workDir, ".agile", "checks");
+  const results: string[] = [];
+
+  for (const script of created) {
+    const scriptPath = path.join(checksDir, script).replace(/\\/g, "/");
+    try {
+      const out = execSync(`bash "${scriptPath}"`, { cwd: workDir, timeout: 30000, encoding: "utf8", maxBuffer: 50 * 1024 });
+      const lines = out.trim().split("\n").filter(l => !l.startsWith("METRIC"));
+      const nonMetric = lines.filter(l => l.trim()).join("\n").slice(0, 500);
+      results.push(`## ${script}\n${nonMetric || "(no output)"}`);
+    } catch (e: unknown) {
+      const err = e as { stderr?: Buffer | string; stdout?: Buffer | string; message?: string };
+      const stderr = err.stderr?.toString().trim() || err.message || "unknown error";
+      const stdout = err.stdout?.toString().trim() || "";
+      const outLines = stdout.split("\n").concat(stderr.split("\n")).filter((l: string) => !l.startsWith("METRIC") && l.trim()).slice(0, 5);
+      results.push(`## ${script}\n⚠ ${outLines.join("\n") || "script failed"}`);
+    }
+  }
+
+  return results;
+}
+
 // ─── Check runner ──────────────────────────────────────────────────────
 
 /**
  * Run all scripts in .agile/checks/, parse METRIC lines, collect reports.
  */
-function runChecks(workDir: string): DiscoveryResult {
+export function runChecks(workDir: string): DiscoveryResult {
   const checksDir = path.join(workDir, ".agile", "checks");
   const scripts = fs.readdirSync(checksDir).filter(f => f.endsWith(".sh"));
 

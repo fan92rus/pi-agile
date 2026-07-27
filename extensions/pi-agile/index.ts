@@ -914,11 +914,12 @@ bd priority <id> high    # set priority: high, medium, low
 ### Phase 0: Project Setup (MUST DO first)
 1. **Run \`/agile init-checks\`** — generates .agile/checks/{todos,lint,coverage}.sh
    for your project's ecosystem (Go, Rust, .NET, Python, JS/TS, etc.)
-2. **Review generated scripts** in .agile/checks/ — edit if auto-detection failed
-3. **Install missing tools** shown in warnings (e.g. eslint, ruff, dotnet-format)
-4. **Run \`agile_discover\`** to validate scripts produce real results
-5. **Create Phase 0 tasks** in bd for any tools that need config setup
-6. Only proceed to Phase 1 after \`agile_discover\` returns meaningful output
+2. **Edit the generated scripts** — they have placeholders; fix paths, commands,
+   and file extensions to match your project
+3. **Install missing tools** (eslint, ruff, dotnet, etc.) via package manager
+4. **Run \`agile_discover\`** to validate scripts produce real output
+5. **Iterate** — if \`agile_discover\` returns empty sections, fix the scripts
+6. Only proceed to Phase 1 after \`agile_discover\` returns meaningful results
 
 ### Phase 1: Discovery
 1. Call \`agile_discover\` tool — returns raw lint/coverage/TODO/security output
@@ -1778,48 +1779,55 @@ do_not_do:
           ctx.ui.notify("⚠ Not a git repo. Run git init first.", "error");
         }
 
-        // 8. Generate .agile/checks/ scripts
         ctx.ui.notify("Generating discovery scripts...", "info");
         const checksResult = initChecks(workDir);
         const eco = detectEcosystem(workDir);
         let checksMsg = `\nCreated ${checksResult.created.length} check script(s): ${checksResult.created.join(", ")}`;
         if (eco) checksMsg += ` (detected: ${eco.language})`;
         if (checksResult.warnings.length > 0) {
-          checksMsg += `\n\n⚠ Agent must fix BEFORE agile_discover:\n${checksResult.warnings.join("\n")}`;
-        }
-        checksMsg += `\n\n## Agent instructions\n`;
-        if (eco) {
-          checksMsg += `1. Install missing tools (commands above)\n`;
-          checksMsg += `2. Review generated scripts in .agile/checks/\n`;
-          checksMsg += `3. Run \`agile_discover\` to validate`;
-        } else {
-          checksMsg += `1. Auto-detection failed — edit .agile/checks/lint.sh with your linter\n`;
-          checksMsg += `2. Edit .agile/checks/coverage.sh with your test command\n`;
-          checksMsg += `3. Install any needed tools\n`;
-          checksMsg += `4. Run \`agile_discover\` to validate`;
+          checksMsg += `\n\n⚠ ${checksResult.warnings.join("\n")}`;
         }
 
-        ctx.ui.notify(lines.join("\n") + `\n${checksMsg}\n\n✅ Setup complete! Configs created in ${agileDir}/`, "info");
+        checksMsg += `\n\n## Agent: edit these scripts before using\n`;
+        checksMsg += `Review each script in .agile/checks/ and fix paths/commands for your project:\n`;
+        for (const script of checksResult.created) {
+          const hints: Record<string, string> = {
+            "lint.sh": "Set the correct linter command and flags",
+            "coverage.sh": "Set the correct test runner and test path",
+            "todos.sh": "Adjust file extensions to match project languages",
+          };
+          checksMsg += `  - .agile/checks/${script} — ${hints[script] || ""}\n`;
+        }
+        checksMsg += `\nThen run \`agile_discover\` to validate.`;
+
+        ctx.ui.notify(lines.join("\n") + checksMsg + "\n\n✅ Setup complete! Configs created in " + agileDir + "/", "info");
         return;
       }
 
       if (command === "init-checks") {
         const checksResult = initChecks(workDir);
         const eco = detectEcosystem(workDir);
+
         let msg = `Created ${checksResult.created.length} check script(s): ${checksResult.created.join(", ")}`;
         if (eco) msg += ` (detected: ${eco.language})`;
+
         if (checksResult.warnings.length > 0) {
-          msg += `\n\n⚠ Setup needed:\n${checksResult.warnings.join("\n")}`;
+          msg += `\n\n⚠ ${checksResult.warnings.join("\n")}`;
         }
-        msg += `\n\n## Next steps for the agent\n`;
-        msg += `1. Install missing tools using the commands above\n`;
-        if (!eco) {
-          msg += `2. Edit \`.agile/checks/lint.sh\` with your project's linter\n`;
-          msg += `3. Edit \`.agile/checks/coverage.sh\` with your test runner\n`;
-          msg += `4. Run \`agile_discover\` to validate the scripts work`;
-        } else {
-          msg += `2. Run \`agile_discover\` to verify detection works`;
+
+        msg += `\n\n## Agent: edit these scripts before using\n`;
+        msg += `Review each script in .agile/checks/ and fix paths/commands for your project:\n`;
+        for (const script of checksResult.created) {
+          const hints: Record<string, string> = {
+            "lint.sh": "Set the correct linter command and flags for your project",
+            "coverage.sh": "Set the correct test runner and test path for your project",
+            "todos.sh": "Adjust file extensions to match your project languages",
+          };
+          const hint = hints[script] || "";
+          msg += `  - \`.agile/checks/${script}\` — ${hint}\n`;
         }
+        msg += `\nRun \`agile_discover\` after editing to validate.`;
+
         ctx.ui.notify(msg, "info");
         return;
       }
