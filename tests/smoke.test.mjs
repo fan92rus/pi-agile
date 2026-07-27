@@ -209,6 +209,119 @@ await test("trackConstraintViolation increments", () => {
   assert.strictEqual(obs.constraintViolations.get("rule1"), 3);
 });
 
+// ── YAML parser ──────────────────────────────────────────────
+console.log("\n## YAML parser");
+
+function parseSimpleYaml(text) {
+  const result = {};
+  const lines = text.split('\n');
+  const stack = [{ indent: -1, obj: result }];
+  let i = 0;
+  while (i < lines.length) {
+    const rawLine = lines[i].replace(/\r$/, '');
+    if (!rawLine.trim() || rawLine.trim().startsWith('#')) { i++; continue; }
+    const indent = rawLine.length - rawLine.trimStart().length;
+    const content = rawLine.trim();
+    while (stack.length > 1 && stack[stack.length - 1].indent >= indent) { stack.pop(); }
+    const current = stack[stack.length - 1].obj;
+    if (content.startsWith('- ')) {
+      const value = content.slice(2).trim();
+      const topObj = stack[stack.length - 1].obj;
+      const topKeys = Object.keys(topObj);
+      if (stack.length > 1 && topKeys.length === 0) {
+        const parent = stack[stack.length - 2].obj;
+        const parentKeys = Object.keys(parent);
+        for (let k = parentKeys.length - 1; k >= 0; k--) {
+          if (parent[parentKeys[k]] === topObj) {
+            parent[parentKeys[k]] = [parseYamlValue(value)];
+            stack.pop();
+            break;
+          }
+        }
+      } else {
+        for (let k = topKeys.length - 1; k >= 0; k--) {
+          if (Array.isArray(topObj[topKeys[k]])) {
+            topObj[topKeys[k]].push(parseYamlValue(value));
+            break;
+          }
+        }
+      }
+      i++;
+    } else if (content.includes(':')) {
+      const colonIdx = content.indexOf(':');
+      const key = content.slice(0, colonIdx).trim();
+      const valueStr = content.slice(colonIdx + 1).trim();
+      if (valueStr === '') {
+        current[key] = {};
+        stack.push({ indent, obj: current[key] });
+        i++;
+      } else if (valueStr === '>' || valueStr === '|') {
+        const blockLines = [];
+        const blockIndent = indent + 2;
+        i++;
+        while (i < lines.length) {
+          const nextLine = lines[i].replace(/\r$/, '');
+          if (nextLine.trim() === '' && i + 1 < lines.length) { blockLines.push(''); i++; continue; }
+          const nextIndent = nextLine.length - nextLine.trimStart().length;
+          if (nextIndent > indent) {
+            blockLines.push(nextLine.slice(Math.min(blockIndent, nextIndent)).trimEnd());
+            i++;
+          } else { break; }
+        }
+        current[key] = valueStr === '>' ? blockLines.join(' ').trim() : blockLines.join('\n');
+      } else {
+        current[key] = parseYamlValue(valueStr);
+        i++;
+      }
+    } else { i++; }
+  }
+  return result;
+}
+function parseYamlValue(s) {
+  const t = s.trim();
+  if (t.startsWith('"') && t.endsWith('"')) return t.slice(1, -1);
+  if (t.startsWith("'") && t.endsWith("'")) return t.slice(1, -1);
+  if (t === 'true') return true; if (t === 'false') return false;
+  if (/^-?\d+$/.test(t)) return parseInt(t, 10);
+  if (/^-?\d+\.\d+$/.test(t)) return parseFloat(t);
+  return t;
+}
+
+await test("YAML: simple key-value", () => {
+  const r = parseSimpleYaml("key: value\r\nnum: 42");
+  assert.strictEqual(r.key, "value");
+  assert.strictEqual(r.num, 42);
+});
+
+await test("YAML: nested objects", () => {
+  const r = parseSimpleYaml("a:\n  b:\n    c: hello");
+  assert.strictEqual(r.a.b.c, "hello");
+});
+
+await test("YAML: arrays via - items", () => {
+  const r = parseSimpleYaml("list:\n  - a\n  - b");
+  assert.deepStrictEqual(r.list, ["a", "b"]);
+});
+
+await test("YAML: multiple arrays under same parent", () => {
+  const yaml = [
+    "scope:",
+    "  include:",
+    '    - "src/**"',
+    '    - "tests/**"',
+    "  exclude:",
+    '    - "node_modules/**"',
+  ].join("\n");
+  const r = parseSimpleYaml(yaml);
+  assert.deepStrictEqual(r.scope.include, ["src/**", "tests/**"]);
+  assert.deepStrictEqual(r.scope.exclude, ["node_modules/**"]);
+});
+
+await test("YAML: folded block scalar >", () => {
+  const r = parseSimpleYaml("desc: >\n  line one\n  line two");
+  assert.strictEqual(r.desc, "line one line two");
+});
+
 // ── index.ts: parseBdShow ────────────────────────────────────────
 console.log("\n## index.ts: parseBdShow");
 

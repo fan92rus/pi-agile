@@ -97,18 +97,19 @@ function getAgentModel(workDir: string, role: string): string {
   return models[role] ?? DEFAULT_AGENT_MODELS[role] ?? DEFAULT_AGENT_MODELS.worker;
 }
 
-/** Simple YAML parser (key: value, nested via indent, arrays via "- item"). */
+/** Simple YAML parser (key: value, nested via indent, arrays via "- item", folded scalars). */
 function parseSimpleYaml(text: string): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   const lines = text.split("\n");
   const stack: { indent: number; obj: Record<string, unknown> }[] = [{ indent: -1, obj: result }];
+  let i = 0;
 
-  for (const rawLine of lines) {
-    const line = rawLine.replace(/\r$/, "");
-    if (!line.trim() || line.trim().startsWith("#")) continue;
+  while (i < lines.length) {
+    const rawLine = lines[i].replace(/\r$/, "");
+    if (!rawLine.trim() || rawLine.trim().startsWith("#")) { i++; continue; }
 
-    const indent = line.length - line.trimStart().length;
-    const content = line.trim();
+    const indent = rawLine.length - rawLine.trimStart().length;
+    const content = rawLine.trim();
 
     while (stack.length > 1 && stack[stack.length - 1].indent >= indent) {
       stack.pop();
@@ -117,18 +118,63 @@ function parseSimpleYaml(text: string): Record<string, unknown> {
 
     if (content.startsWith("- ")) {
       const value = content.slice(2).trim();
-      const key = Object.keys(current).find((k) => Array.isArray(current[k]));
-      if (key) (current[key] as unknown[]).push(parseYamlValue(value));
+      const topObj = stack[stack.length - 1].obj;
+      const topKeys = Object.keys(topObj);
+
+      if (stack.length > 1 && topKeys.length === 0) {
+        // Empty placeholder {} from last "key:" → convert to array in parent
+        const parent = stack[stack.length - 2].obj;
+        const parentKeys = Object.keys(parent);
+        for (let k = parentKeys.length - 1; k >= 0; k--) {
+          if (parent[parentKeys[k]] === topObj) {
+            parent[parentKeys[k]] = [parseYamlValue(value)];
+            stack.pop();
+            break;
+          }
+        }
+      } else {
+        // Find existing array on current object (second+ array item)
+        for (let k = topKeys.length - 1; k >= 0; k--) {
+          if (Array.isArray(topObj[topKeys[k]])) {
+            (topObj[topKeys[k]] as unknown[]).push(parseYamlValue(value));
+            break;
+          }
+        }
+      }
+      i++;
     } else if (content.includes(":")) {
       const colonIdx = content.indexOf(":");
       const key = content.slice(0, colonIdx).trim();
       const valueStr = content.slice(colonIdx + 1).trim();
-      if (valueStr === "" || valueStr === ">") {
+
+      if (valueStr === "") {
+        // Empty value — could be nested object or array, create empty object for now
         current[key] = {};
         stack.push({ indent, obj: current[key] as Record<string, unknown> });
+        i++;
+      } else if (valueStr === ">" || valueStr === "|") {
+        // Folded (>) or literal (|) block scalar — read subsequent indented lines
+        const blockLines: string[] = [];
+        const blockIndent = indent + 2;
+        i++;
+        while (i < lines.length) {
+          const nextLine = lines[i].replace(/\r$/, "");
+          if (nextLine.trim() === "" && i + 1 < lines.length) { blockLines.push(""); i++; continue; }
+          const nextIndent = nextLine.length - nextLine.trimStart().length;
+          if (nextIndent > indent) {
+            blockLines.push(nextLine.slice(Math.min(blockIndent, nextIndent)).trimEnd());
+            i++;
+          } else {
+            break;
+          }
+        }
+        current[key] = valueStr === ">" ? blockLines.join(" ").replace(/\s+$/g, "\n").trim() : blockLines.join("\n");
       } else {
         current[key] = parseYamlValue(valueStr);
+        i++;
       }
+    } else {
+      i++;
     }
   }
   return result;
