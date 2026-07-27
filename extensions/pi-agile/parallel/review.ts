@@ -103,36 +103,57 @@ If "approved", lessons can still be recorded.`;
 
 /**
  * Parse the reviewer subagent's text response into a ReviewVerdictResult.
- * Best-effort: extract JSON from the response text.
+ * First extracts the explicit text verdict (## Verdict: approved/rework/blocked),
+ * then enriches with JSON fields (dimensions, action_items, lessons) when available.
  */
 export function parseReviewVerdict(responseText: string): ReviewVerdictResult {
-  // Try to find a JSON block in the response
-  const jsonMatch = responseText.match(/```json\s*([\s\S]*?)```/) ?? responseText.match(/\{[\s\S]*\}/);
-  const jsonStr = jsonMatch ? (jsonMatch[1] ?? jsonMatch[0]) : responseText.trim();
+  // 1. Extract verdict from explicit text markdown line first
+  const verdictLine = responseText.match(/##\s*Verdict\s*:?\s*\*{0,2}(approved|rework|blocked)\*{0,2}/i);
+  const textStatus = verdictLine ? verdictLine[1].toLowerCase() as "approved" | "rework" | "blocked" : undefined;
 
-  try {
-    const parsed = JSON.parse(jsonStr.trim());
-    return {
-      status: parsed.status === "approved" ? "approved" : parsed.status === "blocked" ? "blocked" : "rework",
-      dimensions: parsed.dimensions ?? {},
-      action_items: Array.isArray(parsed.action_items) ? parsed.action_items : [],
-      lessons: Array.isArray(parsed.lessons) ? parsed.lessons : [],
-      do_not_retry: typeof parsed.do_not_retry === "string" ? parsed.do_not_retry : undefined,
-    };
-  } catch {
-    // Fallback: if JSON parsing fails, infer from text
-    const lower = responseText.toLowerCase();
-    let status: "approved" | "rework" | "blocked" = "rework";
-    if (lower.includes("approved") || lower.includes("lgtm")) status = "approved";
-    if (lower.includes("blocked") || lower.includes("fundamentally")) status = "blocked";
-
-    return {
-      status,
-      dimensions: {},
-      action_items: [responseText.slice(0, 500)],
-      lessons: [],
-    };
+  // 2. Try to find a JSON block for structured fields (dimensions, action_items, lessons)
+  //    IMPORTANT: prefer the SHALLOWEST/outermost ```json block, not nested acceptance-report
+  const outerJsonMatch = responseText.match(/^```json\s*\{/m);
+  let jsonMatch: RegExpMatchArray | null;
+  if (outerJsonMatch) {
+    // Found a ```json block at line start — match until its closing ```
+    jsonMatch = responseText.match(/```json\s*([\s\S]*?)```/);
+  } else {
+    // Fall back to any ```json block or bare object
+    jsonMatch = responseText.match(/```json\s*([\s\S]*?)```/) ?? responseText.match(/\{[\s\S]*\}/);
   }
+  const jsonStr = jsonMatch ? (jsonMatch[1] ?? jsonMatch[0]) : null;
+
+  let parsedJson: Record<string, unknown> | null = null;
+  if (jsonStr) {
+    try {
+      parsedJson = JSON.parse(jsonStr.trim());
+    } catch { /* ignore parse failures */ }
+  }
+
+  // 3. Determine status: prefer text verdict, fall back to JSON status
+  let status: "approved" | "rework" | "blocked";
+  if (textStatus) {
+    status = textStatus;
+  } else if (parsedJson && parsedJson.status === "approved") {
+    status = "approved";
+  } else if (parsedJson && parsedJson.status === "blocked") {
+    status = "blocked";
+  } else {
+    // Last resort: text heuristic
+    const lower = responseText.toLowerCase();
+    if (lower.includes("approved") || lower.includes("lgtm")) status = "approved";
+    else if (lower.includes("blocked") || lower.includes("fundamentally")) status = "blocked";
+    else status = "rework";
+  }
+
+  return {
+    status,
+    dimensions: (parsedJson?.dimensions as Record<string, unknown>) ?? {},
+    action_items: Array.isArray(parsedJson?.action_items) ? parsedJson.action_items : [],
+    lessons: Array.isArray(parsedJson?.lessons) ? parsedJson.lessons : [],
+    do_not_retry: typeof parsedJson?.do_not_retry === "string" ? parsedJson.do_not_retry : undefined,
+  };
 }
 
 /** Build task text for a chain agent (scout, researcher, planner, etc.) */
