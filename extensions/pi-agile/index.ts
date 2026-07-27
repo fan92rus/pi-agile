@@ -1523,13 +1523,29 @@ ${workerSummary.slice(0, 1000)}`;
       // Complete sprint
       runtime.store.completeSprint(sprint, workDir);
 
+      // Run observer on sprint completion
+      const observerSteers = runSprintObserver(sprint, runtime.observerState, {
+        reworkStuckThreshold: 3,
+        constraintSpamThreshold: 3,
+        velocityDropThreshold: 50,
+        observerEnabled: true,
+      }, workDir);
+
       // Build retrospective text
       const v = sprint.velocity;
       const retroText = buildRetrospectiveText(sprint, workDir, v, runtime.knowledge);
 
+      // Append observer steers to output if any
+      const steerText = observerSteers.length > 0
+        ? `
+## Observer
+${observerSteers.map((s: { type: string; message: string; severity: string }) => `[${s.severity}] ${s.message}`).join("\n")}
+`
+        : "";
+
       return {
-        content: [{ type: "text" as const, text: retroText }],
-        details: { sprintId: sprint.id, velocity: v },
+        content: [{ type: "text" as const, text: retroText + steerText }],
+        details: { sprintId: sprint.id, velocity: v, observerSteers },
       };
     },
   });

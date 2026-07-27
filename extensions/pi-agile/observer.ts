@@ -8,6 +8,8 @@
  * The agent reads steers and decides what to do.
  */
 
+import * as fs from "fs";
+import * as path from "path";
 import type { SprintState, SprintTask } from "./parallel/sprint.ts";
 
 export interface ObserverConfig {
@@ -66,6 +68,7 @@ export function runSprintObserver(
   state: SprintState,
   obsState: SprintObserverState,
   config: ObserverConfig,
+  workDir?: string,
 ): ObserverSteer[] {
   if (!config.observerEnabled) return [];
 
@@ -87,7 +90,57 @@ export function runSprintObserver(
   const emptySteer = checkDiscoveryEmpty(state);
   if (emptySteer) steers.push(emptySteer);
 
+  // 5. Sprint completed — recommend continue or check criteria
+  if (state.status === "done") {
+    const completedSteer = checkSprintCompleted(workDir);
+    if (completedSteer) steers.push(completedSteer);
+  }
+
   return steers;
+}
+
+/**
+ * After sprint completion, check stop criteria and recommend next action.
+ * - No stop criteria (continuous mode): recommend analysis + continue.
+ * - Stop criteria set: confirm everything is normal, check criteria.
+ */
+function checkSprintCompleted(workDir?: string): ObserverSteer | null {
+  if (!workDir) return null;
+
+  // Read project config to check for stop criteria
+  const projectPath = path.join(workDir, ".agile", "project.yaml");
+  if (!fs.existsSync(projectPath)) {
+    return {
+      type: "sprint_completed",
+      severity: "info",
+      message: "Sprint completed. No stop criteria configured — analyze results and continue to next sprint.",
+    };
+  }
+
+  try {
+    const yaml = fs.readFileSync(projectPath, "utf8");
+    const hasStopWhen = yaml.includes("stop_when");
+
+    if (!hasStopWhen) {
+      return {
+        type: "sprint_completed",
+        severity: "info",
+        message: "Sprint completed. No stop criteria (continuous mode). Analyze sprint results, record lessons, then start next sprint.",
+      };
+    }
+
+    return {
+      type: "sprint_completed",
+      severity: "info",
+      message: "Sprint completed. Stop criteria are configured — check them before deciding: continue or stop.",
+    };
+  } catch {
+    return {
+      type: "sprint_completed",
+      severity: "info",
+      message: "Sprint completed. Analyze results and decide: continue or stop.",
+    };
+  }
 }
 
 function checkSprintStagnation(
