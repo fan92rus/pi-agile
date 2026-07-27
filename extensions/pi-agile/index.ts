@@ -271,6 +271,41 @@ async function gitCheckoutMain(pi: ExtensionAPI, workDir: string): Promise<strin
 }
 
 /**
+ * Squash-merge a worktree's feature branch into the main repo's default branch.
+ * Worktrees cannot checkout the default branch (it's already checked out in the
+ * main repo), so we git-fetch from the worktree into the main repo and merge there.
+ */
+async function gitMergeFromWorktree(
+  pi: ExtensionAPI,
+  mainWorkDir: string,
+  worktreeDir: string,
+  featBranch: string,
+  commitMsg?: string,
+): Promise<string> {
+  const branchResult = await pi.exec("git", ["branch", "--list"], { cwd: mainWorkDir, timeout: 5_000 });
+  const branchList = (branchResult.stdout ?? "") + (branchResult.stderr ?? "");
+  const defaultBranch = branchList.includes("main") ? "main" : "master";
+
+  // Ensure main repo is on default branch
+  const checkout = await pi.exec("git", ["checkout", defaultBranch], { cwd: mainWorkDir, timeout: 15_000 });
+  if (checkout.code !== 0) return `checkout ${defaultBranch} in main repo failed: ${checkout.stderr}`;
+
+  // Fetch from worktree
+  const fetch = await pi.exec("git", ["fetch", worktreeDir, featBranch], { cwd: mainWorkDir, timeout: 30_000 });
+  if (fetch.code !== 0) return `fetch from worktree ${worktreeDir} failed: ${fetch.stderr}`;
+
+  // Squash merge FETCH_HEAD
+  const merge = await pi.exec("git", ["merge", "--squash", "FETCH_HEAD"], { cwd: mainWorkDir, timeout: 30_000 });
+  if (merge.code !== 0) return `squash merge failed: ${merge.stderr}`;
+
+  const msg = commitMsg ?? `feat: merge ${featBranch}`;
+  const commit = await pi.exec("git", ["commit", "-m", msg], { cwd: mainWorkDir, timeout: 15_000 });
+  if (commit.code !== 0) return `commit after squash failed: ${commit.stderr}`;
+
+  return "";
+}
+
+/**
  * Full task lifecycle in a worktree directory:
  * create branch → spawn worker → poll → spawn reviewer → poll → parse verdict
  * Returns {bdId, status, verdict, diff, branch} or {bdId, status: "error", error}.
