@@ -91,6 +91,22 @@ const DEFAULT_AGENT_MODELS: Record<string, string> = {
   reviewer: "opencode-go/deepseek-v4-flash",
 };
 
+/** Read spawn_timeout from .agile/config.json, default 600s (600000ms). */
+function getSpawnTimeout(workDir: string): number {
+  const config = loadAgileConfig(workDir);
+  const raw = config.spawn_timeout;
+  if (typeof raw === "number" && raw >= 30_000) return raw;
+  return 600_000;
+}
+
+/** Write progress to .agile/batch-progress.json during parallel execution. */
+function writeBatchProgress(workDir: string, data: { tasks: { bdId: string; round: number; stage: string; status: string }[] }): void {
+  try {
+    ensureAgileDir(workDir);
+    fs.writeFileSync(path.join(workDir, ".agile", "batch-progress.json"), JSON.stringify(data, null, 2), "utf8");
+  } catch { /* non-fatal */ }
+}
+
 /** Resolve model for a given agent role from .agile/config.json or default. */
 function getAgentModel(workDir: string, role: string): string {
   const config = loadAgileConfig(workDir);
@@ -320,6 +336,7 @@ async function delegateTaskInWorktree(
   deadEnds: string,
   patterns: string,
   reviewDepth: "deep" | "standard",
+  spawnTimeout: number,
   onProgress?: (status: string) => void,
 ): Promise<{
   bdId: string;
@@ -374,7 +391,7 @@ async function delegateTaskInWorktree(
         context: "fresh",
         output: workerOutput,
         outputMode: "file-only",
-      }, 120_000);
+      }, spawnTimeout);
     } catch (e: unknown) {
       return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `spawn worker r${round}: ${e instanceof Error ? e.message : String(e)}` };
     }
@@ -414,7 +431,7 @@ async function delegateTaskInWorktree(
         context: "fresh",
         output: reviewerOutput,
         outputMode: "file-only",
-      }, 120_000);
+      }, spawnTimeout);
     } catch (e: unknown) {
       return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `spawn reviewer r${round}: ${e instanceof Error ? e.message : String(e)}` };
     }
@@ -481,12 +498,23 @@ async function delegateBatchParallel(
 
   // 3. Run ALL tasks in parallel — each its own worktree, each has its own loop
   onProgress?.("Running all tasks in parallel...");
+  const spawnTimeout = getSpawnTimeout(mainWorkDir);
   const taskPromises = tasks.map((t, i) =>
-    delegateTaskInWorktree(pi, rpc_, worktrees[i], t.bdId, t.meta, constraints, deadEnds, patterns, reviewDepth, onProgress)
+    delegateTaskInWorktree(pi, rpc_, worktrees[i], t.bdId, t.meta, constraints, deadEnds, patterns, reviewDepth, spawnTimeout, onProgress)
   );
   const results = await Promise.all(taskPromises);
 
-  // 4. For approved tasks: merge to main
+  // 4. Write progress snapshot
+  writeBatchProgress(mainWorkDir, {
+    tasks: results.map(r => ({
+      bdId: r.bdId,
+      round: (r.reviews ?? []).length,
+      stage: r.error ? "error" : r.verdict.status === "approved" ? "merge" : r.verdict.status,
+      status: r.error ? `error: ${r.error}` : r.verdict.status,
+    })),
+  });
+
+  // 5. For approved tasks: merge to main
   for (let i = 0; i < results.length; i++) {
     const r = results[i];
     if (r.verdict.status === "approved" && !r.error) {
@@ -500,7 +528,7 @@ async function delegateBatchParallel(
     }
   }
 
-  // 5. Clean up worktrees
+  // 6. Clean up worktrees
   onProgress?.("Cleaning up worktrees...");
   for (const wt of worktrees) {
     try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
@@ -1078,7 +1106,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
           context: "fresh",
           output: workerOutput,
           outputMode: "file-only",
-        }, 30_000);
+        }, getSpawnTimeout(workDir));
       } catch (e: unknown) {
         return {
           content: [{ type: "text" as const, text: `❌ Failed to spawn worker: ${e instanceof Error ? e.message : String(e)}` }],
@@ -1128,7 +1156,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
           context: "fresh",
           output: reviewerOutput,
           outputMode: "file-only",
-        }, 30_000);
+        }, getSpawnTimeout(workDir));
       } catch (e: unknown) {
         return {
           content: [{ type: "text" as const, text: `❌ Failed to spawn reviewer: ${e instanceof Error ? e.message : String(e)}` }],
