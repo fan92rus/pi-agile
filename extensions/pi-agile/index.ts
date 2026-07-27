@@ -349,6 +349,7 @@ async function pollWithProgress(
 // ---------------------------------------------------------------------------
 
 interface AgileRuntime {
+  agileMode: boolean;
   sprintLoopActive: boolean;
   currentSprintId: number;
   rpc: RpcClient | null;
@@ -360,6 +361,7 @@ interface AgileRuntime {
 
 function createRuntime(events: unknown): AgileRuntime {
   return {
+    agileMode: false,
     sprintLoopActive: false,
     currentSprintId: 0,
     rpc: null,
@@ -394,6 +396,23 @@ function getOrRestoreSprint(rt: AgileRuntime, workDir: string): SprintState | nu
 
 // Module-level runtime store (per-session)
 const runtimeStore = new Map<string, AgileRuntime>();
+
+/** Set agile mode flag — gates tool execution and system prompt injection. */
+function setAgileMode(ctx: ExtensionContext, enabled: boolean): void {
+  getRuntime(ctx, runtimeStore).agileMode = enabled;
+  if (!enabled) {
+    // Remove gated tools from active set when turning off
+    const tools = ctx.getActiveTools?.() ?? [];
+    const gated = ["agile_discover", "agile_start_sprint", "agile_delegate_task", "agile_merge_task", "agile_retrospective", "agile_knowledge"];
+    ctx.setActiveTools?.(tools.filter((t) => !gated.includes(t)));
+  }
+}
+
+/** Return an error response if agile mode is off (used by gated tools). */
+function assertAgileActive(rt: AgileRuntime): { content: { type: "text"; text: string }[] } | undefined {
+  if (rt.agileMode) return undefined;
+  return { content: [{ type: "text" as const, text: "❌ Agile mode is OFF. Run /agile on first." }] };
+}
 
 // ---------------------------------------------------------------------------
 // Extension registration
@@ -524,6 +543,9 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
   // -----------------------------------------------------------------------
 
   pi.on("before_agent_start", async (event, ctx) => {
+    const runtime = getRuntime(ctx, runtimeStore);
+    if (!runtime.agileMode) return;
+
     const workDir = ctx.cwd;
     const project = loadProjectConfig(workDir);
     if (!project) return; // Not an agile project
@@ -565,6 +587,9 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx, runtimeStore);
+      const gate = assertAgileActive(runtime);
+      if (gate) return gate;
       const workDir = (params.cwd as string) || ctx.cwd;
       const project = loadProjectConfig(workDir);
       const scope = (params.scope as string[]) ?? extractScope(project);
@@ -591,6 +616,10 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const workDir = (params.cwd as string) || ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
+      {
+        const gate = assertAgileActive(runtime);
+        if (gate) return gate;
+      }
       const project = loadProjectConfig(workDir);
       const meta = extractProjectMeta(project);
 
@@ -635,6 +664,10 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       const workDir = (params.cwd as string) || ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
+      {
+        const gate = assertAgileActive(runtime);
+        if (gate) return gate;
+      }
       const project = loadProjectConfig(workDir);
       const meta = extractProjectMeta(project);
 
@@ -847,6 +880,10 @@ ${workerSummary.slice(0, 1000)}`;
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const workDir = (params.cwd as string) || ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
+      {
+        const gate = assertAgileActive(runtime);
+        if (gate) return gate;
+      }
       const bdId = params.bd_id as string;
       const branch = `feat/${bdId}`;
 
@@ -920,6 +957,10 @@ ${workerSummary.slice(0, 1000)}`;
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const workDir = (_params?.cwd as string) || ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
+      {
+        const gate = assertAgileActive(runtime);
+        if (gate) return gate;
+      }
       const sprint = runtime.store.getCurrent(workDir);
 
       if (!sprint) {
@@ -989,6 +1030,10 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const workDir = (params.cwd as string) || ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
+      {
+        const gate = assertAgileActive(runtime);
+        if (gate) return gate;
+      }
       const action = params.action as string;
 
       if (action === "read") {
@@ -1040,6 +1085,18 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
         return;
       }
 
+      if (command === "on") {
+        setAgileMode(ctx, true);
+        ctx.ui.notify("✅ Agile mode ON — tools and system prompt active", "info");
+        return;
+      }
+
+      if (command === "off") {
+        setAgileMode(ctx, false);
+        ctx.ui.notify("Agile mode OFF — tools and system prompt inactive", "info");
+        return;
+      }
+
       if (command === "status") {
         const project = loadProjectConfig(workDir);
         if (!project) {
@@ -1053,6 +1110,7 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
         ctx.ui.notify([
           "# pi-agile Status",
           "",
+          `Mode: ${runtime.agileMode ? "🟢 ON" : "🔴 OFF"}`,
           `Goal: ${meta.goal}`,
           `Review depth: ${meta.reviewDepth}`,
           `Max workers: ${meta.maxWorkers}`,
@@ -1240,6 +1298,8 @@ If not met → start next sprint.`;
 function agileHelp(): string {
   return `# pi-agile Commands
 
+\`/agile on\`       — Enable agile mode (tools + system prompt active)
+\`/agile off\`      — Disable agile mode
 \`/agile setup\`    — Run setup wizard (creates .agile/project.yaml + constraints.yaml)
 \`/agile status\`   — Show current sprint status
 \`/agile stop\`     — Graceful stop
@@ -1248,8 +1308,9 @@ function agileHelp(): string {
 
 ## Workflow
 1. \`/agile setup\` — configure project
-2. Call \`agile_discover\` tool — get discovery results
-3. Create tasks in bd: \`bd create "title" --description "desc"\`
+2. \`/agile on\` — enable agile mode
+3. Call \`agile_discover\` tool — get discovery results
+4. Create tasks in bd: \`bd create "title" --description "desc"\`
 4. Call \`agile_start_sprint\` — initialize sprint
 5. For each task: call \`agile_delegate_task\` → get verdict
 6. If approved: call \`agile_merge_task\`

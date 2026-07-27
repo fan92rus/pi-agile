@@ -6,6 +6,8 @@
  */
 
 const AGILE_SUBCOMMANDS: { value: string; label: string; description: string }[] = [
+  { value: "on", label: "on", description: "Enable agile mode" },
+  { value: "off", label: "off", description: "Disable agile mode" },
   { value: "run", label: "run", description: "Start sprint loop" },
   { value: "status", label: "status", description: "Show current sprint status" },
   { value: "stop", label: "stop", description: "Graceful stop after current tasks" },
