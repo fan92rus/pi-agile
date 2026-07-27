@@ -485,7 +485,7 @@ async function delegateBatchParallel(
     if (r.verdict.status === "approved" && !r.error) {
       onProgress?.(`${r.bdId}: approved, merging...`);
       try {
-        const mergeResult = await gitMergeSquash(pi, worktrees[i], r.branch, `feat: merge ${r.bdId}`);
+        const mergeResult = await gitMergeFromWorktree(pi, mainWorkDir, worktrees[i], r.branch, `feat: merge ${r.bdId}`);
         if (mergeResult) r.error = `merge failed: ${mergeResult}`;
       } catch (e: unknown) {
         r.error = `merge error: ${e instanceof Error ? e.message : String(e)}`;
