@@ -1623,6 +1623,136 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
         return;
       }
 
+      if (command === "setup") {
+        await ctx.ui.input("Press Enter to start the setup wizard...", "");
+        const lines: string[] = ["# pi-agile Setup Wizard"];
+
+        // 1. Project name & goal
+        lines.push("");
+        const name = await ctx.ui.input("Project name (e.g., 'My App'):", "");
+        if (!name) { ctx.ui.notify("Setup cancelled", "error"); return; }
+        const goal = await ctx.ui.input("What should the agent achieve over multiple sprints?\n  (e.g., 'Fix all ESLint warnings', 'Refactor auth module'):", "");
+        if (!goal) { ctx.ui.notify("Setup cancelled", "error"); return; }
+        lines.push(`Project: ${name}`);
+        lines.push(`Goal: ${goal}`);
+
+        // 2. Scope
+        const includeStr = await ctx.ui.input("Include globs (comma-separated, e.g. src/**, tests/**):", "src/**");
+        const excludeStr = await ctx.ui.input("Exclude globs (comma-separated, e.g. node_modules/**, dist/**):", "node_modules/**, dist/**");
+        const includes = (includeStr || "src/**").split(",").map(s => `      - "${s.trim()}"`).join("\n");
+        const excludes = (excludeStr || "node_modules/**, dist/**").split(",").map(s => `      - "${s.trim()}"`).join("\n");
+        lines.push(`Scope: include ${includeStr || "src/**"}, exclude ${excludeStr || "node_modules/**"}`);
+
+        // 3. Constraints
+        const constraints: string[] = [];
+        ctx.ui.notify("Now add project constraints. Enter one per line. Empty line to finish.", "info");
+        while (true) {
+          const rule = await ctx.ui.input(`Constraint ${constraints.length + 1} (Enter to finish):`, "");
+          if (!rule) break;
+          constraints.push(rule);
+        }
+        if (constraints.length === 0) constraints.push("All new code must have tests");
+        lines.push(`Constraints: ${constraints.length} rules`);
+
+        // 4. Stop criteria
+        const stopMode = await ctx.ui.select("Stop criteria:", [
+          "continuous — no auto-stop, run until /agile stop",
+          "budget — stop after N sprints",
+          "goal-driven — stop when a metric target is reached",
+        ]);
+        const isContinuous = stopMode?.startsWith("continuous");
+        const isBudget = stopMode?.startsWith("budget");
+        const isGoal = stopMode?.startsWith("goal");
+        let sprints: string | undefined;
+        let metricName = "";
+        let metricTarget = "";
+        if (isBudget) {
+          sprints = await ctx.ui.input("How many sprints?:", "3");
+          if (!sprints) sprints = "3";
+          lines.push(`Stop: after ${sprints} sprints`);
+        } else if (isGoal) {
+          metricName = await ctx.ui.input("Metric name (e.g., 'test_coverage'):", "");
+          metricTarget = await ctx.ui.input("Target value:", "");
+          lines.push(`Stop: ${metricName} >= ${metricTarget}`);
+        } else {
+          lines.push("Stop: continuous (manual /agile stop)");
+        }
+
+        // 5. Review depth
+        const depth = await ctx.ui.select("Review depth:", [
+          "deep — 6 dimensions (architecture, correctness, security, performance, tests, constraints)",
+          "standard — 3 dimensions (correctness, tests, constraints)",
+        ]);
+        const reviewDepth = depth?.startsWith("deep") ? "deep" : "standard";
+        lines.push(`Review depth: ${reviewDepth}`);
+
+        // 6. Generate configs
+        const agileDir = path.join(workDir, ".agile");
+        fs.mkdirSync(agileDir, { recursive: true });
+
+        const projectYaml = `project:
+  name: "${name}"
+  goal: >
+    ${goal}
+
+  scope:
+    include:
+${includes}
+    exclude:
+${excludes}
+${isBudget ? `  stop_when:
+    mode: any_of
+    conditions:
+      - metric: sprint_count
+        target: ${sprints}
+        area: "project"
+        description: "After ${sprints} sprints"` : ""}
+${isGoal ? `  stop_when:
+    mode: any_of
+    conditions:
+      - metric: ${metricName}
+        target: ${metricTarget}
+        area: "project"
+        description: "${metricName} >= ${metricTarget}"` : ""}
+  review_depth: ${reviewDepth}
+  max_workers: 5
+`;
+        fs.writeFileSync(path.join(agileDir, "project.yaml"), projectYaml, "utf8");
+
+        const constraintsYaml = `rules:
+${constraints.map((r, i) => `  - id: rule-${i + 1}
+    rule: "${r}"`).join("\n")}
+
+architectural_principles:
+  - Follow existing code patterns and conventions
+
+process:
+  - Use conventional commits
+  - Keep changes minimal per task
+
+do_not_do:
+  - Do not modify files outside project scope
+  - Do not add new dependencies without constraint override
+`;
+        fs.writeFileSync(path.join(agileDir, "constraints.yaml"), constraintsYaml, "utf8");
+
+        // 7. Init bd if needed
+        ctx.ui.notify("Checking prerequisites...", "info");
+        try {
+          await pi.exec("bd", ["--version"], { cwd: workDir, timeout: 5000 });
+        } catch {
+          ctx.ui.notify("⚠ bd CLI not found. Install from https://github.com/fan92rus/bd", "error");
+        }
+        try {
+          await pi.exec("git", ["rev-parse", "--git-dir"], { cwd: workDir, timeout: 5000 });
+        } catch {
+          ctx.ui.notify("⚠ Not a git repo. Run git init first.", "error");
+        }
+
+        ctx.ui.notify(lines.join("\n") + `\n\n✅ Setup complete! Configs created in ${agileDir}/\n\nNext: /agile on`, "info");
+        return;
+      }
+
       if (command === "on") {
         setAgileMode(ctx, true, workDir);
         const cleaned = cleanupStaleWorktrees(workDir);
