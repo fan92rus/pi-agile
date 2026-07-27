@@ -321,6 +321,30 @@ async function gitMergeFromWorktree(
   return "";
 }
 
+/** Remove stale git worktrees left from crashed/aborted batch runs. Returns count removed. */
+function cleanupStaleWorktrees(workDir: string): number {
+  let removed = 0;
+  try {
+    const listPath = path.join(workDir, ".git", "worktrees");
+    if (!fs.existsSync(listPath)) return 0;
+    const entries = fs.readdirSync(listPath);
+    for (const entry of entries) {
+      const wtGitDir = path.join(listPath, entry);
+      const gitdirFile = path.join(wtGitDir, "gitdir");
+      if (!fs.existsSync(gitdirFile)) continue;
+      const wtPath = fs.readFileSync(gitdirFile, "utf8").trim().replace(/\/\s*$/, "");
+      if (wtPath && wtPath !== workDir && fs.existsSync(wtPath)) {
+        try {
+          fs.rmSync(wtGitDir, { recursive: true, force: true });
+          fs.rmSync(wtPath, { recursive: true, force: true });
+          removed++;
+        } catch {}
+      }
+    }
+  } catch {}
+  return removed;
+}
+
 /**
  * Full task lifecycle in a worktree directory:
  * create branch → spawn worker → poll → spawn reviewer → poll → parse verdict
@@ -393,14 +417,14 @@ async function delegateTaskInWorktree(
         outputMode: "file-only",
       }, spawnTimeout);
     } catch (e: unknown) {
-      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `spawn worker r${round}: ${e instanceof Error ? e.message : String(e)}` };
+      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `⏱ Worker r${round} spawn failed after ${(spawnTimeout / 1000)}s: ${e instanceof Error ? e.message : String(e)}. Try increasing spawn_timeout in .agile/config.json or simplifying the task.` };
     }
 
     onProgress?.(`${bdId} (r${round}): worker started...`);
     try { pi.notify(`[${bdId}] R${round}: worker running...`, "info"); } catch {}
     const workerDone = await pollWithProgress(pi, workDir, rpc_, worker.runId, workerOutput, `worker-${bdId}-r${round}`, (s: string) => onProgress?.(`${bdId}: ${s}`));
     if (!workerDone) {
-      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `worker r${round} timeout` };
+      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `⏱ Worker r${round} did not complete within ${Math.round(spawnTimeout / 1000)}s. Increase spawn_timeout in .agile/config.json or split into smaller tasks.` };
     }
 
     try { if (fs.existsSync(workerOutput)) currentWorkerSummary = fs.readFileSync(workerOutput, "utf8"); } catch {}
@@ -433,7 +457,7 @@ async function delegateTaskInWorktree(
         outputMode: "file-only",
       }, spawnTimeout);
     } catch (e: unknown) {
-      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `spawn reviewer r${round}: ${e instanceof Error ? e.message : String(e)}` };
+      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `⏱ Reviewer r${round} spawn failed after ${(spawnTimeout / 1000)}s: ${e instanceof Error ? e.message : String(e)}. Try increasing spawn_timeout in .agile/config.json.` };
     }
 
     onProgress?.(`${bdId} (r${round}): reviewer started...`);
@@ -773,8 +797,14 @@ function getOrRestoreSprint(rt: AgileRuntime, workDir: string): SprintState | nu
 const runtimeStore = new Map<string, AgileRuntime>();
 
 /** Set agile mode flag — gates tool execution and system prompt injection. */
-function setAgileMode(ctx: ExtensionContext, enabled: boolean): void {
+function setAgileMode(ctx: ExtensionContext, enabled: boolean, workDir?: string): void {
   getRuntime(ctx, runtimeStore).agileMode = enabled;
+  // Persist to .agile/config.json
+  if (workDir) {
+    const config = loadAgileConfig(workDir);
+    config.agile_mode = enabled;
+    saveAgileConfig(workDir, config);
+  }
   if (!enabled) {
     // Remove gated tools from active set when turning off
     const tools = ctx.getActiveTools?.() ?? [];
@@ -835,9 +865,19 @@ bd priority <id> high    # set priority: high, medium, low
 
 ## Workflow
 
+### Phase 0: Project Setup (MUST DO first)
+1. **Initialize all analysis tools** for the project:
+   - Set up ESLint/Pylint/TSConfig — the project MUST have working linter config
+   - Add test runner config (Jest/Vitest/node --test) — tests are REQUIRED for every change
+   - Install coverage tools (c8/nyc/istanbul) if available
+   - Configure complexity analyzers (plato/complexity-report)
+   - Without these tools, \`agile_discover\` returns empty results for those categories
+2. Add the configs and tool setup as the FIRST tasks in bd
+3. Only proceed to discovery after tools are working
+
 ### Phase 1: Discovery
 1. Call \`agile_discover\` tool — returns raw lint/coverage/TODO/security output
-2. Read ALL output carefully
+2. Read ALL output carefully — empty sections likely mean tools need setup (see Phase 0)
 3. Identify findings that are actionable tasks:
    - Each TODO/FIXME is a potential task
    - Each lint error is a potential task
@@ -919,6 +959,14 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", async (event, ctx) => {
     const runtime = getRuntime(ctx, runtimeStore);
+    // Auto-enable agile mode if persisted in .agile/config.json
+    if (!runtime.agileMode) {
+      const config = loadAgileConfig(ctx.cwd);
+      if (config.agile_mode === true) {
+        runtime.agileMode = true;
+        cleanupStaleWorktrees(ctx.cwd);
+      }
+    }
     if (!runtime.agileMode) return;
 
     const workDir = ctx.cwd;
@@ -1389,7 +1437,7 @@ ${workerSummary.slice(0, 1000)}`;
 
 ## Your Tasks
 1. Formulate lessons learned from this sprint
-2. Record them via bash: append to .agile/knowledge.jsonl
+2. Record them via \`agile_knowledge({ action: "append", type: "lesson", finding: "..." })\`
 3. Read the stop-check message below
 4. Run stop criteria check commands yourself
 5. Decide: stop or continue to next sprint
@@ -1477,13 +1525,14 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
       }
 
       if (command === "on") {
-        setAgileMode(ctx, true);
-        ctx.ui.notify("✅ Agile mode ON — tools and system prompt active", "info");
+        setAgileMode(ctx, true, workDir);
+        const cleaned = cleanupStaleWorktrees(workDir);
+        ctx.ui.notify("✅ Agile mode ON — tools and system prompt active" + (cleaned > 0 ? ` Cleaned ${cleaned} stale worktree(s).` : ""), "info");
         return;
       }
 
       if (command === "off") {
-        setAgileMode(ctx, false);
+        setAgileMode(ctx, false, workDir);
         ctx.ui.notify("Agile mode OFF — tools and system prompt inactive", "info");
         return;
       }
