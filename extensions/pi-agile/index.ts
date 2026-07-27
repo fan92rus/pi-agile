@@ -81,6 +81,22 @@ function saveAgileConfig(workDir: string, config: Record<string, unknown>): void
   fs.writeFileSync(path.join(workDir, CONFIG_FILE), JSON.stringify(config, null, 2), "utf8");
 }
 
+// ---------------------------------------------------------------------------
+// Agent model configuration
+// ---------------------------------------------------------------------------
+
+const DEFAULT_AGENT_MODELS: Record<string, string> = {
+  worker: "opencode-go/deepseek-v4-flash",
+  reviewer: "opencode-go/deepseek-v4-flash",
+};
+
+/** Resolve model for a given agent role from .agile/config.json or default. */
+function getAgentModel(workDir: string, role: string): string {
+  const config = loadAgileConfig(workDir);
+  const models = (config.agent_models ?? {}) as Record<string, string>;
+  return models[role] ?? DEFAULT_AGENT_MODELS[role] ?? DEFAULT_AGENT_MODELS.worker;
+}
+
 /** Simple YAML parser (key: value, nested via indent, arrays via "- item"). */
 function parseSimpleYaml(text: string): Record<string, unknown> {
   const result: Record<string, unknown> = {};
@@ -351,6 +367,17 @@ For each task in the sprint:
 5. Run stop criteria check commands yourself (via bash)
 6. Decide: stop (criteria met) or continue (start next sprint)
 
+## Agent Models (configurable)
+
+Worker and reviewer subagents use configurable models. Defaults:
+- worker: opencode-go/deepseek-v4-flash
+- reviewer: opencode-go/deepseek-v4-flash
+
+Override in .agile/config.json:
+  { "agent_models": { "worker": "zai-glm/glm-5.2", "reviewer": "zai-glm/glm-5.2" } }
+
+Both worker and reviewer run with fresh context (no parent session inheritance).
+
 ## Key Rules
 
 1. **ONE task per agile_delegate_task call** — don't batch
@@ -524,6 +551,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       try {
         worker = await rpc.spawn({
           agent: "worker",
+          model: getAgentModel(workDir, "worker"),
           task: workerTaskText,
           cwd: workDir,
           context: "fresh",
@@ -578,6 +606,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       try {
         reviewer = await rpc.spawn({
           agent: "reviewer",
+          model: getAgentModel(workDir, "reviewer"),
           task: reviewerTaskText,
           cwd: workDir,
           context: "fresh",
