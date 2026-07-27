@@ -338,9 +338,16 @@ Return a structured report. For EACH finding:
 - **Effort**: S (< 1h) | M (1-4h) | L (4h+)
 \'\'\'
 
+## CRITICAL: File Path Instructions
+- Your working directory is: ${workDir}
+- When calling tools (read, ctx_read, bash, etc.), ALWAYS pass ABSOLUTE paths
+  starting with: ${workDir}
+- Example: read(path: "${workDir}/src/auth.js") NOT read(path: "src/auth.js")
+- NEVER pass undefined or relative paths to tools
+
 ## Rules
 - Do NOT write code or make changes — only report findings
-- Be SPECIFIC: exact file paths and line numbers
+- Be SPECIFIC: exact file paths and line numbers (absolute paths from project root)
 - Focus on ACTIONABLE findings — skip cosmetic issues (formatting, naming)
 - Respect project constraints — don't suggest changes that violate them
 - Group related issues (e.g. 3 missing validations in one file = one finding)

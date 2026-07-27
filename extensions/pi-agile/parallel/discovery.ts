@@ -17,7 +17,7 @@ import { execSync } from "node:child_process";
 
 export interface DiscoveryResult {
   /** Parsed METRIC lines from all scripts */
-  metrics: Record<string, number>;
+  metrics: Record<string, number | string>;
   /** Free-text reports per script */
   reports: Record<string, string>;
   /** Script names that were run */
@@ -32,29 +32,58 @@ export interface DiscoveryResult {
 function getBashExecutable(): string {
   if (process.platform !== "win32") return "bash";
 
-  // Check common Git Bash locations
+  // Common Git Bash locations
   const candidates = [
     "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
     "C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe",
+    "C:\\Program Files\\Git\\bin\\bash.exe",
+    "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
   ];
   for (const c of candidates) {
     if (fs.existsSync(c)) return c;
   }
 
   // Check via PROGRAMFILES env var
-  const pf = process.env.PROGRAMFILES || "C:\\Program Files";
-  const viaEnv = path.join(pf, "Git", "usr", "bin", "bash.exe");
-  if (fs.existsSync(viaEnv)) return viaEnv;
+  for (const envVar of ["PROGRAMFILES", "PROGRAMFILES(X86)"]) {
+    const pf = process.env[envVar];
+    if (pf) {
+      const p1 = path.join(pf, "Git", "usr", "bin", "bash.exe");
+      if (fs.existsSync(p1)) return p1;
+      const p2 = path.join(pf, "Git", "bin", "bash.exe");
+      if (fs.existsSync(p2)) return p2;
+    }
+  }
+
+  // Scoop installs
+  const userprofile = process.env.USERPROFILE || "";
+  if (userprofile) {
+    const scoopPaths = [
+      path.join(userprofile, "scoop", "apps", "git", "current", "bin", "bash.exe"),
+      path.join(userprofile, "scoop", "apps", "git", "current", "usr", "bin", "bash.exe"),
+    ];
+    for (const s of scoopPaths) {
+      if (fs.existsSync(s)) return s;
+    }
+  }
+
+  // winget / LocalAppData installs
+  const localAppData = process.env.LOCALAPPDATA || "";
+  if (localAppData) {
+    const wingetPath = path.join(localAppData, "Programs", "Git", "bin", "bash.exe");
+    if (fs.existsSync(wingetPath)) return wingetPath;
+  }
 
   // Fallback: 'bash' from PATH (might be WSL2 or Git Bash)
   return "bash";
 }
 
-/** Get the bash command for running a script (quoted path to bash exe). */
+/** Get the bash command for running a script. Uses --login so /usr/bin is in PATH. */
 function bashCommand(scriptPath: string): string {
   const bash = getBashExecutable();
   const quoted = bash.includes(" ") ? `"${bash}"` : bash;
-  return `${quoted} "${scriptPath.replace(/\\/g, "/")}"`;
+  // --login: makes Git Bash read /etc/profile which adds /usr/bin to PATH
+  // Without it, grep/find/tail/rm/wc are unavailable on Windows Git Bash
+  return `${quoted} --login "${scriptPath.replace(/\\/g, "/")}"`;
 }
 
 /** Try running a command with a timeout. Returns stdout on success, or error text. */
@@ -62,13 +91,13 @@ function tryExecSync(cmd: string, workDir: string, timeoutMs = 60_000): string {
   try {
     return execSync(cmd, { cwd: workDir, timeout: timeoutMs, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
   } catch (e: unknown) {
-    if (e && typeof e === "object" && "stdout" in e) {
-      return String((e as { stdout: string }).stdout);
-    }
-    if (e && typeof e === "object" && "stderr" in e && (e as { stderr: string }).stderr) {
-      return String((e as { stderr: string }).stderr);
-    }
-    return `[discovery error] ${e instanceof Error ? e.message : String(e)}`;
+    const err = e as { stdout?: string; stderr?: string; message?: string };
+    // Return stdout if non-empty (script ran but exited non-zero)
+    if (err.stdout) return String(err.stdout);
+    // Return stderr if non-empty (script crashed with an error message)
+    if (err.stderr) return String(err.stderr);
+    // Last resort: error message so the report shows the script failed
+    return `[discovery error] ${err.message ?? String(e)}`;
   }
 }
 
@@ -180,7 +209,8 @@ export function detectEcosystem(workDir: string): EcosystemInfo | null {
 
 /**
  * Generate .agile/checks/*.sh template scripts for the detected ecosystem.
- * Returns a summary of what was created and what needs manual setup.
+ * Templates are EMPTY — only comments about what to check and how to return.
+ * The agent fills in the actual commands.
  */
 export function initChecks(workDir: string): { created: string[]; warnings: string[] } {
   const checksDir = path.join(workDir, ".agile", "checks");
@@ -282,74 +312,6 @@ export function initChecks(workDir: string): { created: string[]; warnings: stri
   return { created, warnings };
 }
 
-// ─── Auto-install ────────────────────────────────────────────────────────
-
-/**
- * Try to install missing ecosystem tools via package manager.
- * Returns lists of what was installed and what still needs manual setup.
- */
-export function autoInstallTools(workDir: string, ecosystem: EcosystemInfo | null): { installed: string[]; failed: string[] } {
-  if (!ecosystem) return { installed: [], failed: [] };
-
-  const installed: string[] = [];
-  const failed: string[] = [];
-
-  for (const tool of ecosystem.tools) {
-    const cmd = tool.name.split(" ")[0];
-    // Check if already installed
-    try {
-      execSync(`${cmd} --version`, { cwd: workDir, timeout: 5000, encoding: "utf8", stdio: ["ignore", "ignore", "pipe"] });
-      continue;
-    } catch { /* need install */ }
-
-    const installCmd = tool.install;
-    if (installCmd.startsWith("npm") || installCmd.startsWith("pip") || installCmd.startsWith("go")) {
-      try {
-        execSync(installCmd, { cwd: workDir, timeout: 120000, encoding: "utf8", stdio: ["ignore", "ignore", "pipe"] });
-        installed.push(tool.name);
-        continue;
-      } catch {
-        failed.push(tool.name);
-        continue;
-      }
-    }
-    // tools that ship with SDK (dotnet format, go test) — mark as needing SDK
-    if (installCmd === "(built-in)" || installCmd === "(included in .NET SDK)") {
-      failed.push(tool.name + " (needs SDK installed)");
-      continue;
-    }
-    failed.push(tool.name);
-  }
-
-  return { installed, failed };
-}
-
-/**
- * Validate generated checks scripts by running them and collecting output.
- */
-export function validateCheckScripts(workDir: string, created: string[]): string[] {
-  const checksDir = path.join(workDir, ".agile", "checks");
-  const results: string[] = [];
-
-  for (const script of created) {
-    const scriptPath = path.join(checksDir, script).replace(/\\/g, "/");
-    try {
-      const out = execSync(bashCommand(scriptPath), { cwd: workDir, timeout: 30000, encoding: "utf8", maxBuffer: 50 * 1024 });
-      const lines = out.trim().split("\n").filter(l => !l.startsWith("METRIC"));
-      const nonMetric = lines.filter(l => l.trim()).join("\n").slice(0, 500);
-      results.push(`## ${script}\n${nonMetric || "(no output)"}`);
-    } catch (e: unknown) {
-      const err = e as { stderr?: Buffer | string; stdout?: Buffer | string; message?: string };
-      const stderr = err.stderr?.toString().trim() || err.message || "unknown error";
-      const stdout = err.stdout?.toString().trim() || "";
-      const outLines = stdout.split("\n").concat(stderr.split("\n")).filter((l: string) => !l.startsWith("METRIC") && l.trim()).slice(0, 5);
-      results.push(`## ${script}\n⚠ ${outLines.join("\n") || "script failed"}`);
-    }
-  }
-
-  return results;
-}
-
 // ─── Check runner ──────────────────────────────────────────────────────
 
 /**
@@ -359,7 +321,7 @@ export function runChecks(workDir: string): DiscoveryResult {
   const checksDir = path.join(workDir, ".agile", "checks");
   const scripts = fs.readdirSync(checksDir).filter(f => f.endsWith(".sh"));
 
-  const metrics: Record<string, number> = {};
+  const metrics: Record<string, number | string> = {};
   const reports: Record<string, string> = {};
   const scriptsFound: string[] = [];
 
@@ -372,9 +334,16 @@ export function runChecks(workDir: string): DiscoveryResult {
     // Parse METRIC lines and split from report text
     const reportLines: string[] = [];
     for (const line of raw.split("\n")) {
-      const m = line.match(/^METRIC\s+(\w[\w.]+)\s*=\s*([\d.]+)\s*$/);
-      if (m) {
-        metrics[m[1]] = parseFloat(m[2]);
+      // METRIC key=number  OR  METRIC key="string"  OR  METRIC key=bare_value
+      const mNum = line.match(/^METRIC\s+(\w[\w.]*)\s*=\s*(-?[\d.]+)\s*$/);
+      const mStr = line.match(/^METRIC\s+(\w[\w.]*)\s*=\s*"([^"]*)"\s*$/);
+      const mRaw = line.match(/^METRIC\s+(\w[\w.]*)\s*=\s*(.+?)\s*$/);
+      if (mNum) {
+        metrics[mNum[1]] = parseFloat(mNum[2]);
+      } else if (mStr) {
+        metrics[mStr[1]] = mStr[2];
+      } else if (mRaw) {
+        metrics[mRaw[1]] = mRaw[2];
       } else {
         reportLines.push(line);
       }
@@ -533,6 +502,9 @@ export async function runDiscovery(workDir: string, scope: string[]): Promise<Di
   };
 }
 
+/** Maximum chars per report section (dotnet test verbose can be 10000+). */
+const REPORT_MAX_CHARS = 20000;
+
 /**
  * Format discovery results into a single block for tool output.
  */
@@ -553,15 +525,15 @@ export function formatDiscoveryResult(result: DiscoveryResult): string {
   for (const [name, report] of Object.entries(result.reports)) {
     if (!report || report.startsWith("(no ")) continue;
     const heading = name.charAt(0).toUpperCase() + name.slice(1);
-    const truncated = report.length > 3000
-      ? report.slice(0, 3000) + `\n... (truncated, ${report.length - 3000} more chars)`
+    const truncated = report.length > REPORT_MAX_CHARS
+      ? report.slice(0, REPORT_MAX_CHARS) + `\n... (truncated, ${report.length - REPORT_MAX_CHARS} more chars)`
       : report;
     parts.push(`## ${heading} Results\n${truncated}`);
   }
 
   // Notice when using fallback
   if (result.scriptsFound.length === 0 && metricKeys.length === 0) {
-    parts.push("## ℹ️  No .agile/checks/ Scripts");
+    parts.push("## No .agile/checks/ Scripts");
     parts.push("Run `/agile init-checks` to generate template scripts for your project ecosystem.");
     parts.push("Scripts give you full control over discovery — custom metrics, any language, any tool.");
   }
