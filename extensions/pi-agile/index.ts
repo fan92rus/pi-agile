@@ -933,7 +933,7 @@ ${workerSummary.slice(0, 1000)}`;
       runtime.knowledge.save(workDir);
 
       // Complete sprint
-      runtime.store.completeSprint(workDir, sprint);
+      runtime.store.completeSprint(sprint, workDir);
 
       // Build retrospective text
       const v = sprint.velocity;
