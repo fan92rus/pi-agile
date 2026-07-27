@@ -194,8 +194,13 @@ async function gitDiff(pi: ExtensionAPI, workDir: string, ref: string): Promise<
 }
 
 async function gitMergeSquash(pi: ExtensionAPI, workDir: string, branch: string): Promise<string> {
-  const checkout = await pi.exec("git", ["checkout", "main"], { cwd: workDir, timeout: 15_000 });
-  if (checkout.code !== 0) return `git checkout main failed: ${checkout.stderr}`;
+  // Detect default branch (main or master)
+  const branchResult = await pi.exec("git", ["branch", "--list"], { cwd: workDir, timeout: 5_000 });
+  const branchList = (branchResult.stdout ?? "") + (branchResult.stderr ?? "");
+  const defaultBranch = branchList.includes("main") ? "main" : "master";
+
+  const checkout = await pi.exec("git", ["checkout", defaultBranch], { cwd: workDir, timeout: 15_000 });
+  if (checkout.code !== 0) return `git checkout ${defaultBranch} failed: ${checkout.stderr}`;
   const merge = await pi.exec("git", ["merge", "--squash", branch], { cwd: workDir, timeout: 30_000 });
   return merge.code === 0 ? "" : `git merge --squash ${branch} failed: ${merge.stderr}`;
 }
