@@ -1052,7 +1052,7 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
           // Step 2: pick method
           const method = await ctx.ui.select(
             `Set model for ${role}${current ? ` (current: ${current})` : ""}:`,
-            ["presets — common coding models", "browse by provider", "type model ID"],
+            ["browse by provider", "type model ID"],
           );
           if (!method) return;
 
@@ -1061,28 +1061,6 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
           if (method.startsWith("type")) {
             model = await ctx.ui.input("Enter model ID (format: provider/model:thinking?)", current ?? "");
             if (model) model = model.trim();
-          } else if (method.startsWith("presets")) {
-            // Show focused coding-model presets (dynamically generated)
-            const codingPrefixes = ["opencode-go/", "opencode/", "deepseek/", "zai-coding-cn/", "openrouter/z-ai/", "openrouter/deepseek/", "openrouter/qwen/"];
-            const presets: string[] = [];
-            for (const [prov, models] of Object.entries(allModels)) {
-              if (codingPrefixes.some((p) => prov.startsWith(p) || prov.includes(p.replace("/", "")))) {
-                for (const m of models) {
-                  if (!m.includes("free") && !m.includes(":free") && !m.includes("nano") && !m.includes("mini")) {
-                    presets.push(m);
-                  }
-                }
-              }
-            }
-            const options = [...new Set(presets)].sort().slice(0, 60).map((m) => m === current ? `${m} ✓` : m);
-            options.push("——— browse all models ———");
-            const pick = await ctx.ui.select("Select model:", options);
-            if (!pick) return;
-            if (pick.startsWith("———")) {
-              // Fall through to browse logic below
-            } else {
-              model = pick.replace(" ✓", "");
-            }
           }
 
           if (!model) {
