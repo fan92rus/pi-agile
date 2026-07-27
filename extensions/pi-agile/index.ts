@@ -246,7 +246,6 @@ async function gitMergeSquash(pi: ExtensionAPI, workDir: string, branch: string,
   const branchList = (branchResult.stdout ?? "") + (branchResult.stderr ?? "");
   const defaultBranch = branchList.includes("main") ? "main" : "master";
 
-  console.warn("[pi-agile] gitMergeSquash called for", workDir, branch);
   const checkout = await pi.exec("git", ["checkout", defaultBranch], { cwd: workDir, timeout: 15_000 });
   if (checkout.code !== 0) return `git checkout ${defaultBranch} failed: ${checkout.stderr}`;
   const merge = await pi.exec("git", ["merge", "--squash", branch], { cwd: workDir, timeout: 30_000 });
@@ -287,7 +286,6 @@ async function gitMergeFromWorktree(
   const branchList = (branchResult.stdout ?? "") + (branchResult.stderr ?? "");
   const defaultBranch = branchList.includes("main") ? "main" : "master";
 
-  console.warn("[pi-agile] gitMergeFromWorktree called mainWorkDir=", mainWorkDir, "worktree=", worktreeDir, "branch=", featBranch);
   // Ensure main repo is on default branch
   const checkout = await pi.exec("git", ["checkout", defaultBranch], { cwd: mainWorkDir, timeout: 15_000 });
   if (checkout.code !== 0) return `checkout ${defaultBranch} in main repo failed: ${checkout.stderr}`;
@@ -376,7 +374,7 @@ async function delegateTaskInWorktree(
         context: "fresh",
         output: workerOutput,
         outputMode: "file-only",
-      }, 30_000);
+      }, 120_000);
     } catch (e: unknown) {
       return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `spawn worker r${round}: ${e instanceof Error ? e.message : String(e)}` };
     }
@@ -416,7 +414,7 @@ async function delegateTaskInWorktree(
         context: "fresh",
         output: reviewerOutput,
         outputMode: "file-only",
-      }, 30_000);
+      }, 120_000);
     } catch (e: unknown) {
       return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `spawn reviewer r${round}: ${e instanceof Error ? e.message : String(e)}` };
     }
@@ -493,10 +491,8 @@ async function delegateBatchParallel(
     const r = results[i];
     if (r.verdict.status === "approved" && !r.error) {
       onProgress?.(`${r.bdId}: approved, merging...`);
-      console.warn("[pi-agile] Calling merge for", r.bdId, "mergeResult before call:", (r as any).error);
       try {
         const mergeResult = await gitMergeFromWorktree(pi, mainWorkDir, worktrees[i], r.branch, `feat: merge ${r.bdId}`);
-        console.warn("[pi-agile] mergeResult returned:", mergeResult);
         if (mergeResult) r.error = `merge failed: ${mergeResult}`;
       } catch (e: unknown) {
         r.error = `merge error: ${e instanceof Error ? e.message : String(e)}`;
