@@ -179,8 +179,16 @@ export class SprintStore {
     this.save(workDir, state);
   }
 
-  getCurrent(): SprintState | null {
-    return this.current;
+  getCurrent(workDir?: string): SprintState | null {
+    if (this.current) return this.current;
+    // Auto-restore from disk if workDir is provided
+    if (workDir) {
+      const lastId = this.findLastSprintId(workDir);
+      if (lastId > 0) {
+        return this.load(workDir, lastId);
+      }
+    }
+    return null;
   }
 
   findLastSprintId(workDir: string): number {

@@ -240,7 +240,7 @@ async function gitDiff(pi: ExtensionAPI, workDir: string, ref: string): Promise<
   return execText(pi, "git", ["diff", ref], workDir, 30_000);
 }
 
-async function gitMergeSquash(pi: ExtensionAPI, workDir: string, branch: string): Promise<string> {
+async function gitMergeSquash(pi: ExtensionAPI, workDir: string, branch: string, commitMsg?: string): Promise<string> {
   // Detect default branch (main or master)
   const branchResult = await pi.exec("git", ["branch", "--list"], { cwd: workDir, timeout: 5_000 });
   const branchList = (branchResult.stdout ?? "") + (branchResult.stderr ?? "");
@@ -249,7 +249,14 @@ async function gitMergeSquash(pi: ExtensionAPI, workDir: string, branch: string)
   const checkout = await pi.exec("git", ["checkout", defaultBranch], { cwd: workDir, timeout: 15_000 });
   if (checkout.code !== 0) return `git checkout ${defaultBranch} failed: ${checkout.stderr}`;
   const merge = await pi.exec("git", ["merge", "--squash", branch], { cwd: workDir, timeout: 30_000 });
-  return merge.code === 0 ? "" : `git merge --squash ${branch} failed: ${merge.stderr}`;
+  if (merge.code !== 0) return `git merge --squash ${branch} failed: ${merge.stderr}`;
+
+  // Commit the squashed changes
+  const msg = commitMsg ?? `feat: merge ${branch}`;
+  const commit = await pi.exec("git", ["commit", "-m", msg], { cwd: workDir, timeout: 15_000 });
+  if (commit.code !== 0) return `git commit after squash failed: ${commit.stderr}`;
+
+  return "";
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +378,18 @@ function getRuntime(ctx: ExtensionContext, store: Map<string, AgileRuntime>): Ag
     store.set(key, rt);
   }
   return rt;
+}
+
+/** Try to restore sprint state from disk if current is null. */
+function getOrRestoreSprint(rt: AgileRuntime, workDir: string): SprintState | null {
+  const current = rt.store.getCurrent();
+  if (current) return current;
+  const lastId = rt.store.findLastSprintId(workDir);
+  if (lastId > 0) {
+    const sprint = rt.store.load(workDir, lastId);
+    if (sprint) return sprint;
+  }
+  return null;
 }
 
 // Module-level runtime store (per-session)
@@ -832,7 +851,7 @@ ${workerSummary.slice(0, 1000)}`;
       const branch = `feat/${bdId}`;
 
       // Merge
-      const mergeResult = await gitMergeSquash(pi, workDir, branch);
+      const mergeResult = await gitMergeSquash(pi, workDir, branch, `feat: merge ${bdId}`);
       if (mergeResult) {
         return {
           content: [{ type: "text" as const, text: `❌ Merge failed: ${mergeResult}` }],
@@ -892,11 +911,11 @@ ${workerSummary.slice(0, 1000)}`;
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const workDir = (_params?.cwd as string) || ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
-      const sprint = runtime.store.getCurrent();
+      const sprint = runtime.store.getCurrent(workDir);
 
       if (!sprint) {
         return {
-          content: [{ type: "text" as const, text: "❌ No active sprint. Call agile_start_sprint first." }],
+          content: [{ type: "text" as const, text: "❌ No active sprint found. Start a sprint with agile_start_sprint or ensure sprint-*.json exists in .agile/." }],
         };
       }
 
