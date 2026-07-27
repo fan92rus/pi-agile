@@ -23,7 +23,7 @@ import * as path from "node:path";
 import { KnowledgeBase } from "./parallel/knowledge.ts";
 import { SprintStore, type SprintState, type SprintTask, type SprintVelocity } from "./parallel/sprint.ts";
 import { runDiscovery, formatDiscoveryResult, initChecks, detectEcosystem, type EcosystemInfo } from "./parallel/discovery.ts";
-import { buildChainAgentTask, buildReviewerTask, buildWorkerTask, parseReviewVerdict } from "./parallel/review.ts";
+import { buildChainAgentTask, buildReviewerTask, buildWorkerTask, parseReviewVerdict, buildDiscoveryScoutTask } from "./parallel/review.ts";
 import { RpcClient, type SpawnedWorker } from "./parallel/rpc.ts";
 import {
   createObserverState,
@@ -922,7 +922,7 @@ bd priority <id> high    # set priority: high, medium, low
 6. Only proceed to Phase 1 after \`agile_discover\` returns meaningful results
 
 ### Phase 1: Discovery
-1. Call \`agile_discover\` tool — returns raw lint/coverage/TODO/security output
+1. Call \`agile_discover\` tool — runs check scripts (lint/coverage/todos) + scout subagent codebase analysis
 2. Read ALL output carefully — empty sections likely mean tools need setup (see Phase 0)
 3. Identify findings that are actionable tasks:
    - Each TODO/FIXME is a potential task
@@ -1076,9 +1076,10 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "agile_discover",
     label: "agile_discover",
-    description: "Run codebase discovery (linters, coverage, TODOs, security). Returns raw output for the agent to analyze and decide which findings become tasks.",
+    description: "Run codebase discovery: check scripts (lint/coverage/todos) + scout subagent analysis. Returns raw output for the agent to analyze and decide which findings become tasks.",
     parameters: Type.Object({
       scope: Type.Optional(Type.Array(Type.String(), { description: "Glob patterns to scan. Defaults to project scope." })),
+      skip_scout: Type.Optional(Type.Boolean({ description: "Skip the scout subagent (only run check scripts). Default: false." })),
       cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1088,12 +1089,14 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       const workDir = (params.cwd as string) || ctx.cwd;
       const project = loadProjectConfig(workDir);
       const scope = (params.scope as string[]) ?? extractScope(project);
+      const skipScout = (params.skip_scout as boolean) ?? false;
 
+      // 1. Run check scripts (lint, coverage, todos)
       const result = await runDiscovery(workDir, scope);
       const eco = detectEcosystem(workDir);
       const text = formatDiscoveryResult(result);
 
-      // Detect missing tools and recommend setup
+      // Detect missing tools
       let missingBlock = "";
       if (eco) {
         const missing = eco.tools.filter(t => {
@@ -1105,15 +1108,63 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
           }
         });
         if (missing.length > 0) {
-          missingBlock = "## \u2699\ufe0f Tools Not Found\n" +
+          missingBlock = "## ⚙️ Tools Not Found\n" +
             "Run /agile init-checks to generate scripts, or install manually:\n" +
             missing.map(t => "- " + t.name + ": `" + t.install + "`").join("\n") + "\n\n";
         }
       }
 
+      // 2. Run scout subagent for codebase analysis
+      let scoutBlock = "";
+      if (!skipScout) {
+        try {
+          const meta = extractProjectMeta(project);
+          const kb = new KnowledgeBase(workDir);
+          await kb.load();
+          const constraintsText = loadConstraintsText(workDir);
+          const patternsText = kb.formatPatterns();
+          const scoutTask = buildDiscoveryScoutTask(workDir, meta.goal || "", constraintsText, patternsText, scope);
+          const scoutOutput = path.join(workDir, ".agile", "scout-output.txt");
+          const spawnTimeout = getSpawnTimeout(workDir);
+
+          let spawned: SpawnedWorker;
+          try {
+            spawned = await rpc.spawn({
+              agent: "worker",
+              model: getAgentModel(workDir, "scout"),
+              task: scoutTask,
+              cwd: workDir,
+              context: "fresh",
+              output: scoutOutput,
+              outputMode: "file-only",
+            }, Math.min(spawnTimeout, 120_000));
+          } catch (e: unknown) {
+            scoutBlock = "\n\n## Scout Analysis\n⚠ Scout spawn failed: " + (e instanceof Error ? e.message : String(e)) + "\n";
+          }
+
+          if (!scoutBlock) {
+            // Poll for completion
+            const scoutDone = await pollWithProgress(
+              pi, workDir, rpc, spawned.runId, scoutOutput, "scout",
+              () => {}, Math.min(spawnTimeout, 120_000)
+            );
+            if (scoutDone && fs.existsSync(scoutOutput)) {
+              const scoutResult = fs.readFileSync(scoutOutput, "utf8").trim();
+              if (scoutResult.length > 100) {
+                scoutBlock = "\n\n## Scout Analysis (subagent findings)\n" + scoutResult.slice(0, 8000) + "\n";
+              }
+            } else {
+              scoutBlock = "\n\n## Scout Analysis\n⚠ Scout did not complete in time. Re-run agile_discover or set skip_scout=true.\n";
+            }
+          }
+        } catch (e: unknown) {
+          scoutBlock = "\n\n## Scout Analysis\n⚠ Scout error: " + (e instanceof Error ? e.message : String(e)) + "\n";
+        }
+      }
+
       return {
-        content: [{ type: "text" as const, text: `# Discovery Results\n\n${missingBlock}${text}` }],
-        details: { scriptsFound: result.scriptsFound, metricCount: Object.keys(result.metrics).length },
+        content: [{ type: "text" as const, text: `# Discovery Results\n\n${missingBlock}${text}${scoutBlock}` }],
+        details: { scriptsFound: result.scriptsFound, metricCount: Object.keys(result.metrics).length, scoutRan: !skipScout && !scoutBlock.startsWith("\n\n## Scout Analysis\n⚠") },
       };
     },
   });
@@ -2304,7 +2355,7 @@ function agileHelp(): string {
 ## Workflow
 1. \`/agile setup\` — configure project
 2. \`/agile on\` — enable agile mode
-3. Call \`agile_discover\` tool — get discovery results
+3. Call \`agile_discover\` tool — runs check scripts + scout subagent analysis
 4. Create tasks in bd: \`bd create "title" --description "desc"\`
 4. Call \`agile_start_sprint\` — initialize sprint
 5. For each task: call \`agile_delegate_task\` → get verdict

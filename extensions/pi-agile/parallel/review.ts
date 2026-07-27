@@ -285,3 +285,65 @@ ${ctx}${feedback ? "## Rework Feedback (from previous review)\n" + feedback + "\
 ## Returns
 Return a summary of changes made: files modified, approach taken, lines of code.`;
 }
+
+/**
+ * Build a discovery scout task — full codebase exploration to find
+ * actionable improvement opportunities within project constraints.
+ */
+export function buildDiscoveryScoutTask(
+  workDir: string,
+  goal: string,
+  constraints: string,
+  patterns: string,
+  scope: string[],
+): string {
+  return `# Codebase Discovery Scout
+
+You are a codebase scout exploring the project at ${workDir}.
+
+## Project Goal
+${goal || "(not specified — improve code quality, find bugs, reduce tech debt)"}
+
+## Project Constraints
+${constraints || "(none specified)"}
+
+## Known Patterns
+${patterns || "(none recorded yet)"}
+
+## Scan Scope
+${scope.length > 0 ? scope.join(", ") : "(entire project)"}
+
+## Your Mission
+Explore the codebase and find concrete, actionable improvement opportunities.
+Focus on things that could become tasks for developers.
+
+## What to Look For
+1. **Bugs & Correctness**: error handling gaps, race conditions, edge cases, incorrect logic
+2. **Security**: hardcoded secrets, injection risks, missing input validation, auth issues
+3. **Performance**: N+1 queries, unnecessary allocations, blocking calls, memory leaks
+4. **Maintainability**: duplicated code, overly complex functions, missing error context
+5. **Testing**: untested critical paths, missing edge case tests, brittle mocks
+6. **Architecture**: circular dependencies, layer violations, tight coupling
+7. **Configuration**: hardcoded values that should be configurable, missing env vars
+8. **Documentation**: missing/incorrect docs for public APIs, outdated README
+
+## Output Format
+Return a structured report. For EACH finding:
+\'\'\'
+### [Category] Short title
+- **File**: path/to/file.ts:line
+- **Issue**: what's wrong (1-2 sentences)
+- **Severity**: critical | high | medium | low
+- **Fix**: brief description of the fix (1 sentence)
+- **Effort**: S (< 1h) | M (1-4h) | L (4h+)
+\'\'\'
+
+## Rules
+- Do NOT write code or make changes — only report findings
+- Be SPECIFIC: exact file paths and line numbers
+- Focus on ACTIONABLE findings — skip cosmetic issues (formatting, naming)
+- Respect project constraints — don't suggest changes that violate them
+- Group related issues (e.g. 3 missing validations in one file = one finding)
+- Limit to TOP 15 findings by severity/impact
+- Include a summary at the top: N critical, N high, N medium, N low`;
+}
