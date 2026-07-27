@@ -912,14 +912,13 @@ bd priority <id> high    # set priority: high, medium, low
 ## Workflow
 
 ### Phase 0: Project Setup (MUST DO first)
-1. **Initialize all analysis tools** for the project:
-   - Set up ESLint/Pylint/TSConfig — the project MUST have working linter config
-   - Add test runner config (Jest/Vitest/node --test) — tests are REQUIRED for every change
-   - Install coverage tools (c8/nyc/istanbul) if available
-   - Configure complexity analyzers (plato/complexity-report)
-   - Without these tools, \`agile_discover\` returns empty results for those categories
-2. Add the configs and tool setup as the FIRST tasks in bd
-3. Only proceed to discovery after tools are working
+1. **Run \`/agile init-checks\`** — generates .agile/checks/{todos,lint,coverage}.sh
+   for your project's ecosystem (Go, Rust, .NET, Python, JS/TS, etc.)
+2. **Review generated scripts** in .agile/checks/ — edit if auto-detection failed
+3. **Install missing tools** shown in warnings (e.g. eslint, ruff, dotnet-format)
+4. **Run \`agile_discover\`** to validate scripts produce real results
+5. **Create Phase 0 tasks** in bd for any tools that need config setup
+6. Only proceed to Phase 1 after \`agile_discover\` returns meaningful output
 
 ### Phase 1: Discovery
 1. Call \`agile_discover\` tool — returns raw lint/coverage/TODO/security output
@@ -1098,15 +1097,10 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       if (eco) {
         const missing = eco.tools.filter(t => {
           try {
-            require("child_process").execSync(t.name.split(" ")[0] + " --version", { cwd: workDir, timeout: 3000, encoding: "utf8" });
+            require("child_process").execSync(t.name.split(" ")[0] + " --version", { cwd: workDir, timeout: 3000, encoding: "utf8", stdio: ["ignore", "ignore", "pipe"] });
             return false;
           } catch {
-            try {
-              require("child_process").execSync(t.name.split(" ")[0] + " version", { cwd: workDir, timeout: 3000, encoding: "utf8" });
-              return false;
-            } catch {
-              return true;
-            }
+            return true;
           }
         });
         if (missing.length > 0) {
@@ -1791,10 +1785,21 @@ do_not_do:
         let checksMsg = `\nCreated ${checksResult.created.length} check script(s): ${checksResult.created.join(", ")}`;
         if (eco) checksMsg += ` (detected: ${eco.language})`;
         if (checksResult.warnings.length > 0) {
-          checksMsg += `\n\n⚠ Setup needed:\n${checksResult.warnings.join("\n")}`;
+          checksMsg += `\n\n⚠ Agent must fix BEFORE agile_discover:\n${checksResult.warnings.join("\n")}`;
+        }
+        checksMsg += `\n\n## Agent instructions\n`;
+        if (eco) {
+          checksMsg += `1. Install missing tools (commands above)\n`;
+          checksMsg += `2. Review generated scripts in .agile/checks/\n`;
+          checksMsg += `3. Run \`agile_discover\` to validate`;
+        } else {
+          checksMsg += `1. Auto-detection failed — edit .agile/checks/lint.sh with your linter\n`;
+          checksMsg += `2. Edit .agile/checks/coverage.sh with your test command\n`;
+          checksMsg += `3. Install any needed tools\n`;
+          checksMsg += `4. Run \`agile_discover\` to validate`;
         }
 
-        ctx.ui.notify(lines.join("\n") + `\n${checksMsg}\n\n✅ Setup complete! Configs created in ${agileDir}/\n\nNext: /agile on`, "info");
+        ctx.ui.notify(lines.join("\n") + `\n${checksMsg}\n\n✅ Setup complete! Configs created in ${agileDir}/`, "info");
         return;
       }
 
@@ -1805,7 +1810,15 @@ do_not_do:
         if (eco) msg += ` (detected: ${eco.language})`;
         if (checksResult.warnings.length > 0) {
           msg += `\n\n⚠ Setup needed:\n${checksResult.warnings.join("\n")}`;
-          msg += `\n\nInstall the missing tools, then run \`agile_discover\` to validate.`;
+        }
+        msg += `\n\n## Next steps for the agent\n`;
+        msg += `1. Install missing tools using the commands above\n`;
+        if (!eco) {
+          msg += `2. Edit \`.agile/checks/lint.sh\` with your project's linter\n`;
+          msg += `3. Edit \`.agile/checks/coverage.sh\` with your test runner\n`;
+          msg += `4. Run \`agile_discover\` to validate the scripts work`;
+        } else {
+          msg += `2. Run \`agile_discover\` to verify detection works`;
         }
         ctx.ui.notify(msg, "info");
         return;

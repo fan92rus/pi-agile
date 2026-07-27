@@ -71,12 +71,21 @@ export function detectEcosystem(workDir: string): EcosystemInfo | null {
     };
   }
 
-  // .NET / C#
-  if (fs.readdirSync(workDir).some(f => f.endsWith(".csproj") || f.endsWith(".sln"))) {
+  // .NET / C# — search recursively for .csproj or .sln
+  function findFiles(dir: string, ext: string): boolean {
+    try {
+      return fs.readdirSync(dir).some(f => f.endsWith(ext)) ||
+        fs.readdirSync(dir).some(e => {
+          const p = path.join(dir, e);
+          return e !== ".git" && fs.statSync(p).isDirectory() && findFiles(p, ext);
+        });
+    } catch { return false; }
+  }
+  if (findFiles(workDir, ".csproj") || findFiles(workDir, ".sln")) {
     return {
       language: "dotnet",
       tools: [
-        { name: "dotnet format", check: "dotnet format --verify-no-changes", install: "dotnet tool install -g dotnet-format" },
+        { name: "dotnet format", check: "dotnet format --verify-no-changes", install: "(included in .NET SDK)" },
         { name: "dotnet test", check: "dotnet test", install: "(built-in)" },
       ],
       configFiles: [".editorconfig"],
@@ -175,59 +184,85 @@ echo "METRIC fixme_count=$FIXME"
   fs.writeFileSync(path.join(checksDir, "todos.sh"), todosScript, "utf8");
   created.push("todos.sh");
 
+  // Determine lint tools
+  const lintTools = ecosystem
+    ? ecosystem.tools.filter(t =>
+        t.name.includes("lint") || t.name === "eslint" || t.name === "ruff" ||
+        t.name.includes("clippy") || t.name.includes("format") ||
+        t.name.includes("rubocop") || t.name.includes("checkstyle")
+      )
+    : [];
+
+  // Always create lint.sh (ecosystem-specific or generic)
+  let lintContent = "#!/bin/bash\n# .agile/checks/lint.sh — Lint checker\n";
+  if (lintTools.length > 0) {
+    for (const tool of lintTools) {
+      const metricName = tool.name.replace(/[^a-zA-Z0-9_]/g, "_");
+      lintContent += `# Tool: ${tool.name}\n# Install: ${tool.install}\n`;
+      lintContent += `if command -v ${tool.name.split(" ")[0]} &>/dev/null; then\n`;
+      lintContent += `  echo "--- ${tool.name} ---"\n`;
+      lintContent += `  ${tool.check} 2>/dev/null || true\n`;
+      lintContent += `  ${tool.check} 2>&1 | grep -cE "error|warning" | awk '{print "METRIC ${metricName}_errors=" $1}' || echo "METRIC ${metricName}_errors=0"\n`;
+      lintContent += `else\n`;
+      lintContent += `  echo "# ${tool.name} not installed — run: ${tool.install}"\n`;
+      lintContent += `fi\n\n`;
+    }
+  } else {
+    lintContent += `# Project type not auto-detected. Add your linter command here.\n`;
+    lintContent += `# Examples:\n`;
+    lintContent += `#   npx eslint . --format compact\n`;
+    lintContent += `#   dotnet format --verify-no-changes\n`;
+    lintContent += `#   cargo clippy -- -D warnings\n`;
+    lintContent += `#   ruff check .\n`;
+    lintContent += `echo "(no linter configured — edit this script)"\n`;
+    lintContent += `echo "METRIC lint_errors=0"\n`;
+  }
+  fs.writeFileSync(path.join(checksDir, "lint.sh"), lintContent, "utf8");
+  created.push("lint.sh");
+
+  // Coverage / test script
+  const testTools = ecosystem
+    ? ecosystem.tools.filter(t =>
+        t.name.includes("test") || t.name.includes("jest") || t.name.includes("vitest") ||
+        t.name.includes("pytest") || t.name.includes("rspec") || t.name.includes("mvn")
+      )
+    : [];
+  let covContent = "#!/bin/bash\n# .agile/checks/coverage.sh — Test coverage\n";
+  if (testTools.length > 0) {
+    for (const tool of testTools) {
+      covContent += `# Tool: ${tool.name}\n# Install: ${tool.install}\n`;
+      covContent += `if command -v ${tool.name.split(" ")[0]} &>/dev/null; then\n`;
+      covContent += `  echo "--- ${tool.name} ---"\n`;
+      covContent += `  ${tool.check} 2>/dev/null || true\n`;
+      covContent += `else\n`;
+      covContent += `  echo "# ${tool.name} not installed — run: ${tool.install}"\n`;
+      covContent += `fi\n\n`;
+    }
+  } else {
+    covContent += `# Project type not auto-detected. Add your test command here.\n`;
+    covContent += `# Examples:\n`;
+    covContent += `#   npx vitest run\n`;
+    covContent += `#   dotnet test\n`;
+    covContent += `#   cargo test\n`;
+    covContent += `#   go test -cover ./...\n`;
+    covContent += `echo "(no test runner configured — edit this script)"\n`;
+    covContent += `echo "METRIC coverage_pct=0"\n`;
+  }
+  fs.writeFileSync(path.join(checksDir, "coverage.sh"), covContent, "utf8");
+  created.push("coverage.sh");
+
+  // Check tool availability for warnings
   if (ecosystem) {
-    // Lint script
-    const lintChecks = ecosystem.tools.filter(t =>
-      t.name.includes("lint") || t.name === "eslint" || t.name === "ruff" ||
-      t.name.includes("clippy") || t.name.includes("format") ||
-      t.name.includes("rubocop") || t.name.includes("checkstyle")
-    );
-    if (lintChecks.length > 0) {
-      let lintContent = "#!/bin/bash\n# .agile/checks/lint.sh — Lint checker\n# Adjust paths and flags to match your project.\n\n";
-      for (const tool of lintChecks) {
-        const metricName = tool.name.replace(/[^a-zA-Z0-9_]/g, "_");
-        lintContent += `# Tool: ${tool.name}\n# Install: ${tool.install}\n`;
-        lintContent += `if command -v ${tool.name.split(" ")[0]} &>/dev/null; then\n`;
-        lintContent += `  echo "--- ${tool.name} ---"\n`;
-        lintContent += `  ${tool.check} 2>/dev/null || true\n`;
-        lintContent += `  ${tool.check} 2>&1 | grep -cE "error|warning" | awk '{print "METRIC ${metricName}_errors=" $1}' || echo "METRIC ${metricName}_errors=0"\n`;
-        lintContent += `else\n`;
-        lintContent += `  echo "# ${tool.name} not installed — run: ${tool.install}"\n`;
-        lintContent += `fi\n\n`;
-      }
-      fs.writeFileSync(path.join(checksDir, "lint.sh"), lintContent, "utf8");
-      created.push("lint.sh");
-    }
-
-    // Coverage / test script
-    const testTools = ecosystem.tools.filter(t =>
-      t.name.includes("test") || t.name.includes("jest") || t.name.includes("vitest") ||
-      t.name.includes("pytest") || t.name.includes("rspec") || t.name.includes("mvn")
-    );
-    if (testTools.length > 0) {
-      let covContent = "#!/bin/bash\n# .agile/checks/coverage.sh — Test coverage\n# Adjust to match your test runner.\n\n";
-      for (const tool of testTools) {
-        covContent += `# Tool: ${tool.name}\n# Install: ${tool.install}\n`;
-        covContent += `if command -v ${tool.name.split(" ")[0]} &>/dev/null; then\n`;
-        covContent += `  echo "--- ${tool.name} ---"\n`;
-        covContent += `  ${tool.check} 2>/dev/null || true\n`;
-        covContent += `else\n`;
-        covContent += `  echo "# ${tool.name} not installed — run: ${tool.install}"\n`;
-        covContent += `fi\n\n`;
-      }
-      fs.writeFileSync(path.join(checksDir, "coverage.sh"), covContent, "utf8");
-      created.push("coverage.sh");
-    }
-
-    // Check tool availability for warnings
     for (const tool of ecosystem.tools) {
       const cmd = tool.name.split(" ")[0];
       try {
-        execSync(`${cmd} --version 2>/dev/null || ${cmd} version 2>/dev/null`, { cwd: workDir, timeout: 5000, encoding: "utf8" });
+        execSync(`${cmd} --version`, { cwd: workDir, timeout: 5000, encoding: "utf8", stdio: ["ignore", "ignore", "pipe"] });
       } catch {
         warnings.push(`⚠️  \`${tool.name}\` not found. Install: \`${tool.install}\``);
       }
     }
+  } else {
+    warnings.push(`ℹ️  Project type not auto-detected. Edit \`.agile/checks/lint.sh\` and \`.agile/checks/coverage.sh\` with your actual linter and test commands.`);
   }
 
   // chmod +x (Unix only)
