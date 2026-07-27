@@ -89,6 +89,9 @@ function saveAgileConfig(workDir: string, config: Record<string, unknown>): void
 const DEFAULT_AGENT_MODELS: Record<string, string> = {
   worker: "opencode-go/deepseek-v4-flash",
   reviewer: "opencode-go/deepseek-v4-flash",
+  scout: "opencode-go/deepseek-v4-flash",
+  researcher: "zai-glm/glm-5.2",
+  planner: "zai-glm/glm-5.2",
 };
 
 /** Read agent_chains from .agile/config.json, default {"default": ["worker","reviewer"]}. */
@@ -948,13 +951,31 @@ bd priority <id> high    # set priority: high, medium, low
 3. Call \`agile_start_sprint\` with the task IDs
 4. The sprint is now active
 
+## Agent Chains
+Choose the right chain based on task complexity and context:
+
+| Task type | Chain | Reason |
+|-----------|-------|--------|
+| **Simple bugfix** in familiar code | \`["worker", "reviewer"]\` (default) | Cheapest, fastest |
+| **Refactor** in unfamiliar code | \`["scout", "worker", "reviewer"]\` | Scout maps existing patterns first |
+| **New feature** with external API | \`["researcher", "scout", "worker", "reviewer"]\` | Research docs, scout existing code |
+| **Complex multi-file change** | \`["scout", "worker", "reviewer"]\` (+ planner if large) | Decompose before implementing |
+| **Security fix** | \`["scout", "worker", "reviewer"]\` | Scout finds all vulnerable paths |
+
+**Rules:**
+- Chain agents run ONCE before the worker loop (not on rework rounds)
+- Each chain agent sees outputs from previous chain agents
+- Rework loop is always worker → reviewer (no scout/re-research)
+- Set project-wide defaults in \`.agile/config.json\`:
+  \`\`\`json
+  {"agent_chains": {"refactor": ["scout", "worker", "reviewer"]}}
+  \`\`\`
+- Pass \`chain\` per-call: \`agile_delegate_task({bd_id: "...", chain: ["scout", "worker", "reviewer"]})\`
+
 ### Phase 4: Sprint Execution
 For each task in the sprint:
 1. Call \`agile_delegate_task\` with just the bd_id — the tool reads task details from bd
-2. The tool runs the agent chain (default: worker → reviewer). Customize via \`chain\` param:
-   - \`chain: ["scout", "worker", "reviewer"]\` — scout explores codebase first
-   - \`chain: ["researcher", "scout", "worker", "reviewer"]\` — research + scout + implement
-   - Set default chains in \`.agile/config.json\` under \`agent_chains\`
+2. Select the chain (from table above based on task type)
 3. The worker gets context from prior chain steps (scout report, research, plan)
 4. Read the review verdict:
    - **approved** → call \`agile_merge_task\` to merge to main
@@ -975,14 +996,17 @@ For each task in the sprint:
 
 ## Agent Models (configurable)
 
-Worker and reviewer subagents use configurable models. Defaults:
+Each agent role uses a configurable model. Defaults:
 - worker: opencode-go/deepseek-v4-flash
 - reviewer: opencode-go/deepseek-v4-flash
+- scout: opencode-go/deepseek-v4-flash
+- researcher: zai-glm/glm-5.2 (stronger for research tasks)
+- planner: zai-glm/glm-5.2 (stronger for decomposition)
 
 Override in .agile/config.json:
-  { "agent_models": { "worker": "zai-glm/glm-5.2", "reviewer": "zai-glm/glm-5.2" } }
+  { "agent_models": { "scout": "opencode-go/deepseek-v4-flash", "researcher": "zai-glm/glm-5.2" } }
 
-Both worker and reviewer run with fresh context (no parent session inheritance).
+All agents run with fresh context (no parent session inheritance).
 
 ## Key Rules
 
@@ -1685,14 +1709,19 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
           const totalCount = Object.values(allModels).reduce((s, m) => s + m.length, 0);
 
           // Step 1: pick role
-          const roleChoice = await ctx.ui.select("Select agent role:", [
+          const roleChoices = [
             "worker — implementation subagent",
             "reviewer — code review subagent",
+            "scout — codebase exploration agent",
+            "researcher — API/best-practices research agent",
+            "planner — task decomposition agent",
             "show current models",
-          ]);
+          ];
+          const roleChoice = await ctx.ui.select("Select agent role:", roleChoices);
           if (!roleChoice) return;
           if (roleChoice === "show current models") { await showModelStatus(totalCount, providerCount); return; }
-          const role = roleChoice.startsWith("worker") ? "worker" : "reviewer";
+          const roleMap: Record<string, string> = { worker: "worker", reviewer: "reviewer", scout: "scout", researcher: "researcher", planner: "planner" };
+          const role = Object.keys(roleMap).find(k => roleChoice.startsWith(k)) ?? "worker";
           const current = ((config.agent_models ?? {}) as Record<string, string>)[role];
 
           // Step 2: pick method
@@ -1741,8 +1770,8 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
           await showModelStatus(Object.values(allModels).reduce((s, m) => s + m.length, 0), Object.keys(allModels).length);
           return;
         }
-        if (!["worker", "reviewer"].includes(parts[1])) {
-          ctx.ui.notify(`Unknown role: ${parts[1]}. Use 'worker' or 'reviewer'.`, "error");
+        if (!["worker", "reviewer", "scout", "researcher", "planner"].includes(parts[1])) {
+          ctx.ui.notify(`Unknown role: ${parts[1]}. Use 'worker', 'reviewer', 'scout', 'researcher', or 'planner'.`, "error");
           return;
         }
         if (!config.agent_models) config.agent_models = {};
