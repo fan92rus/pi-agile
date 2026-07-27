@@ -1003,16 +1003,70 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
 
       if (command === "model" || command.startsWith("model ")) {
         const parts = command.split(/\s+/);
-        if (parts.length < 3) {
-          // Show current models
-          const config = loadAgileConfig(workDir);
+        const config = loadAgileConfig(workDir);
+
+        async function showModelStatus() {
           const models = (config.agent_models ?? {}) as Record<string, string>;
-          const lines = ["# Agent Models", ""]
+          const lines = ["# Agent Models", ""];
           lines.push(`  worker:   ${models.worker ?? "opencode-go/deepseek-v4-flash (default)"}`);
           lines.push(`  reviewer: ${models.reviewer ?? "opencode-go/deepseek-v4-flash (default)"}`);
           lines.push("");
           lines.push("Set: /agile model <worker|reviewer> <model-id>");
           ctx.ui.notify(lines.join("\n"), "info");
+        }
+
+        // Interactive mode: no args / just "model"
+        if (parts.length < 2) {
+          // Step 1: select role
+          const roleChoice = await ctx.ui.select("Select agent role to configure:", [
+            "worker — implementation subagent",
+            "reviewer — code review subagent",
+            "show current",
+          ]);
+          if (!roleChoice || roleChoice === "show current") {
+            await showModelStatus();
+            return;
+          }
+          const role = roleChoice.startsWith("worker") ? "worker" : "reviewer";
+          const current = ((config.agent_models ?? {}) as Record<string, string>)[role];
+
+          // Step 2: select model from presets or type custom
+          const MODEL_PRESETS = [
+            "opencode-go/deepseek-v4-flash — default (flash, cheap)",
+            "opencode-go/deepseek-v4-flash:low — flash with low thinking",
+            "opencode-go/deepseek-v4-flash:xhigh — flash with max thinking",
+            "zai-glm/glm-5.2 — GLM 5 (powerful, expensive)",
+            "zai-glm/glm-5.2:high — GLM 5 with high thinking",
+            "type custom model...",
+          ];
+
+          let model: string | undefined;
+          const modelChoice = await ctx.ui.select(
+            `Model for ${role}${current ? ` (current: ${current})` : ""}:`,
+            MODEL_PRESETS,
+          );
+          if (!modelChoice) return;
+
+          if (modelChoice.startsWith("type custom")) {
+            model = await ctx.ui.input(
+              `Enter model for ${role}\nFormat: provider/model or provider/model:thinking`,
+              current ?? "",
+            );
+            if (!model || !model.trim()) return;
+          } else {
+            model = modelChoice.split(" —")[0].trim();
+          }
+
+          if (!config.agent_models) config.agent_models = {};
+          (config.agent_models as Record<string, string>)[role] = model;
+          saveAgileConfig(workDir, config);
+          ctx.ui.notify(`✅ ${role} model set to: ${model}`, "info");
+          return;
+        }
+
+        // Non-interactive: /agile model <role> <model>
+        if (parts.length < 3) {
+          await showModelStatus();
           return;
         }
         const role = parts[1];
@@ -1021,7 +1075,6 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
           ctx.ui.notify(`Unknown role: ${role}. Use 'worker' or 'reviewer'.`, "error");
           return;
         }
-        const config = loadAgileConfig(workDir);
         if (!config.agent_models) config.agent_models = {};
         (config.agent_models as Record<string, string>)[role] = model;
         saveAgileConfig(workDir, config);
