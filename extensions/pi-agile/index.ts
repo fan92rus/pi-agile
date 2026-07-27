@@ -409,10 +409,11 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     label: "agile_discover",
     description: "Run codebase discovery (linters, coverage, TODOs, security). Returns raw output for the agent to analyze and decide which findings become tasks.",
     parameters: Type.Object({
-      scope: Type.Optional(Type.Array(Type.String(), { description: "Glob patterns to scan. Defaults to project scope." })),
+      scope: Type.Optional(Type.Array(Type.String(), { description: "Glob patterns to scan. Defaults to project scope.",
+      cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })) })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const workDir = ctx.cwd;
+      const workDir = (params.cwd as string) || ctx.cwd;
       const project = loadProjectConfig(workDir);
       const scope = (params.scope as string[]) ?? extractScope(project);
 
@@ -432,10 +433,11 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     label: "agile_start_sprint",
     description: "Initialize a new sprint. Call after creating tasks in bd. Returns sprint state.",
     parameters: Type.Object({
-      task_ids: Type.Array(Type.String(), { description: "bd task IDs included in this sprint" }),
+      task_ids: Type.Array(Type.String(), { description: "bd task IDs included in this sprint",
+      cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })) }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const workDir = ctx.cwd;
+      const workDir = (params.cwd as string) || ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
       const project = loadProjectConfig(workDir);
       const meta = extractProjectMeta(project);
@@ -473,12 +475,13 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     label: "agile_delegate_task",
     description: "Delegate a single task to a worker subagent (implements on feature branch), then a reviewer subagent (reviews diff). Returns review verdict. Task title and description are read from bd automatically — just pass bd_id.",
     parameters: Type.Object({
-      bd_id: Type.String({ description: "bd task ID (e.g. agile-test-9do)" }),
+      bd_id: Type.String({ description: "bd task ID (e.g. agile-test-9do)",
+      cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })) }),
       title: Type.Optional(Type.String({ description: "Override task title (normally read from bd)" })),
       description: Type.Optional(Type.String({ description: "Override task description (normally read from bd)" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const workDir = ctx.cwd;
+      const workDir = (params.cwd as string) || ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
       const project = loadProjectConfig(workDir);
       const meta = extractProjectMeta(project);
@@ -693,10 +696,11 @@ ${workerSummary.slice(0, 1000)}`;
     label: "agile_merge_task",
     description: "Merge an approved task's feature branch to main (squash merge). Run main checks (lint + test). Call only after agile_delegate_task returns 'approved'.",
     parameters: Type.Object({
-      bd_id: Type.String({ description: "bd task ID to merge" }),
+      bd_id: Type.String({ description: "bd task ID to merge",
+      cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })) }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const workDir = ctx.cwd;
+      const workDir = (params.cwd as string) || ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
       const bdId = params.bd_id as string;
       const branch = `feat/${bdId}`;
@@ -756,7 +760,7 @@ ${workerSummary.slice(0, 1000)}`;
     name: "agile_retrospective",
     label: "agile_retrospective",
     description: "Complete current sprint: compute velocity, save sprint summary to knowledge, build stop-check message. Agent reads velocity and decides whether to stop or continue.",
-    parameters: Type.Object({}),
+    parameters: Type.Object({cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" }))}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const workDir = ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
@@ -817,7 +821,8 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
     label: "agile_knowledge",
     description: "Append a knowledge entry (lesson, dead_end, pattern) or read all entries. Used for cross-sprint memory.",
     parameters: Type.Object({
-      action: Type.Union([Type.Literal("append"), Type.Literal("read")], { description: "append or read" }),
+      action: Type.Union([Type.Literal("append"), Type.Literal("read")], { description: "append or read",
+      cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })) }),
       type: Type.Optional(Type.Union([
         Type.Literal("lesson"), Type.Literal("dead_end"),
         Type.Literal("pattern"), Type.Literal("task_done"),
@@ -826,7 +831,7 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
       do_not_retry: Type.Optional(Type.String({ description: "For dead_end: what not to retry" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const workDir = ctx.cwd;
+      const workDir = (params.cwd as string) || ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
       const action = params.action as string;
 
