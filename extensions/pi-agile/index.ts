@@ -478,7 +478,7 @@ async function executeBatchTasks(
   workDir: string,
   bdIds: string[],
   runtime: AgileRuntime,
-  onUpdate: (text: string) => void,
+  onUpdate: (update: { type: string; content?: string }) => void,
 ): Promise<{ content: { type: "text"; text: string }[] }> {
   const project = loadProjectConfig(workDir);
   const meta = extractProjectMeta(project);
@@ -486,7 +486,7 @@ async function executeBatchTasks(
   const patterns = runtime.knowledge.formatPatterns();
   const deadEnds = runtime.knowledge.formatDeadEnds();
 
-  onUpdate("Reading task details from bd...");
+  onUpdate({type: "update", content: "Reading task details from bd..."});
 
   // Read all task details from bd
   const tasks: { bdId: string; meta: { title: string; description: string; acceptanceCriteria?: string } }[] = [];
@@ -503,13 +503,21 @@ async function executeBatchTasks(
     });
   }
 
-  onUpdate(`Delegating ${tasks.length} tasks in parallel...`);
+  onUpdate({type: "update", content: `Delegating ${tasks.length} tasks in parallel...`});
 
-  const { results } = await delegateBatchParallel(
+  let results: Awaited<ReturnType<typeof delegateBatchParallel>>["results"] = [];
+  try {
+    const batchResult = await delegateBatchParallel(
     pi, rpc_, workDir, tasks, constraints, deadEnds, patterns,
     meta.reviewDepth as "deep" | "standard",
-    (status: string) => onUpdate(status),
+    (status: string) => onUpdate({type: "update", content: status}),
   );
+
+    results = batchResult.results;
+  } catch (e: unknown) {
+    const errMsg = e instanceof Error ? e.message : String(e);
+    return { content: [{ type: "text" as const, text: `\u274c Batch delegation failed: ${errMsg}` }] };
+  }
 
   // Update sprint state
   const sprint = runtime.store.getCurrent(workDir);
