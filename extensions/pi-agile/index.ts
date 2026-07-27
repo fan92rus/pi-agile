@@ -486,7 +486,7 @@ async function executeBatchTasks(
   const patterns = runtime.knowledge.formatPatterns();
   const deadEnds = runtime.knowledge.formatDeadEnds();
 
-  onUpdate({type: "update", content: "Reading task details from bd..."});
+  //
 
   // Read all task details from bd
   const tasks: { bdId: string; meta: { title: string; description: string; acceptanceCriteria?: string } }[] = [];
@@ -503,14 +503,14 @@ async function executeBatchTasks(
     });
   }
 
-  onUpdate({type: "update", content: `Delegating ${tasks.length} tasks in parallel...`});
+  //
 
   let results: Awaited<ReturnType<typeof delegateBatchParallel>>["results"] = [];
   try {
     const batchResult = await delegateBatchParallel(
     pi, rpc_, workDir, tasks, constraints, deadEnds, patterns,
     meta.reviewDepth as "deep" | "standard",
-    (status: string) => onUpdate({type: "update", content: status}),
+    () => {},
   );
 
     results = batchResult.results;
