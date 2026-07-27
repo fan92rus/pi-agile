@@ -1800,7 +1800,16 @@ do_not_do:
         }
         checksMsg += `\nThen run \`agile_discover\` to validate.`;
 
-        ctx.ui.notify(lines.join("\n") + checksMsg + "\n\n✅ Setup complete! Configs created in " + agileDir + "/", "info");
+        ctx.ui.notify(lines.join("\n") + checksMsg + "\n\n\u2705 Setup complete! Configs created in " + agileDir + "/", "info");
+
+        // Trigger agent to edit scripts and start discovery
+        const setupAgentMsg = `Project configured in .agile/. Next steps:
+1. Read and edit .agile/checks/*.sh scripts — fix commands and paths for this project
+2. Install any missing tools
+3. Run agile_discover to validate
+4. Create tasks in bd from discovery results
+5. Call agile_start_sprint to begin`;
+        await pi.sendUserMessage(setupAgentMsg, { deliverAs: "followUp" });
         return;
       }
 
@@ -1829,6 +1838,11 @@ do_not_do:
         msg += `\nRun \`agile_discover\` after editing to validate.`;
 
         ctx.ui.notify(msg, "info");
+
+        // Trigger agent to edit and validate the scripts
+        const agentMsg = `Check scripts created in .agile/checks/: ${checksResult.created.join(", ")}.
+Read each script, fix the commands and paths for this project, install any missing tools, then run agile_discover to validate they produce real output.`;
+        await pi.sendUserMessage(agentMsg, { deliverAs: "followUp" });
         return;
       }
 
