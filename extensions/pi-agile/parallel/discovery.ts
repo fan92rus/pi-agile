@@ -95,8 +95,49 @@ async function runComplexity(workDir: string, _scope: string[]): Promise<string>
 }
 
 async function scanTODOs(workDir: string, scope: string[]): Promise<string> {
-  const scopeStr = scope.map((s) => `--include="${s}"`).join(" ");
-  return tryExecSync(`grep -rn "TODO\\|FIXME\\|HACK\\|XXX" ${scopeStr} --include="*.ts" --include="*.js" --include="*.go" 2>&1 || echo "(no TODOs found)"`, workDir);
+  // Cross-platform TODO scanning using Node.js (no grep dependency)
+  const extensions = [".ts", ".js", ".jsx", ".tsx", ".go", ".py", ".rs", ".java", ".rb", ".php", ".c", ".cpp", ".h"];
+  const patterns = ["TODO", "FIXME", "HACK", "XXX"];
+  const results: string[] = [];
+
+  function scanDir(dir: string) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      // Skip node_modules, .git, dist, build
+      if (["node_modules", ".git", "dist", "build", ".next", "target", "__pycache__"].includes(entry.name)) continue;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        scanDir(fullPath);
+      } else if (entry.isFile()) {
+        const ext = path.extname(entry.name).toLowerCase();
+        if (!extensions.includes(ext)) continue;
+        // Check if file is in scope
+        const relPath = path.relative(workDir, fullPath).replace(/\\/g, "/");
+        const inScope = scope.length === 0 || scope.some((s) => {
+          const glob = s.replace(/\*\*/g, "").replace(/\*/g, "");
+          return relPath.startsWith(glob.replace(/\/$/, ""));
+        });
+        if (!inScope) continue;
+        try {
+          const content = fs.readFileSync(fullPath, "utf-8");
+          const lines = content.split("\n");
+          for (let i = 0; i < lines.length; i++) {
+            if (patterns.some((p) => lines[i].includes(p))) {
+              results.push(`${relPath}:${i + 1}:${lines[i].trim()}`);
+            }
+          }
+        } catch { /* skip unreadable */ }
+      }
+    }
+  }
+
+  scanDir(workDir);
+  return results.length > 0 ? results.join("\n") : "(no TODOs found)";
 }
 
 async function runSecurityScan(workDir: string, scope: string[]): Promise<string> {
