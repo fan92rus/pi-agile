@@ -135,6 +135,79 @@ export function parseReviewVerdict(responseText: string): ReviewVerdictResult {
   }
 }
 
+/** Build task text for a chain agent (scout, researcher, planner, etc.) */
+export function buildChainAgentTask(
+  agent: string,
+  taskTitle: string,
+  taskDescription: string,
+  acceptanceCriteria: string | undefined,
+  constraints: string,
+  chainContext: { agent: string; output: string }[],
+): string {
+  const priorContext = chainContext.length > 0
+    ? "\n## Previous Chain Steps Output\n" + chainContext.map(c =>
+        `### ${c.agent}\n${c.output}\n`
+      ).join("\n---\n")
+    : "";
+
+  const prompts: Record<string, string> = {
+    scout: `You are a codebase scout. Your task is to EXPLORE the codebase and understand the relevant code for this task.
+
+## Instructions
+1. Find the key files and functions related to the task
+2. Map the dependencies and data flow
+3. Identify existing patterns, conventions, and risks
+4. Do NOT write code — only explore and report
+5. Be specific: file paths, function names, line numbers
+
+Return a structured report with sections:
+- Files to modify (with specific locations)
+- Key functions/classes to understand
+- Dependencies and data flow
+- Potential risks and pitfalls
+- Recommended approach (high-level)`,
+
+    researcher: `You are a technical researcher. Your task is to research best practices, APIs, and patterns relevant to this task.
+
+## Instructions
+1. Search for relevant documentation, APIs, and patterns
+2. If this is a new technology or library, find its documentation
+3. Recommend concrete approaches based on research
+4. Do NOT write code — only research and recommend
+
+Return a structured report with sections:
+- Research findings
+- Recommended approach
+- Relevant documentation links or references`,
+
+    planner: `You are a technical planner. Your task is to decompose this task into concrete implementation steps.
+
+## Instructions
+1. Break down the task into sequential sub-steps
+2. For each step, specify: files, approach, edge cases
+3. Estimate complexity: simple | medium | hard
+4. Do NOT write code — only plan
+
+Return a structured plan with sections:
+- Step-by-step breakdown
+- Files to modify per step
+- Edge cases and testing approach`,
+  };
+
+  return `# Chain Agent: ${agent}
+## Task: ${taskTitle}
+## Description
+${taskDescription}
+## Acceptance Criteria
+${acceptanceCriteria ?? "Change resolves the issue described above."}
+## Project Constraints (MUST follow)
+${constraints || "(none specified)"}${priorContext}
+
+${prompts[agent] ?? `You are a ${agent} agent supporting this task. Explore the codebase and provide relevant context for the next agent.`}
+
+Return your findings as structured text. Be specific: file paths, function names, concrete recommendations.`;
+}
+
 /**
  * Build the worker task prompt.
  * Constraints and dead-ends injected as text.
@@ -146,7 +219,14 @@ export function buildWorkerTask(
   constraints: string,
   deadEnds: string,
   feedback?: string,
+  chainContext?: { agent: string; output: string }[],
 ): string {
+  const ctx = chainContext && chainContext.length > 0
+    ? "\n## Prior Analysis (from chain agents)\n" + chainContext.map(c =>
+        `### ${c.agent} Output\n${c.output}\n`
+      ).join("\n---\n") + "\n"
+    : "";
+
   return `# Task: ${taskTitle}
 
 ## Description
@@ -160,8 +240,7 @@ ${constraints || "(none specified)"}
 
 ## Known Dead-Ends (do NOT repeat these approaches)
 ${deadEnds || "(none recorded yet)"}
-
-${feedback ? "## Rework Feedback (from previous review)\n" + feedback + "\n" : ""}
+${ctx}${feedback ? "## Rework Feedback (from previous review)\n" + feedback + "\n" : ""}
 ## Instructions
 1. Implement ONLY the change needed to satisfy the acceptance criteria.
 2. Follow existing code patterns and conventions.

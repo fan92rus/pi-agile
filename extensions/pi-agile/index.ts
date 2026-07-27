@@ -23,7 +23,7 @@ import * as path from "node:path";
 import { KnowledgeBase } from "./parallel/knowledge.ts";
 import { SprintStore, type SprintState } from "./parallel/sprint.ts";
 import { runDiscovery, formatDiscoveryResult } from "./parallel/discovery.ts";
-import { buildReviewerTask, buildWorkerTask, parseReviewVerdict } from "./parallel/review.ts";
+import { buildChainAgentTask, buildReviewerTask, buildWorkerTask, parseReviewVerdict } from "./parallel/review.ts";
 import { RpcClient, type SpawnedWorker } from "./parallel/rpc.ts";
 import {
   createObserverState,
@@ -90,6 +90,12 @@ const DEFAULT_AGENT_MODELS: Record<string, string> = {
   worker: "opencode-go/deepseek-v4-flash",
   reviewer: "opencode-go/deepseek-v4-flash",
 };
+
+/** Read agent_chains from .agile/config.json, default {"default": ["worker","reviewer"]}. */
+function getChainConfig(workDir: string): Record<string, string[]> {
+  const config = loadAgileConfig(workDir);
+  return (config.agent_chains as Record<string, string[]>) ?? { "default": ["worker", "reviewer"] };
+}
 
 /** Read spawn_timeout from .agile/config.json, default 600s (600000ms). */
 function getSpawnTimeout(workDir: string): number {
@@ -362,6 +368,7 @@ async function delegateTaskInWorktree(
   reviewDepth: "deep" | "standard",
   spawnTimeout: number,
   onProgress?: (status: string) => void,
+  chain: string[] = ["worker", "reviewer"],
 ): Promise<{
   bdId: string;
   verdict: ReturnType<typeof parseReviewVerdict>;
@@ -369,17 +376,48 @@ async function delegateTaskInWorktree(
   branch: string;
   workerSummary?: string;
   reviews?: { round: number; action_items: string[]; lessons: string[] }[];
+  chainOutputs?: { agent: string; output: string }[];
   error?: string;
 }> {
   const branch = `feat/${bdId}`;
   const MAX_REWORK_ROUNDS = 3;
   const reviews: { round: number; action_items: string[]; lessons: string[] }[] = [];
+  const chainOutputs: { agent: string; output: string }[] = [];
   let currentDiff = "";
   let currentWorkerSummary = "";
   let overallVerdict: ReturnType<typeof parseReviewVerdict> = { status: "rework", dimensions: {}, action_items: [], lessons: [] };
 
   // 1. Create feature branch (assumes on main)
   await gitCreateBranch(pi, workDir, branch);
+
+  // 2. Run chain agents before worker (scout, researcher, planner, etc.)
+  const preWorker = chain.slice(0, chain.indexOf("worker"));
+  for (const agent of preWorker) {
+    try { pi.notify(`[${bdId}] Chain: ${agent} starting...`, "info"); } catch {}
+    onProgress?.(`${bdId}: chain agent ${agent}...`);
+    const agentOutput = path.join(workDir, ".agile", `${agent}-${bdId}.txt`);
+    const agentTaskText = buildChainAgentTask(agent, meta.title, meta.description, meta.acceptanceCriteria, constraints, chainOutputs);
+    let spawned: SpawnedWorker;
+    try {
+      spawned = await rpc_.spawn({
+        agent: agent,
+        model: getAgentModel(workDir, agent),
+        task: agentTaskText,
+        cwd: workDir,
+        context: "fresh",
+        output: agentOutput,
+        outputMode: "file-only",
+      }, Math.min(spawnTimeout, 120_000));
+    } catch (e: unknown) {
+      chainOutputs.push({ agent, output: `[FAILED] ${e instanceof Error ? e.message : String(e)}` });
+      continue;
+    }
+    const done = await pollWithProgress(pi, workDir, rpc_, spawned.runId, agentOutput, `${agent}-${bdId}`, (s: string) => onProgress?.(`${bdId}: ${s}`), 300);
+    let output = "";
+    try { if (fs.existsSync(agentOutput)) output = fs.readFileSync(agentOutput, "utf8"); } catch {}
+    chainOutputs.push({ agent, output: output || `(${agent} completed)` });
+    try { pi.notify(`[${bdId}] Chain: ${agent} done`, "info"); } catch {}
+  }
 
   for (let round = 1; round <= MAX_REWORK_ROUNDS; round++) {
     try { pi.notify(`[${bdId}] Round ${round}/${MAX_REWORK_ROUNDS}`, "info"); } catch {}
@@ -400,8 +438,8 @@ async function delegateTaskInWorktree(
       onProgress?.(`${bdId}: rework round ${round}...`);
     }
 
-    // 2. Spawn worker
-    const workerTaskText = buildWorkerTask(meta.title, meta.description, meta.acceptanceCriteria, constraints, deadEnds, feedbackText);
+    // 3. Spawn worker (with chain context)
+    const workerTaskText = buildWorkerTask(meta.title, meta.description, meta.acceptanceCriteria, constraints, deadEnds, feedbackText, chainOutputs.length > 0 ? chainOutputs : undefined);
     onProgress?.(`${bdId} (r${round}): spawning worker...`);
     try { pi.notify(`[${bdId}] R${round}: worker starting...`, "info"); } catch {}
 
@@ -476,7 +514,7 @@ async function delegateTaskInWorktree(
     }
   }
 
-  return { bdId, verdict: overallVerdict, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews };
+  return { bdId, verdict: overallVerdict, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, chainOutputs };
 }
 
 /**
@@ -493,6 +531,7 @@ async function delegateBatchParallel(
   deadEnds: string,
   patterns: string,
   reviewDepth: "deep" | "standard",
+  chain: string[],
   onProgress?: (status: string) => void,
 ): Promise<{
   results: Awaited<ReturnType<typeof delegateTaskInWorktree>>[];
@@ -524,7 +563,7 @@ async function delegateBatchParallel(
   onProgress?.("Running all tasks in parallel...");
   const spawnTimeout = getSpawnTimeout(mainWorkDir);
   const taskPromises = tasks.map((t, i) =>
-    delegateTaskInWorktree(pi, rpc_, worktrees[i], t.bdId, t.meta, constraints, deadEnds, patterns, reviewDepth, spawnTimeout, onProgress)
+    delegateTaskInWorktree(pi, rpc_, worktrees[i], t.bdId, t.meta, constraints, deadEnds, patterns, reviewDepth, spawnTimeout, onProgress, chain)
   );
   const results = await Promise.all(taskPromises);
 
@@ -573,6 +612,7 @@ async function executeBatchTasks(
   bdIds: string[],
   runtime: AgileRuntime,
   onUpdate: (update: { type: string; content?: string }) => void,
+  chain?: string[],
 ): Promise<{ content: { type: "text"; text: string }[] }> {
   const project = loadProjectConfig(workDir);
   const meta = extractProjectMeta(project);
@@ -599,11 +639,14 @@ async function executeBatchTasks(
 
   //
 
+  const chains = getChainConfig(workDir);
+  const taskChain = (chain as string[] | undefined) ?? chains.default ?? ["worker", "reviewer"];
   let results: Awaited<ReturnType<typeof delegateBatchParallel>>["results"] = [];
   try {
     const batchResult = await delegateBatchParallel(
     pi, rpc_, workDir, tasks, constraints, deadEnds, patterns,
     meta.reviewDepth as "deep" | "standard",
+    taskChain,
     () => {},
   );
 
@@ -908,8 +951,12 @@ bd priority <id> high    # set priority: high, medium, low
 ### Phase 4: Sprint Execution
 For each task in the sprint:
 1. Call \`agile_delegate_task\` with just the bd_id — the tool reads task details from bd
-2. The tool delegates a worker subagent (implements on feature branch) then a reviewer subagent
-3. Read the review verdict:
+2. The tool runs the agent chain (default: worker → reviewer). Customize via \`chain\` param:
+   - \`chain: ["scout", "worker", "reviewer"]\` — scout explores codebase first
+   - \`chain: ["researcher", "scout", "worker", "reviewer"]\` — research + scout + implement
+   - Set default chains in \`.agile/config.json\` under \`agent_chains\`
+3. The worker gets context from prior chain steps (scout report, research, plan)
+4. Read the review verdict:
    - **approved** → call \`agile_merge_task\` to merge to main
    - **rework** → read action_items, call \`agile_delegate_task\` again for rework
    - **blocked** → task is fundamentally flawed, move to next task
@@ -941,10 +988,11 @@ Both worker and reviewer run with fresh context (no parent session inheritance).
 
 1. **ONE task per agile_delegate_task call** — don't batch
 2. **Worker needs context** — write detailed descriptions in bd, workers only see title + description
-3. **Constraints are TEXT** — read them above, enforce by reasoning, reject violations
-4. **Git workflow** — feature branch per task (\`feat/<bd-id>\`), conventional commits only
-5. **Merge only after approved review** — never merge rework or blocked
-6. **Record dead-ends** — if a task is blocked, record WHY via agile_knowledge so future sprints avoid it
+3. **Use chain agents for complex tasks**: scout (explore codebase), researcher (look up APIs), planner (break down)
+4. **Constraints are TEXT** — read them above, enforce by reasoning, reject violations
+5. **Git workflow** — feature branch per task (\`feat/<bd-id>\`), conventional commits only
+6. **Merge only after approved review** — never merge rework or blocked
+7. **Record dead-ends** — if a task is blocked, record WHY via agile_knowledge so future sprints avoid it
 
 You make ALL decisions. Extension only runs tools and persists data.`;
 
@@ -1084,6 +1132,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })),
       title: Type.Optional(Type.String({ description: "Override task title (normally read from bd). Single mode only." })),
       description: Type.Optional(Type.String({ description: "Override task description (normally read from bd). Single mode only." })),
+      chain: Type.Optional(Type.Array(Type.String(), { description: "Agent chain: e.g. ['scout','worker','reviewer'] or ['worker','reviewer'] (default). Overrides agent_chains.default from .agile/config.json." })),
     }),
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       const workDir = (params.cwd as string) || ctx.cwd;
@@ -1100,7 +1149,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         if (singleBdId) {
           return { content: [{ type: "text" as const, text: "❌ Cannot use both bd_id and bd_ids. Use one or the other." }] };
         }
-        return await executeBatchTasks(pi, rpc, workDir, bdIds, runtime, onUpdate);
+        return await executeBatchTasks(pi, rpc, workDir, bdIds, runtime, onUpdate, params.chain as string[] | undefined);
       }
 
       if (!singleBdId) {
@@ -1139,9 +1188,35 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       runtime.knowledge.load(workDir);
       const constraints = loadConstraintsText(workDir);
       const deadEnds = runtime.knowledge.formatDeadEnds();
+      const chains = getChainConfig(workDir);
+      const taskChain = (params.chain as string[] | undefined) ?? chains.default ?? ["worker", "reviewer"];
+
+      // 2b. Run chain agents before worker (scout, researcher, planner, etc.)
+      const chainOutputs: { agent: string; output: string }[] = [];
+      const preWorker = taskChain.slice(0, taskChain.indexOf("worker"));
+      for (const agent of preWorker) {
+        try { pi.notify(`[${bdId}] Chain: ${agent} starting...`, "info"); } catch {}
+        const agentOutput = path.join(workDir, ".agile", `${agent}-${bdId}.txt`);
+        const agentTaskText = buildChainAgentTask(agent, title, description, acceptanceCriteria, constraints, chainOutputs);
+        try {
+          const spawned = await rpc.spawn({
+            agent, model: getAgentModel(workDir, agent),
+            task: agentTaskText, cwd: workDir, context: "fresh",
+            output: agentOutput, outputMode: "file-only",
+          }, Math.min(getSpawnTimeout(workDir), 120_000));
+          await pollWithProgress(pi, workDir, rpc, spawned.runId, agentOutput, `${agent}-${bdId}`, onUpdate, 300);
+        } catch (e: unknown) {
+          chainOutputs.push({ agent, output: `[FAILED] ${e instanceof Error ? e.message : String(e)}` });
+          continue;
+        }
+        let output = "";
+        try { if (fs.existsSync(agentOutput)) output = fs.readFileSync(agentOutput, "utf8"); } catch {}
+        chainOutputs.push({ agent, output: output || `(${agent} completed)` });
+        try { pi.notify(`[${bdId}] Chain: ${agent} done`, "info"); } catch {}
+      }
 
       // 3. Delegate worker via RPC
-      const workerTaskText = buildWorkerTask(title, description, acceptanceCriteria, constraints, deadEnds);
+      const workerTaskText = buildWorkerTask(title, description, acceptanceCriteria, constraints, deadEnds, undefined, chainOutputs.length > 0 ? chainOutputs : undefined);
       const workerOutput = path.join(workDir, ".agile", `worker-${bdId}.txt`);
 
       let worker: SpawnedWorker;
