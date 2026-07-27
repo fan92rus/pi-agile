@@ -1,0 +1,8 @@
+{
+  "name": "pi-agile",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Autonomous Agile workflow engine for pi — discover, delegate, review, reflect, repeat.",
+  "license": "MIT",
+  "private": true
+}

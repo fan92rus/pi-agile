@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Pi extension build artifacts
+*.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Agile state (per-project, not in this repo)
+.agile/
+.auto/
