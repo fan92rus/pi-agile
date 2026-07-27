@@ -1119,8 +1119,8 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       if (!skipScout) {
         try {
           const meta = extractProjectMeta(project);
-          const kb = new KnowledgeBase(workDir);
-          await kb.load();
+          const kb = new KnowledgeBase();
+          kb.load(workDir);
           const constraintsText = loadConstraintsText(workDir);
           const patternsText = kb.formatPatterns();
           const scoutTask = buildDiscoveryScoutTask(workDir, meta.goal || "", constraintsText, patternsText, scope);
