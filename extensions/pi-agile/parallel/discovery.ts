@@ -230,10 +230,12 @@ echo "METRIC fixme_count=$FIXME"
     }
   }
 
-  // chmod +x (best-effort, fails silently on Windows)
-  try {
-    execSync(`chmod +x "${checksDir}"/*.sh`, { timeout: 3000, encoding: "utf8" });
-  } catch { /* not required on all platforms */ }
+  // chmod +x (Unix only)
+  if (process.platform !== "win32") {
+    try {
+      execSync(`chmod +x "${checksDir}"/*.sh`, { timeout: 3000, encoding: "utf8" });
+    } catch { /* non-critical */ }
+  }
 
   return { created, warnings };
 }
