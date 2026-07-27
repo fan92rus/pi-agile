@@ -950,6 +950,34 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
         return;
       }
 
+      if (command === "model" || command.startsWith("model ")) {
+        const parts = command.split(/\s+/);
+        if (parts.length < 3) {
+          // Show current models
+          const config = loadAgileConfig(workDir);
+          const models = (config.agent_models ?? {}) as Record<string, string>;
+          const lines = ["# Agent Models", ""]
+          lines.push(`  worker:   ${models.worker ?? "opencode-go/deepseek-v4-flash (default)"}`);
+          lines.push(`  reviewer: ${models.reviewer ?? "opencode-go/deepseek-v4-flash (default)"}`);
+          lines.push("");
+          lines.push("Set: /agile model <worker|reviewer> <model-id>");
+          ctx.ui.notify(lines.join("\n"), "info");
+          return;
+        }
+        const role = parts[1];
+        const model = parts[2];
+        if (role !== "worker" && role !== "reviewer") {
+          ctx.ui.notify(`Unknown role: ${role}. Use 'worker' or 'reviewer'.`, "error");
+          return;
+        }
+        const config = loadAgileConfig(workDir);
+        if (!config.agent_models) config.agent_models = {};
+        (config.agent_models as Record<string, string>)[role] = model;
+        saveAgileConfig(workDir, config);
+        ctx.ui.notify(`✅ ${role} model set to: ${model}`, "info");
+        return;
+      }
+
       if (command === "observer") {
         const config = loadAgileConfig(workDir);
         const current = config.observer_enabled !== false;
