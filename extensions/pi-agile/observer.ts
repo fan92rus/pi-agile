@@ -90,7 +90,11 @@ export function runSprintObserver(
   const emptySteer = checkDiscoveryEmpty(state);
   if (emptySteer) steers.push(emptySteer);
 
-  // 5. Sprint completed — recommend continue or check criteria
+  // 5. All tasks in terminal state (done/blocked) — need new tasks
+  const exhaustedSteer = checkAllTasksExhausted(state);
+  if (exhaustedSteer) steers.push(exhaustedSteer);
+
+  // 6. Sprint completed — recommend continue or check criteria
   if (state.status === "done") {
     const completedSteer = checkSprintCompleted(workDir);
     if (completedSteer) steers.push(completedSteer);
@@ -141,6 +145,27 @@ function checkSprintCompleted(workDir?: string): ObserverSteer | null {
       message: "Sprint completed. Analyze results and decide: continue or stop.",
     };
   }
+}
+
+/**
+ * All tasks in the sprint are in terminal states (done/blocked),
+ * no pending work — recommend running discovery or ending sprint.
+ */
+function checkAllTasksExhausted(state: SprintState): ObserverSteer | null {
+  if (state.tasks.length === 0) return null;
+  if (state.status === "done") return null; // already handled by checkSprintCompleted
+
+  const pending = state.tasks.filter((t) => t.status !== "done" && t.status !== "blocked");
+  if (pending.length > 0) return null;
+
+  const totalBlocked = state.tasks.filter((t) => t.status === "blocked").length;
+  const totalDone = state.tasks.filter((t) => t.status === "done").length;
+
+  return {
+    type: "all_tasks_exhausted",
+    severity: "info",
+    message: `All ${state.tasks.length} tasks are exhausted (${totalDone} done, ${totalBlocked} blocked). Run discovery to find new tasks, or end the sprint.`,
+  };
 }
 
 function checkSprintStagnation(
