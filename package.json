@@ -2,7 +2,46 @@
   "name": "pi-agile",
   "version": "0.1.0",
   "type": "module",
-  "description": "Autonomous Agile workflow engine for pi — discover, delegate, review, reflect, repeat.",
+  "description": "Autonomous Agile/Kanban engine for pi — agent discovers tasks, delegates workers, reviews, and iterates in sprints",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "agile",
+    "kanban",
+    "autonomous",
+    "coding-agent"
+  ],
   "license": "MIT",
-  "private": true
+  "author": "fan92rus",
+  "homepage": "https://github.com/fan92rus/pi-agile#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fan92rus/pi-agile.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fan92rus/pi-agile/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@10.28.2",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "files": [
+    "extensions",
+    "skills",
+    "README.md",
+    "CHANGELOG.md",
+    "package.json"
+  ],
+  "scripts": {
+    "test": "echo \"Tests: TBD\""
+  }
 }
