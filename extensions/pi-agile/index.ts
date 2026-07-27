@@ -17,6 +17,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { KnowledgeBase } from "./parallel/knowledge.ts";
@@ -1005,80 +1006,125 @@ ${buildStopCheckMessage(workDir, sprint.id)}`;
         const parts = command.split(/\s+/);
         const config = loadAgileConfig(workDir);
 
-        async function showModelStatus() {
+        async function getAvailableModels(): Promise<Record<string, string[]>> {
+          const mp = path.join(os.homedir(), ".pi", "agent", "models-store.json");
+          if (!fs.existsSync(mp)) return {};
+          try {
+            const raw = JSON.parse(fs.readFileSync(mp, "utf8")) as Record<string, unknown>;
+            const byProvider: Record<string, string[]> = {};
+            for (const [provider, info] of Object.entries(raw)) {
+              if (info && typeof info === "object" && Array.isArray((info as Record<string, unknown>).models)) {
+                const arr = (info as Record<string, unknown>).models as Array<Record<string, unknown>>;
+                byProvider[provider] = arr.map((m) => `${provider}/${m.id}`).sort();
+              }
+            }
+            return byProvider;
+          } catch { return {}; }
+        }
+
+        async function showModelStatus(availableCount: number, providerCount: number) {
           const models = (config.agent_models ?? {}) as Record<string, string>;
           const lines = ["# Agent Models", ""];
           lines.push(`  worker:   ${models.worker ?? "opencode-go/deepseek-v4-flash (default)"}`);
           lines.push(`  reviewer: ${models.reviewer ?? "opencode-go/deepseek-v4-flash (default)"}`);
           lines.push("");
-          lines.push("Set: /agile model <worker|reviewer> <model-id>");
+          lines.push(`Available: ${availableCount} models across ${providerCount} providers`);
           ctx.ui.notify(lines.join("\n"), "info");
         }
 
-        // Interactive mode: no args / just "model"
+        // ── Interactive: /agile model (no args) ──
         if (parts.length < 2) {
-          // Step 1: select role
-          const roleChoice = await ctx.ui.select("Select agent role to configure:", [
+          const allModels = await getAvailableModels();
+          const providerCount = Object.keys(allModels).length;
+          const totalCount = Object.values(allModels).reduce((s, m) => s + m.length, 0);
+
+          // Step 1: pick role
+          const roleChoice = await ctx.ui.select("Select agent role:", [
             "worker — implementation subagent",
             "reviewer — code review subagent",
-            "show current",
+            "show current models",
           ]);
-          if (!roleChoice || roleChoice === "show current") {
-            await showModelStatus();
-            return;
-          }
+          if (!roleChoice) return;
+          if (roleChoice === "show current models") { await showModelStatus(totalCount, providerCount); return; }
           const role = roleChoice.startsWith("worker") ? "worker" : "reviewer";
           const current = ((config.agent_models ?? {}) as Record<string, string>)[role];
 
-          // Step 2: select model from presets or type custom
-          const MODEL_PRESETS = [
-            "opencode-go/deepseek-v4-flash — default (flash, cheap)",
-            "opencode-go/deepseek-v4-flash:low — flash with low thinking",
-            "opencode-go/deepseek-v4-flash:xhigh — flash with max thinking",
-            "zai-glm/glm-5.2 — GLM 5 (powerful, expensive)",
-            "zai-glm/glm-5.2:high — GLM 5 with high thinking",
-            "type custom model...",
-          ];
+          // Step 2: pick method
+          const method = await ctx.ui.select(
+            `Set model for ${role}${current ? ` (current: ${current})` : ""}:`,
+            ["presets — common coding models", "browse by provider", "type model ID"],
+          );
+          if (!method) return;
 
           let model: string | undefined;
-          const modelChoice = await ctx.ui.select(
-            `Model for ${role}${current ? ` (current: ${current})` : ""}:`,
-            MODEL_PRESETS,
-          );
-          if (!modelChoice) return;
 
-          if (modelChoice.startsWith("type custom")) {
-            model = await ctx.ui.input(
-              `Enter model for ${role}\nFormat: provider/model or provider/model:thinking`,
-              current ?? "",
-            );
-            if (!model || !model.trim()) return;
-          } else {
-            model = modelChoice.split(" —")[0].trim();
+          if (method.startsWith("type")) {
+            model = await ctx.ui.input("Enter model ID (format: provider/model:thinking?)", current ?? "");
+            if (model) model = model.trim();
+          } else if (method.startsWith("presets")) {
+            // Show focused coding-model presets (dynamically generated)
+            const codingPrefixes = ["opencode-go/", "opencode/", "deepseek/", "zai-coding-cn/", "openrouter/z-ai/", "openrouter/deepseek/", "openrouter/qwen/"];
+            const presets: string[] = [];
+            for (const [prov, models] of Object.entries(allModels)) {
+              if (codingPrefixes.some((p) => prov.startsWith(p) || prov.includes(p.replace("/", "")))) {
+                for (const m of models) {
+                  if (!m.includes("free") && !m.includes(":free") && !m.includes("nano") && !m.includes("mini")) {
+                    presets.push(m);
+                  }
+                }
+              }
+            }
+            const options = [...new Set(presets)].sort().slice(0, 60).map((m) => m === current ? `${m} ✓` : m);
+            options.push("——— browse all models ———");
+            const pick = await ctx.ui.select("Select model:", options);
+            if (!pick) return;
+            if (pick.startsWith("———")) {
+              // Fall through to browse logic below
+            } else {
+              model = pick.replace(" ✓", "");
+            }
           }
 
+          if (!model) {
+            // Browse by provider
+            const provs = Object.keys(allModels).sort();
+            const provPick = await ctx.ui.select("Select provider:", provs.slice(0, 50));
+            if (!provPick) return;
+            const providerModels = allModels[provPick];
+            if (!providerModels?.length) { ctx.ui.notify("No models found", "error"); return; }
+            const modelPick = await ctx.ui.select(`Model from ${provPick}:`, providerModels.slice(0, 80).map((m) => m === current ? `${m} ✓` : m).concat(["back"]));
+            if (!modelPick || modelPick === "back") return;
+            model = modelPick.replace(" ✓", "");
+          }
+
+          if (!model || !model.trim()) return;
           if (!config.agent_models) config.agent_models = {};
-          (config.agent_models as Record<string, string>)[role] = model;
+          (config.agent_models as Record<string, string>)[role] = model.trim();
           saveAgileConfig(workDir, config);
-          ctx.ui.notify(`✅ ${role} model set to: ${model}`, "info");
+          ctx.ui.notify(`✅ ${role} model set to: ${model.trim()}`, "info");
           return;
         }
 
-        // Non-interactive: /agile model <role> <model>
-        if (parts.length < 3) {
-          await showModelStatus();
+        // ── Quick non-interactive: /agile model show /agile model <role> <model> ──
+        if (parts.length === 2 && parts[1] === "show") {
+          const allModels = await getAvailableModels();
+          const totalCount = Object.values(allModels).reduce((s, m) => s + m.length, 0);
+          await showModelStatus(totalCount, Object.keys(allModels).length);
           return;
         }
-        const role = parts[1];
-        const model = parts[2];
-        if (role !== "worker" && role !== "reviewer") {
-          ctx.ui.notify(`Unknown role: ${role}. Use 'worker' or 'reviewer'.`, "error");
+        if (parts.length < 3) {
+          const allModels = await getAvailableModels();
+          await showModelStatus(Object.values(allModels).reduce((s, m) => s + m.length, 0), Object.keys(allModels).length);
+          return;
+        }
+        if (!["worker", "reviewer"].includes(parts[1])) {
+          ctx.ui.notify(`Unknown role: ${parts[1]}. Use 'worker' or 'reviewer'.`, "error");
           return;
         }
         if (!config.agent_models) config.agent_models = {};
-        (config.agent_models as Record<string, string>)[role] = model;
+        (config.agent_models as Record<string, string>)[parts[1]] = parts[2];
         saveAgileConfig(workDir, config);
-        ctx.ui.notify(`✅ ${role} model set to: ${model}`, "info");
+        ctx.ui.notify(`✅ ${parts[1]} model set to: ${parts[2]}`, "info");
         return;
       }
 
