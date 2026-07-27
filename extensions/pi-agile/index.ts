@@ -284,6 +284,60 @@ function parseBdShow(output: string): { title?: string; description?: string; ac
   return result;
 }
 
+/**
+ * Poll for worker/reviewer completion with progress updates.
+ * Checks output file existence + rpc.status() in parallel.
+ * Sends progress via onUpdate every ~15s.
+ */
+async function pollWithProgress(
+  pi: ExtensionAPI,
+  workDir: string,
+  rpc: RpcClient,
+  runId: string,
+  outputFile: string,
+  role: string,
+  onUpdate: (msg: { content: { type: string; text: string }[] }) => void,
+  maxWaitSeconds = 600,
+): Promise<boolean> {
+  const pollInterval = 5000;
+  let attempts = 0;
+  const maxAttempts = Math.ceil(maxWaitSeconds / (pollInterval / 1000));
+
+  while (attempts < maxAttempts) {
+    await new Promise((r) => setTimeout(r, pollInterval));
+    attempts++;
+
+    // Check 1: output file exists (most reliable signal)
+    if (fs.existsSync(outputFile)) {
+      onUpdate?.({ content: [{ type: "text", text: `${role} completed (output file found)` }] });
+      return true;
+    }
+
+    // Check 2: rpc.status()
+    try {
+      const status = (await rpc.status(runId, 3000)) as { state?: string } | null;
+      if (status?.state === "completed" || status?.state === "stopped" || status?.state === "failed") {
+        onUpdate?.({ content: [{ type: "text", text: `${role} finished (state: ${status.state})` }] });
+        // Give output file a moment to flush
+        for (let w = 0; w < 12; w++) {
+          await new Promise((r) => setTimeout(r, 1000));
+          if (fs.existsSync(outputFile)) break;
+        }
+        return true;
+      }
+    } catch {
+      // rpc.status failed — ignore, loop continues with file check
+    }
+
+    // Progress update every ~15s
+    if (attempts % 3 === 0) {
+      onUpdate?.({ content: [{ type: "text", text: `⏳ Waiting for ${role}... (${Math.round(attempts * pollInterval / 60000)}m elapsed)` }] });
+    }
+  }
+
+  return false;
+}
+
 // Extension runtime state
 // ---------------------------------------------------------------------------
 
@@ -559,7 +613,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       title: Type.Optional(Type.String({ description: "Override task title (normally read from bd)" })),
       description: Type.Optional(Type.String({ description: "Override task description (normally read from bd)" })),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       const workDir = (params.cwd as string) || ctx.cwd;
       const runtime = getRuntime(ctx, runtimeStore);
       const project = loadProjectConfig(workDir);
@@ -616,17 +670,12 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         };
       }
 
-      // Poll for worker completion via RPC status
-      let workerDone = false;
-      let attempts = 0;
-      const maxAttempts = 120; // 10 min at 5s intervals
-      while (!workerDone && attempts < maxAttempts) {
-        await new Promise((r) => setTimeout(r, 5000));
-        const status = await rpc.status(worker.runId) as { state?: string } | null;
-        if (status?.state === "completed" || status?.state === "stopped" || status?.state === "failed") {
-          workerDone = true;
-        }
-        attempts++;
+      // Poll for worker completion with progress updates
+      const workerDone = await pollWithProgress(pi, workDir, rpc, worker.runId, workerOutput, "worker", onUpdate);
+      if (!workerDone) {
+        return {
+          content: [{ type: "text" as const, text: `❌ Worker task ${bdId} did not complete within timeout. Check worker output: ${workerOutput}` }],
+        };
       }
 
       // Read worker output
@@ -671,16 +720,12 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         };
       }
 
-      // Poll for reviewer completion
-      let reviewerDone = false;
-      attempts = 0;
-      while (!reviewerDone && attempts < maxAttempts) {
-        await new Promise((r) => setTimeout(r, 5000));
-        const status = await rpc.status(reviewer.runId) as { state?: string } | null;
-        if (status?.state === "completed" || status?.state === "stopped" || status?.state === "failed") {
-          reviewerDone = true;
-        }
-        attempts++;
+      // Poll for reviewer completion with progress updates
+      const reviewerDone = await pollWithProgress(pi, workDir, rpc, reviewer.runId, reviewerOutput, "reviewer", onUpdate);
+      if (!reviewerDone) {
+        return {
+          content: [{ type: "text" as const, text: `❌ Reviewer for ${bdId} did not complete within timeout. Check output: ${reviewerOutput}. Continuing with whatever was produced.` }],
+        };
       }
 
       // Read reviewer output and parse verdict
