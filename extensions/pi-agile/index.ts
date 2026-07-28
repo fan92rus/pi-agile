@@ -1691,6 +1691,12 @@ ${workerSummary.slice(0, 1000)}`;
         const steers = runSprintObserver(sprint, runtime.observerState, DEFAULT_OBSERVER_CONFIG, workDir);
         if (steers.length > 0) {
           observerBlock = "\n\n## Observer\n" + steers.map(s => `[${s.severity}] ${s.message}`).join("\n");
+          // Send actionable steers as follow-up
+          for (const steer of steers) {
+            try {
+              await pi.sendUserMessage(steer.message, { deliverAs: "followUp" });
+            } catch { /* best effort */ }
+          }
         }
       }
 
@@ -1766,6 +1772,13 @@ ${workerSummary.slice(0, 1000)}`;
 ${observerSteers.map((s: { type: string; message: string; severity: string }) => `[${s.severity}] ${s.message}`).join("\n")}
 `
         : "";
+
+      // Send observer steers as follow-up messages so the agent acts on them
+      for (const steer of observerSteers) {
+        try {
+          await pi.sendUserMessage(steer.message, { deliverAs: "followUp" });
+        } catch { /* best effort */ }
+      }
 
       return {
         content: [{ type: "text" as const, text: retroText + steerText }],
