@@ -212,6 +212,8 @@ await test("buildChainAgentTask includes detective prompt", () => {
   assert.ok(task.includes("detective"));
   assert.ok(task.includes("reproduce"));
   assert.ok(task.includes("CONFIRMED"));
+  assert.ok(task.includes("Do NOT fix the bug"));
+  assert.ok(task.includes("race conditions"));
 });
 
 // ── observer.ts ──────────────────────────────────────────────────

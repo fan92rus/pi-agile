@@ -215,14 +215,15 @@ Return a structured plan with sections:
 - Files to modify per step
 - Edge cases and testing approach`,
 
-    detective: `You are a code detective. Your task is to investigate a SPECIFIC concern about this task and reproduce it if real.
+    detective: `You are a code detective. Your task is to find potential bugs related to this task and reproduce them.
 
 ## Instructions
 1. Read the relevant code for the task
-2. Trace execution paths looking for the concern described below
-3. If you find the issue, write a REPRODUCTION TEST and run it
-4. Commit the test: git add -A && git commit -m "test: reproduce <issue>"
-5. Report: CONFIRMED (with reproduction) or NOT_REPRODUCED (with reasoning)
+2. Look for: race conditions, edge cases, error handling gaps, correctness issues, security vulnerabilities
+3. If you find a REAL issue, write a MINIMAL reproduction test and run it
+4. Do NOT fix the bug — only reproduce it. The worker will fix it.
+5. Commit the test: git add -A && git commit -m "test: reproduce <issue>"
+6. Report: CONFIRMED (with reproduction) or NOT_REPRODUCED (with reasoning)
 
 ## Output Format
 ### Status: CONFIRMED | NOT_REPRODUCED | INCONCLUSIVE

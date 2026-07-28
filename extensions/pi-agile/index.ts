@@ -1204,6 +1204,12 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       const concern = params.concern as string;
       const modelOverride = params.model as string | undefined;
 
+      // Capture original branch BEFORE creating investigate branch
+      let originalBranch = "";
+      try {
+        originalBranch = (await execText(pi, "git", ["rev-parse", "--abbrev-ref", "HEAD"], workDir, 5000)).trim();
+      } catch { /* detached HEAD — will use '-' fallback */ }
+
       // Create investigate branch
       const branchName = "investigate/" + Date.now().toString(36);
       try {
@@ -1213,6 +1219,12 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
           content: [{ type: "text" as const, text: "Failed to create investigate branch. Check for uncommitted changes (git stash)." }],
         };
       }
+
+      // Capture HEAD before detective runs (to detect new commits)
+      let headBefore = "";
+      try {
+        headBefore = (await execText(pi, "git", ["rev-parse", "HEAD"], workDir, 5000)).trim();
+      } catch { /* ignore */ }
 
       // Build detective task
       const constraints = loadConstraintsText(workDir);
@@ -1236,8 +1248,8 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
           outputMode: "file-only",
         }, spawnTimeout);
       } catch (e: unknown) {
-        // Switch back to main branch on failure
-        await execText(pi, "git", ["checkout", "-"], workDir, 5000);
+        // Switch back to original branch on failure
+        await execText(pi, "git", ["checkout", originalBranch || "-"], workDir, 5000);
         return {
           content: [{ type: "text" as const, text: "Detective spawn failed: " + (e instanceof Error ? e.message : String(e)) }],
         };
@@ -1254,18 +1266,25 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         report = fs.readFileSync(detectiveOutput, "utf8").trim();
       }
       if (report.length < 50) {
-        report = "Detective did not produce a report. The investigation may have timed out.\nBranch: " + branchName;
+        report = "Detective did not produce a report. The investigation may have timed out.";
       }
 
-      // Get last commit hash on this branch (detective may have committed)
+      // Check if detective actually committed anything (compare HEAD before/after)
       let commitHash = "";
       try {
-        const commitResult = await execText(pi, "git", ["log", "--oneline", "-1"], workDir, 5000);
-        commitHash = commitResult.trim();
+        const headAfter = (await execText(pi, "git", ["rev-parse", "HEAD"], workDir, 5000)).trim();
+        if (headAfter !== headBefore) {
+          commitHash = (await execText(pi, "git", ["log", "--oneline", "-1"], workDir, 5000)).trim();
+        }
       } catch { /* no commits */ }
 
+      // Switch back to original branch
+      try {
+        await execText(pi, "git", ["checkout", originalBranch || "-"], workDir, 5000);
+      } catch { /* best effort */ }
+
       return {
-        content: [{ type: "text" as const, text: "# Detective Investigation Report\n\n**Branch**: " + branchName + "\n" + (commitHash ? "**Last commit**: " + commitHash + "\n" : "") + "\n" + report }],
+        content: [{ type: "text" as const, text: "# Detective Investigation Report\n\n**Branch**: " + branchName + "\n" + (commitHash ? "**Commit**: " + commitHash + "\n" : "") + "\n" + report }],
         details: { branch: branchName, commit: commitHash },
       };
     },
