@@ -101,12 +101,12 @@ function getChainConfig(workDir: string): Record<string, string[]> {
   return (config.agent_chains as Record<string, string[]>) ?? { "default": ["worker", "reviewer"] };
 }
 
-/** Read spawn_timeout from .agile/config.json, default 600s (600000ms). */
+/** Read spawn_timeout from .agile/config.json, default 1800s (1800000ms). */
 function getSpawnTimeout(workDir: string): number {
   const config = loadAgileConfig(workDir);
   const raw = config.spawn_timeout;
   if (typeof raw === "number" && raw >= 30_000) return raw;
-  return 600_000;
+  return 1_800_000;
 }
 
 /** Write progress to .agile/batch-progress.json during parallel execution. */
@@ -750,7 +750,7 @@ async function pollWithProgress(
   outputFile: string,
   role: string,
   onUpdate: (msg: { content: { type: string; text: string }[] }) => void,
-  maxWaitSeconds = 600,
+  maxWaitSeconds = 1800,
 ): Promise<boolean> {
   const pollInterval = 5000;
   let attempts = 0;
