@@ -137,7 +137,7 @@ await test("SprintStore findLastSprintId", () => {
 // ── review.ts ────────────────────────────────────────────────────
 console.log("\n## review.ts");
 
-const { buildChainAgentTask, buildReviewerTask, buildWorkerTask, parseReviewVerdict } = await importModule(path.join("parallel", "review.ts"));
+const { buildChainAgentTask, buildReviewerTask, buildWorkerTask, parseReviewVerdict, buildDetectiveTask } = await importModule(path.join("parallel", "review.ts"));
 
 await test("buildWorkerTask includes constraints and dead-ends", () => {
   const task = buildWorkerTask("Fix bug", "Fix the bug", undefined, "rule1", "deadend1");
@@ -196,6 +196,22 @@ await test("buildWorkerTask includes patterns section", () => {
   assert.ok(task.includes("Known Codebase Patterns"));
   assert.ok(task.includes("p1"));
   assert.ok(task.includes("dead1"));
+});
+
+await test("buildDetectiveTask includes concern and reproduction instructions", () => {
+  const task = buildDetectiveTask("/project", "Race condition in auth registration", "rule1", "pattern1");
+  assert.ok(task.includes("Race condition in auth registration"));
+  assert.ok(task.includes("CONFIRMED | NOT_REPRODUCED | INCONCLUSIVE"));
+  assert.ok(task.includes("reproduction test"));
+  assert.ok(task.includes("ABSOLUTE paths"));
+  assert.ok(task.includes("Do NOT fix the bug"));
+});
+
+await test("buildChainAgentTask includes detective prompt", () => {
+  const task = buildChainAgentTask("detective", "Find race", "desc", undefined, "c1", "p1", []);
+  assert.ok(task.includes("detective"));
+  assert.ok(task.includes("reproduce"));
+  assert.ok(task.includes("CONFIRMED"));
 });
 
 // ── observer.ts ──────────────────────────────────────────────────

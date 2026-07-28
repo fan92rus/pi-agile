@@ -214,6 +214,28 @@ Return a structured plan with sections:
 - Step-by-step breakdown
 - Files to modify per step
 - Edge cases and testing approach`,
+
+    detective: `You are a code detective. Your task is to investigate a SPECIFIC concern about this task and reproduce it if real.
+
+## Instructions
+1. Read the relevant code for the task
+2. Trace execution paths looking for the concern described below
+3. If you find the issue, write a REPRODUCTION TEST and run it
+4. Commit the test: git add -A && git commit -m "test: reproduce <issue>"
+5. Report: CONFIRMED (with reproduction) or NOT_REPRODUCED (with reasoning)
+
+## Output Format
+### Status: CONFIRMED | NOT_REPRODUCED | INCONCLUSIVE
+### Reproduction
+- Method: test case / manual command / static analysis
+- Commit: <hash> (if test committed)
+- How to run: command or instruction
+### Evidence
+- File: path:line \u2014 what's wrong
+- Test output or execution trace
+### Severity: critical / high / medium / low
+### Fix Direction
+Brief suggestion (not a full fix)`,
   };
 
   return `# Chain Agent: ${agent}
@@ -353,4 +375,78 @@ Return a structured report. For EACH finding:
 - Group related issues (e.g. 3 missing validations in one file = one finding)
 - Limit to TOP 15 findings by severity/impact
 - Include a summary at the top: N critical, N high, N medium, N low`;
+}
+
+/**
+ * Build a detective investigation task prompt (standalone mode).
+ * The detective takes a specific concern, investigates the codebase,
+ * reproduces the issue if real, and commits a test case.
+ */
+export function buildDetectiveTask(
+  workDir: string,
+  concern: string,
+  constraints: string,
+  patterns: string,
+): string {
+  return `# Code Detective: Investigation
+
+You are a code detective investigating a specific concern in the project at ${workDir}.
+
+## Concern (what to investigate)
+${concern}
+
+## Project Constraints
+${constraints || "(none specified)"}
+
+## Known Codebase Patterns
+${patterns || "(none recorded yet)"}
+
+## Your Mission
+Investigate the concern above. Determine if the problem is REAL by reproducing it.
+
+## CRITICAL: File Path Instructions
+- Your working directory is: ${workDir}
+- When calling tools (read, ctx_read, bash, etc.), ALWAYS pass ABSOLUTE paths
+  starting with: ${workDir}
+- Example: read(path: "${workDir}/src/auth.js") NOT read(path: "src/auth.js")
+- NEVER pass undefined or relative paths to tools
+
+## Steps
+1. READ the relevant source code to understand the current implementation
+2. TRACE the execution path related to the concern
+3. ANALYZE whether the concern is real:
+   - If you believe the bug exists, write a MINIMAL reproduction test
+   - Run the test to confirm it fails (proving the bug)
+   - Commit the test: git add -A && git commit -m "test: reproduce <short description>"
+   - If the test passes (bug not present), report NOT_REPRODUCED
+4. If you CANNOT write a test (e.g., infrastructure issue), try to reproduce manually:
+   - Run the specific command or sequence that triggers the issue
+   - Capture the output as evidence
+5. If you need to understand context, read related files, dependencies, config
+
+## Rules
+- Do NOT fix the bug \u2014 only reproduce it
+- Do NOT modify production code \u2014 only add test files or run commands
+- Be SPECIFIC: exact file paths, line numbers, stack traces
+- Keep reproduction MINIMAL \u2014 one focused test, not a suite
+- If the concern turns out to be invalid, say so clearly (NOT_REPRODUCED)
+- Respect project constraints
+
+## Output Format
+### Status: CONFIRMED | NOT_REPRODUCED | INCONCLUSIVE
+
+### Reproduction
+- **Method**: test case / manual command / static analysis
+- **Commit**: <hash> (if test was committed)
+- **How to run**: exact command, e.g. \`npm test -- --grep "duplicate"\`
+  OR specific instruction, e.g. "POST /register twice with same email simultaneously"
+
+### Evidence
+- **File**: path/to/file.ts:42 \u2014 what's wrong (1-2 sentences)
+- **Test output**: relevant lines showing the failure
+
+### Severity: critical | high | medium | low
+
+### Fix Direction
+- Brief suggestion for how to fix (1-2 sentences, NOT a full implementation)`;
 }

@@ -23,7 +23,7 @@ import * as path from "node:path";
 import { KnowledgeBase } from "./parallel/knowledge.ts";
 import { SprintStore, type SprintState, type SprintTask, type SprintVelocity } from "./parallel/sprint.ts";
 import { runDiscovery, formatDiscoveryResult, initChecks, detectEcosystem, type EcosystemInfo } from "./parallel/discovery.ts";
-import { buildChainAgentTask, buildReviewerTask, buildWorkerTask, parseReviewVerdict, buildDiscoveryScoutTask } from "./parallel/review.ts";
+import { buildChainAgentTask, buildReviewerTask, buildWorkerTask, parseReviewVerdict, buildDiscoveryScoutTask, buildDetectiveTask } from "./parallel/review.ts";
 import { RpcClient, type SpawnedWorker } from "./parallel/rpc.ts";
 import {
   createObserverState,
@@ -90,6 +90,7 @@ const DEFAULT_AGENT_MODELS: Record<string, string> = {
   worker: "opencode-go/deepseek-v4-flash",
   reviewer: "opencode-go/deepseek-v4-flash",
   scout: "opencode-go/deepseek-v4-flash",
+  detective: "opencode-go/deepseek-v4-flash",
   researcher: "zai-glm/glm-5.2",
   planner: "zai-glm/glm-5.2",
 };
@@ -854,7 +855,7 @@ function setAgileMode(ctx: ExtensionContext, enabled: boolean, workDir?: string)
   if (!enabled) {
     // Remove gated tools from active set when turning off
     const tools = ctx.getActiveTools?.() ?? [];
-    const gated = ["agile_discover", "agile_start_sprint", "agile_delegate_task", "agile_merge_task", "agile_retrospective", "agile_knowledge"];
+    const gated = ["agile_discover", "agile_start_sprint", "agile_delegate_task", "agile_merge_task", "agile_retrospective", "agile_knowledge", "agile_investigate"];
     ctx.setActiveTools?.(tools.filter((t) => !gated.includes(t)));
   }
 }
@@ -961,6 +962,7 @@ Choose the right chain based on task complexity and context:
 | **New feature** with external API | \`["researcher", "scout", "worker", "reviewer"]\` | Research docs, scout existing code |
 | **Complex multi-file change** | \`["scout", "worker", "reviewer"]\` (+ planner if large) | Decompose before implementing |
 | **Security fix** | \`["scout", "worker", "reviewer"]\` | Scout finds all vulnerable paths |
+| **Suspected bug needing validation** | \`["detective", "worker", "reviewer"]\` | Detective reproduces before worker fixes |
 
 **Rules:**
 - Chain agents run ONCE before the worker loop (not on rework rounds)
@@ -971,6 +973,20 @@ Choose the right chain based on task complexity and context:
   {"agent_chains": {"refactor": ["scout", "worker", "reviewer"]}}
   \`\`\`
 - Pass \`chain\` per-call: \`agile_delegate_task({bd_id: "...", chain: ["scout", "worker", "reviewer"]})\`
+
+## Detective Agent
+
+Use \`agile_investigate\` or chain \`["detective", "worker", "reviewer"]\` when:
+1. Scout found a suspicious pattern — detective confirms it's real
+2. Reviewer flagged a potential issue — detective reproduces it
+3. You have a HYPOTHESIS about a possible bug — detective investigates
+
+Do NOT use detective for broad exploration (use \`agile_discover\` / scout).
+Do NOT use detective when the fix is obvious (skip to worker directly).
+
+**Model selection:**
+- Simple bugs (null check, typo): flash (default)
+- Complex logic (race conditions, security, algorithms): pass \`model: "zai-glm/glm-5.2"\`
 
 ### Phase 4: Sprint Execution
 For each task in the sprint:
@@ -1000,6 +1016,7 @@ Each agent role uses a configurable model. Defaults:
 - worker: opencode-go/deepseek-v4-flash
 - reviewer: opencode-go/deepseek-v4-flash
 - scout: opencode-go/deepseek-v4-flash
+- detective: opencode-go/deepseek-v4-flash
 - researcher: zai-glm/glm-5.2 (stronger for research tasks)
 - planner: zai-glm/glm-5.2 (stronger for decomposition)
 
@@ -1165,6 +1182,91 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       return {
         content: [{ type: "text" as const, text: `# Discovery Results\n\n${missingBlock}${text}${scoutBlock}` }],
         details: { scriptsFound: result.scriptsFound, metricCount: Object.keys(result.metrics).length, scoutRan: !skipScout && !scoutBlock.startsWith("\n\n## Scout Analysis\n⚠") },
+      };
+    },
+  });
+
+  // Tool: agile_investigate — standalone detective agent for targeted bug investigation
+  pi.registerTool({
+    name: "agile_investigate",
+    label: "agile_investigate",
+    description: "Spawn a detective subagent to investigate a specific concern and reproduce it if real. Returns CONFIRMED/NOT_REPRODUCED with reproduction steps. Use when you have a hypothesis about a potential bug.",
+    parameters: Type.Object({
+      concern: Type.String({ description: "The specific concern or hypothesis to investigate. Be specific: what bug, where, under what conditions." }),
+      model: Type.Optional(Type.String({ description: "Override detective model. Use glm-5.2 for complex logic (race conditions, security). Defaults to config." })),
+      cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx, runtimeStore);
+      const gate = assertAgileActive(runtime);
+      if (gate) return gate;
+      const workDir = (params.cwd as string) || ctx.cwd;
+      const concern = params.concern as string;
+      const modelOverride = params.model as string | undefined;
+
+      // Create investigate branch
+      const branchName = "investigate/" + Date.now().toString(36);
+      try {
+        await execText(pi, "git", ["checkout", "-b", branchName], workDir, 10000);
+      } catch {
+        return {
+          content: [{ type: "text" as const, text: "Failed to create investigate branch. Check for uncommitted changes (git stash)." }],
+        };
+      }
+
+      // Build detective task
+      const constraints = loadConstraintsText(workDir);
+      const kb = new KnowledgeBase();
+      kb.load(workDir);
+      const patterns = kb.formatPatterns();
+      const detectiveTask = buildDetectiveTask(workDir, concern, constraints, patterns);
+      const detectiveOutput = path.join(workDir, ".agile", "detective-output.txt");
+      const spawnTimeout = getSpawnTimeout(workDir);
+
+      // Spawn detective subagent
+      let spawned: SpawnedWorker;
+      try {
+        spawned = await rpc.spawn({
+          agent: "worker",
+          model: modelOverride ?? getAgentModel(workDir, "detective"),
+          task: detectiveTask,
+          cwd: workDir,
+          context: "fresh",
+          output: detectiveOutput,
+          outputMode: "file-only",
+        }, spawnTimeout);
+      } catch (e: unknown) {
+        // Switch back to main branch on failure
+        await execText(pi, "git", ["checkout", "-"], workDir, 5000);
+        return {
+          content: [{ type: "text" as const, text: "Detective spawn failed: " + (e instanceof Error ? e.message : String(e)) }],
+        };
+      }
+
+      // Poll for completion
+      const done = await pollWithProgress(
+        pi, workDir, rpc, spawned.runId, detectiveOutput, "detective",
+        () => {}, spawnTimeout,
+      );
+
+      let report = "";
+      if (done && fs.existsSync(detectiveOutput)) {
+        report = fs.readFileSync(detectiveOutput, "utf8").trim();
+      }
+      if (report.length < 50) {
+        report = "Detective did not produce a report. The investigation may have timed out.\nBranch: " + branchName;
+      }
+
+      // Get last commit hash on this branch (detective may have committed)
+      let commitHash = "";
+      try {
+        const commitResult = await execText(pi, "git", ["log", "--oneline", "-1"], workDir, 5000);
+        commitHash = commitResult.trim();
+      } catch { /* no commits */ }
+
+      return {
+        content: [{ type: "text" as const, text: "# Detective Investigation Report\n\n**Branch**: " + branchName + "\n" + (commitHash ? "**Last commit**: " + commitHash + "\n" : "") + "\n" + report }],
+        details: { branch: branchName, commit: commitHash },
       };
     },
   });
@@ -2037,6 +2139,7 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
             "worker — implementation subagent",
             "reviewer — code review subagent",
             "scout — codebase exploration agent",
+            "detective — bug investigation & reproduction agent",
             "researcher — API/best-practices research agent",
             "planner — task decomposition agent",
             "show current models",
@@ -2044,7 +2147,7 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
           const roleChoice = await ctx.ui.select("Select agent role:", roleChoices);
           if (!roleChoice) return;
           if (roleChoice === "show current models") { await showModelStatus(totalCount, providerCount); return; }
-          const roleMap: Record<string, string> = { worker: "worker", reviewer: "reviewer", scout: "scout", researcher: "researcher", planner: "planner" };
+          const roleMap: Record<string, string> = { worker: "worker", reviewer: "reviewer", scout: "scout", detective: "detective", researcher: "researcher", planner: "planner" };
           const role = Object.keys(roleMap).find(k => roleChoice.startsWith(k)) ?? "worker";
           const current = ((config.agent_models ?? {}) as Record<string, string>)[role];
 
