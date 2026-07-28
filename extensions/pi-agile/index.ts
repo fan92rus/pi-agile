@@ -332,10 +332,10 @@ async function gitMergeFromWorktree(
 }
 
 /** Extract list of conflicted files from git merge stderr. */
-function extractConflictedFiles(stderr: string): string[] {
+function extractConflictedFiles(text: string): string[] {
   const files: string[] = [];
-  for (const line of stderr.split("\n")) {
-    const m = line.match(/CONFLICT \(content\): Merge conflict in (.+)$/);
+  for (const line of text.split("\n")) {
+    const m = line.match(/CONFLICT \([^)]+\): Merge conflict in (.+)$/);
     if (m) files.push(m[1].trim());
   }
   return files;
@@ -753,7 +753,7 @@ async function executeBatchTasks(
     const rAny = r as any;
     if (rAny.conflict) {
       conflicted.push(r.bdId);
-      lines.push(`## ${r.bdId}: \ud83d\udc00 CONFLICT`);
+      lines.push(`## ${r.bdId}: \ud83d\udd00 CONFLICT`);
       lines.push(`Files: ${rAny.conflict.files.join(", ")}`);
       lines.push(`Worktree: ${rAny.conflict.worktreeDir} (feat/${r.bdId})`);
       lines.push("");
@@ -761,8 +761,7 @@ async function executeBatchTasks(
       lines.push(`1. \`cd ${rAny.conflict.worktreeDir}\``);
       lines.push(`2. \`git fetch origin main && git rebase origin/main\``);
       lines.push(`3. If conflict: fix files, \`git add <files> && git rebase --continue\``);
-      lines.push(`4. \`git push origin feat/${r.bdId} --force\` (if worktree is shared)`);
-      lines.push(`5. Call \`agile_merge_task({ bd_id: "${r.bdId}" })\` to finalize`);
+      lines.push(`4. Call \`agile_merge_task({ bd_id: "${r.bdId}" })\` to finalize`);
       lines.push("");
     } else if (r.error) {
       errored.push(r.bdId);
@@ -806,7 +805,7 @@ async function executeBatchTasks(
   }
   if (conflicted.length > 0) {
     lines.push("");
-    lines.push("\ud83d\udc00 CONFLICT tasks need resolution. Navigate to the worktree, rebase on main, resolve conflicts, then call agile_merge_task.");
+    lines.push("\ud83d\udd00 CONFLICT tasks need resolution. Navigate to the worktree, rebase on main, resolve conflicts, then call agile_merge_task.");
   }
 
   return { content: [{ type: "text" as const, text: lines.join("\n") }] };
@@ -1776,7 +1775,7 @@ ${workerSummary.slice(0, 1000)}`;
           try { await pi.exec("git", ["merge", "--abort"], { cwd: workDir, timeout: 10_000 }); } catch {}
           const wtHint = fromWorktreeDir || usedWorktree || path.join(path.dirname(workDir), `${path.basename(workDir)}-${bdId}`);
           return {
-            content: [{ type: "text" as const, text: `🐀 Merge conflict in ${bdId}. Worktree kept at:\n  ${wtHint}\n\nTo resolve:\n1. \`cd ${wtHint}\`\n2. \`git fetch origin main && git rebase origin/main\`\n3. Fix conflicts, \`git add <files> && git rebase --continue\`\n4. Run \`agile_merge_task({ bd_id: "${bdId}", from_worktree_dir: "${wtHint}" })\`` }],
+            content: [{ type: "text" as const, text: `🔀 Merge conflict in ${bdId}. Worktree kept at:\n  ${wtHint}\n\nTo resolve:\n1. \`cd ${wtHint}\`\n2. \`git fetch origin main && git rebase origin/main\`\n3. Fix conflicts, \`git add <files> && git rebase --continue\`\n4. Run \`agile_merge_task({ bd_id: "${bdId}", from_worktree_dir: "${wtHint}" })\`` }],
           };
         }
         return {
@@ -1784,13 +1783,17 @@ ${workerSummary.slice(0, 1000)}`;
         };
       }
 
-      // Clean up worktree if we merged from one
-      if (usedWorktree || fromWorktreeDir) {
-        const wtCleanup = usedWorktree || fromWorktreeDir || "";
-        if (wtCleanup && wtCleanup !== workDir && fs.existsSync(wtCleanup)) {
-          try { await pi.exec("git", ["worktree", "remove", "--force", wtCleanup], { cwd: workDir, timeout: 10_000 }); } catch {}
-          try { fs.rmSync(wtCleanup, { recursive: true, force: true }); } catch {}
-        }
+      // Clean up worktree (explicit, auto-detected, or known path)
+      const wtDirs: string[] = [];
+      if (usedWorktree && usedWorktree !== workDir) wtDirs.push(usedWorktree);
+      if (fromWorktreeDir && fromWorktreeDir !== workDir && !wtDirs.includes(fromWorktreeDir)) wtDirs.push(fromWorktreeDir);
+      const knownWt = path.join(path.dirname(workDir), `${path.basename(workDir)}-${bdId}`);
+      if (knownWt !== workDir && !wtDirs.includes(knownWt) && fs.existsSync(knownWt)) {
+        wtDirs.push(knownWt);
+      }
+      for (const wt of wtDirs) {
+        try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: workDir, timeout: 10_000 }); } catch (e) {}
+        try { fs.rmSync(wt, { recursive: true, force: true }); } catch (e) {}
       }
 
       // Run main checks (test, optionally lint)
