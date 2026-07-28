@@ -543,6 +543,61 @@ async function delegateBatchParallel(
   const parentDir = path.dirname(mainWorkDir);
   const repoName = path.basename(mainWorkDir);
 
+  // Per-task progress tracker (shared across parallel tasks)
+  interface TaskProgress {
+    bdId: string;
+    title: string;
+    round: number;
+    stage: string;
+    status: string; // "active" | "done" | "error"
+  }
+  const progressMap = new Map<string, TaskProgress>();
+  for (const t of tasks) {
+    progressMap.set(t.bdId, { bdId: t.bdId, title: t.meta.title, round: 0, stage: "waiting", status: "active" });
+  }
+
+  function showBatchSummary(): void {
+    const all = Array.from(progressMap.values());
+    const active = all.filter(t => t.status === "active");
+    const done = all.filter(t => t.status !== "active");
+    try {
+      pi.notify(
+        `📋 Batch: ${active.length} active, ${done.length} done\n${
+          active.map(t => `  [${t.bdId}] ${t.title} — ${t.stage} (r${t.round})`).join("\n")
+        }`,
+        "info"
+      );
+    } catch {}
+    writeBatchProgress(mainWorkDir, {
+      tasks: all.map(t => ({ bdId: t.bdId, round: t.round, stage: t.stage, status: t.status })),
+    });
+  }
+
+  // Parse bdId and round from onProgress status strings like "abc: stage..." or "abc (r1): stage..."
+  function parseProgressStatus(status: string): { bdId: string; stage: string; round: number } | null {
+    const m = status.match(/^([a-zA-Z0-9_-]+)\s*(?:\((r\d+)\))?\s*:\s*(.+)$/);
+    if (!m) return null;
+    return {
+      bdId: m[1],
+      round: m[2] ? parseInt(m[2].slice(1), 10) : 1,
+      stage: m[3].trim(),
+    };
+  }
+
+  const wrappedOnProgress = (status: string) => {
+    onProgress?.(status);
+    const parsed = parseProgressStatus(status);
+    if (parsed && progressMap.has(parsed.bdId)) {
+      const p = progressMap.get(parsed.bdId)!;
+      p.stage = parsed.stage;
+      p.round = parsed.round;
+      if (parsed.stage.includes("approved") || parsed.stage.includes("merge") || parsed.stage.startsWith("error")) {
+        // Will be marked done later after merge
+      }
+      showBatchSummary();
+    }
+  };
+
   // 1. Ensure on main
   const mainBranch = await gitCheckoutMain(pi, mainWorkDir);
 
@@ -553,7 +608,7 @@ async function delegateBatchParallel(
       const wtDir = path.join(parentDir, `${repoName}-${t.bdId}`);
       await pi.exec("git", ["worktree", "add", "-b", `feat/${t.bdId}`, wtDir, mainBranch], { cwd: mainWorkDir, timeout: 30_000 });
       worktrees.push(wtDir);
-      onProgress?.(`${t.bdId}: worktree created`);
+      wrappedOnProgress(`${t.bdId}: worktree created`);
     }
   } catch (e: unknown) {
     for (const wt of worktrees) {
@@ -564,28 +619,18 @@ async function delegateBatchParallel(
   }
 
   // 3. Run ALL tasks in parallel — each its own worktree, each has its own loop
-  onProgress?.("Running all tasks in parallel...");
+  wrappedOnProgress?.("Running all tasks in parallel...");
   const spawnTimeout = getSpawnTimeout(mainWorkDir);
   const taskPromises = tasks.map((t, i) =>
-    delegateTaskInWorktree(pi, rpc_, worktrees[i], t.bdId, t.meta, constraints, deadEnds, patterns, reviewDepth, spawnTimeout, onProgress, chain)
+    delegateTaskInWorktree(pi, rpc_, worktrees[i], t.bdId, t.meta, constraints, deadEnds, patterns, reviewDepth, spawnTimeout, wrappedOnProgress, chain)
   );
   const results = await Promise.all(taskPromises);
-
-  // 4. Write progress snapshot
-  writeBatchProgress(mainWorkDir, {
-    tasks: results.map(r => ({
-      bdId: r.bdId,
-      round: (r.reviews ?? []).length,
-      stage: r.error ? "error" : r.verdict.status === "approved" ? "merge" : r.verdict.status,
-      status: r.error ? `error: ${r.error}` : r.verdict.status,
-    })),
-  });
 
   // 5. For approved tasks: merge to main
   for (let i = 0; i < results.length; i++) {
     const r = results[i];
     if (r.verdict.status === "approved" && !r.error) {
-      onProgress?.(`${r.bdId}: approved, merging...`);
+      wrappedOnProgress(`${r.bdId}: approved, merging...`);
       try {
         const mergeResult = await gitMergeFromWorktree(pi, mainWorkDir, worktrees[i], r.branch, `feat: merge ${r.bdId}`);
         if (mergeResult) r.error = `merge failed: ${mergeResult}`;
@@ -593,7 +638,14 @@ async function delegateBatchParallel(
         r.error = `merge error: ${e instanceof Error ? e.message : String(e)}`;
       }
     }
+    // Mark task done in progress tracker
+    const prog = progressMap.get(r.bdId);
+    if (prog) {
+      prog.status = r.error ? "error" : "done";
+      prog.stage = r.error ? "error" : r.verdict.status === "approved" ? "merged" : r.verdict.status;
+    }
   }
+  showBatchSummary();
 
   // 6. Clean up worktrees
   onProgress?.("Cleaning up worktrees...");

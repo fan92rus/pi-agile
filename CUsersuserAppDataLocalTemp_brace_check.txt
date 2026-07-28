@@ -1,0 +1,32 @@
+  );
+  const results = await Promise.all(taskPromises);
+
+  // 5. For approved tasks: merge to main
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (r.verdict.status === "approved" && !r.error) {
+      wrappedOnProgress(`${r.bdId}: approved, merging...`);
+      try {
+        const mergeResult = await gitMergeFromWorktree(pi, mainWorkDir, worktrees[i], r.branch, `feat: merge ${r.bdId}`);
+        if (mergeResult) r.error = `merge failed: ${mergeResult}`;
+      } catch (e: unknown) {
+        r.error = `merge error: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    // Mark approved task done in progress tracker (inside the if block)
+    const progApproved = progressMap.get(r.bdId);
+    if (progApproved) {
+      progApproved.status = r.error ? "error" : "done";
+      progApproved.stage = r.error ? "error" : "merged";
+    }
+  } else {
+    // Mark non-approved task done
+    const progOther = progressMap.get(r.bdId);
+    if (progOther) { progOther.status = "done"; progOther.stage = r.error ? "error" : r.verdict.status; }
+  }
+  showBatchSummary();
+
+  // 6. Clean up worktrees
+  onProgress?.("Cleaning up worktrees...");
+  for (const wt of worktrees) {
+    try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
+    try { fs.rmSync(wt, { recursive: true, force: true }); } catch {}
