@@ -797,6 +797,7 @@ async function pollWithProgress(
 interface AgileRuntime {
   agileMode: boolean;
   sprintLoopActive: boolean;
+  remainingSprints: number | undefined; // undefined = continuous
   currentSprintId: number;
   rpc: RpcClient | null;
   observerState: SprintObserverState;
@@ -809,6 +810,7 @@ function createRuntime(events: unknown): AgileRuntime {
   return {
     agileMode: false,
     sprintLoopActive: false,
+    remainingSprints: undefined,
     currentSprintId: 0,
     rpc: null,
     observerState: createObserverState(),
@@ -1765,6 +1767,21 @@ ${workerSummary.slice(0, 1000)}`;
       const v = sprint.velocity;
       const retroText = buildRetrospectiveText(sprint, workDir, v, runtime.knowledge);
 
+      // Decrement remaining sprints (if bounded) and send follow-up
+      if (runtime.remainingSprints !== undefined) {
+        runtime.remainingSprints--;
+        if (runtime.remainingSprints <= 0) {
+          runtime.sprintLoopActive = false;
+          try {
+            await pi.sendUserMessage("All sprints completed. Stop criteria met — end the sprint loop with /agile stop.", { deliverAs: "followUp" });
+          } catch { /* best effort */ }
+        } else {
+          try {
+            await pi.sendUserMessage(`${runtime.remainingSprints} sprint${runtime.remainingSprints > 1 ? "s" : ""} remaining. Decide: continue to next sprint or stop.`, { deliverAs: "followUp" });
+          } catch { /* best effort */ }
+        }
+      }
+
       // Append observer steers to output if any
       const steerText = observerSteers.length > 0
         ? `
@@ -2117,7 +2134,7 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
           `Review depth: ${meta.reviewDepth}`,
           `Max workers: ${meta.maxWorkers}`,
           `Last sprint: ${lastSprintId}`,
-          `Sprint loop active: ${runtime.sprintLoopActive ? "yes" : "no"}`,
+          `Sprint loop active: ${runtime.sprintLoopActive ? "yes" : "no"}${runtime.remainingSprints !== undefined && runtime.sprintLoopActive ? ` (${runtime.remainingSprints} sprint${runtime.remainingSprints > 1 ? "s" : ""} remaining)` : ""}`,
         ].join("\n"), "info");
         return;
       }
@@ -2125,11 +2142,12 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
       if (command === "stop") {
         const runtime = getRuntime(ctx, runtimeStore);
         runtime.sprintLoopActive = false;
+        runtime.remainingSprints = undefined;
         ctx.ui.notify("Sprint loop stopped", "info");
         return;
       }
 
-      if (command === "run") {
+      if (command === "run" || command.startsWith("run ")) {
         const runtime = getRuntime(ctx, runtimeStore);
         if (!runtime.agileMode) {
           ctx.ui.notify("⚠ Agile mode is OFF. Run /agile on first.", "error");
@@ -2140,9 +2158,51 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
           ctx.ui.notify("⚠ No .agile/project.yaml found. Run /agile setup first.", "error");
           return;
         }
+
+        // Parse optional sprint count from command
+        const parts = command.split(/\s+/);
+        let maxSprints: number | undefined;
+        if (parts.length >= 2) {
+          const n = parseInt(parts[1], 10);
+          if (!isNaN(n) && n > 0) maxSprints = n;
+        }
+
+        // If no count from command, try config.json, then project.yaml budget
+        if (maxSprints === undefined) {
+          const config = loadAgileConfig(workDir);
+          if (config.max_sprints && typeof config.max_sprints === "number") {
+            maxSprints = config.max_sprints;
+          }
+        }
+        if (maxSprints === undefined) {
+          const stopWhen = (project as Record<string, unknown>).stop_when as Record<string, unknown> | undefined;
+          if (stopWhen && (stopWhen.mode === "any_of" || stopWhen.mode === "all_of")) {
+            const conditions = (stopWhen.conditions as Array<Record<string, unknown>>) ?? [];
+            const sprintCond = conditions.find(c => (c as Record<string, unknown>).metric === "sprint_count");
+            if (sprintCond) maxSprints = sprintCond.target as number;
+          }
+        }
+
         runtime.sprintLoopActive = true;
-        ctx.ui.notify("▶ Sprint loop started", "info");
-        await pi.sendUserMessage("/agile run — start the sprint loop.\n\nExecute ONE sprint cycle now:\n1. If no sprint exists, call agile_discover to find work\n2. Create tasks in bd from discovery results (bd create \"title\" -d \"desc\")\n3. Call agile_start_sprint with the task IDs\n4. Call agile_delegate_task for each task\n5. Call agile_retrospective after all tasks are done\n6. After retrospective, decide: continue (next sprint) or stop (criteria met)\n\nIf this is the first run and .agile/checks/ scripts are not yet configured,\nfix them first (read each .agile/checks/*.sh, add correct commands).", { deliverAs: "followUp" });
+        runtime.remainingSprints = maxSprints;
+
+        const sprintsInfo = maxSprints
+          ? `You have ${maxSprints} sprint${maxSprints > 1 ? "s" : ""} remaining in this session.`
+          : "Continuous mode (no sprint limit).";
+
+        ctx.ui.notify(`▶ Sprint loop started (${maxSprints ? maxSprints + " sprints" : "continuous"})`, "info");
+        await pi.sendUserMessage(`/agile run — start the sprint loop.
+
+${sprintsInfo}
+After each retrospective, check remaining sprint count — if 0 remaining, stop.
+
+Execute ONE sprint cycle now:
+1. If no sprint exists, call agile_discover to find work
+2. Create tasks in bd from discovery results (bd create "title" -d "desc")
+3. Call agile_start_sprint with the task IDs
+4. Call agile_delegate_task for each task
+5. Call agile_retrospective after all tasks are done
+6. Read remaining sprints in retrospective output — if none left, stop; otherwise decide: continue or stop`, { deliverAs: "followUp" });
         return;
       }
 
