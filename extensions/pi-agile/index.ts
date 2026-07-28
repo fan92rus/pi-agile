@@ -1973,6 +1973,23 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
         return;
       }
 
+      if (command === "run") {
+        const runtime = getRuntime(ctx, runtimeStore);
+        if (!runtime.agileMode) {
+          ctx.ui.notify("⚠ Agile mode is OFF. Run /agile on first.", "error");
+          return;
+        }
+        const project = loadProjectConfig(workDir);
+        if (!project) {
+          ctx.ui.notify("⚠ No .agile/project.yaml found. Run /agile setup first.", "error");
+          return;
+        }
+        runtime.sprintLoopActive = true;
+        ctx.ui.notify("▶ Sprint loop started", "info");
+        await pi.sendUserMessage("/agile run — start the sprint loop.\n\nExecute ONE sprint cycle now:\n1. If no sprint exists, call agile_discover to find work\n2. Create tasks in bd from discovery results (bd create \"title\" -d \"desc\")\n3. Call agile_start_sprint with the task IDs\n4. Call agile_delegate_task for each task\n5. Call agile_retrospective after all tasks are done\n6. After retrospective, decide: continue (next sprint) or stop (criteria met)\n\nIf this is the first run and .agile/checks/ scripts are not yet configured,\nfix them first (read each .agile/checks/*.sh, add correct commands).", { deliverAs: "followUp" });
+        return;
+      }
+
       if (command === "config") {
         const config = loadAgileConfig(workDir);
         ctx.ui.notify(formatConfig(config), "info");
