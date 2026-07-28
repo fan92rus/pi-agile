@@ -331,6 +331,16 @@ async function gitMergeFromWorktree(
   return "";
 }
 
+/** Extract list of conflicted files from git merge stderr. */
+function extractConflictedFiles(stderr: string): string[] {
+  const files: string[] = [];
+  for (const line of stderr.split("\n")) {
+    const m = line.match(/CONFLICT \(content\): Merge conflict in (.+)$/);
+    if (m) files.push(m[1].trim());
+  }
+  return files;
+}
+
 /** Remove stale git worktrees left from crashed/aborted batch runs. Returns count removed. */
 function cleanupStaleWorktrees(workDir: string): number {
   let removed = 0;
@@ -538,7 +548,9 @@ async function delegateBatchParallel(
   chain: string[],
   onProgress?: (status: string) => void,
 ): Promise<{
-  results: Awaited<ReturnType<typeof delegateTaskInWorktree>>[];
+  results: (Awaited<ReturnType<typeof delegateTaskInWorktree>> & {
+    conflict?: { files: string[]; worktreeDir: string };
+  })[];
 }> {
   const parentDir = path.dirname(mainWorkDir);
   const repoName = path.basename(mainWorkDir);
@@ -631,11 +643,23 @@ async function delegateBatchParallel(
     const r = results[i];
     if (r.verdict.status === "approved" && !r.error) {
       wrappedOnProgress(`${r.bdId}: approved, merging...`);
+      let mergeResult: string;
       try {
-        const mergeResult = await gitMergeFromWorktree(pi, mainWorkDir, worktrees[i], r.branch, `feat: merge ${r.bdId}`);
-        if (mergeResult) r.error = `merge failed: ${mergeResult}`;
+        mergeResult = await gitMergeFromWorktree(pi, mainWorkDir, worktrees[i], r.branch, `feat: merge ${r.bdId}`);
       } catch (e: unknown) {
-        r.error = `merge error: ${e instanceof Error ? e.message : String(e)}`;
+        mergeResult = `merge error: ${e instanceof Error ? e.message : String(e)}`;
+      }
+      if (mergeResult) {
+        const isConflict = mergeResult.includes("CONFLICT");
+        if (isConflict) {
+          try { await pi.exec("git", ["merge", "--abort"], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
+          (r as any).conflict = {
+            files: extractConflictedFiles(mergeResult),
+            worktreeDir: worktrees[i],
+          };
+        } else {
+          r.error = `merge failed: ${mergeResult}`;
+        }
       }
     }
     // Mark task done in progress tracker
@@ -647,9 +671,13 @@ async function delegateBatchParallel(
   }
   showBatchSummary();
 
-  // 6. Clean up worktrees
+  // 6. Clean up worktrees (skip conflicted — agent needs them)
   onProgress?.("Cleaning up worktrees...");
+  const conflictedDirs = new Set(
+    results.filter((r: any) => r.conflict).map((r: any) => r.conflict.worktreeDir)
+  );
   for (const wt of worktrees) {
+    if (conflictedDirs.has(wt)) continue;
     try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
     try { fs.rmSync(wt, { recursive: true, force: true }); } catch {}
   }
@@ -718,10 +746,25 @@ async function executeBatchTasks(
   const approved: string[] = [];
   const rework: string[] = [];
   const blocked: string[] = [];
+  const conflicted: string[] = [];
   const errored: string[] = [];
 
   for (const r of results) {
-    if (r.error) {
+    const rAny = r as any;
+    if (rAny.conflict) {
+      conflicted.push(r.bdId);
+      lines.push(`## ${r.bdId}: \ud83d\udc00 CONFLICT`);
+      lines.push(`Files: ${rAny.conflict.files.join(", ")}`);
+      lines.push(`Worktree: ${rAny.conflict.worktreeDir} (feat/${r.bdId})`);
+      lines.push("");
+      lines.push("To merge:");
+      lines.push(`1. \`cd ${rAny.conflict.worktreeDir}\``);
+      lines.push(`2. \`git fetch origin main && git rebase origin/main\``);
+      lines.push(`3. If conflict: fix files, \`git add <files> && git rebase --continue\``);
+      lines.push(`4. \`git push origin feat/${r.bdId} --force\` (if worktree is shared)`);
+      lines.push(`5. Call \`agile_merge_task({ bd_id: "${r.bdId}" })\` to finalize`);
+      lines.push("");
+    } else if (r.error) {
       errored.push(r.bdId);
       lines.push(`## ${r.bdId}: \u274c ERROR`);
       lines.push(r.error);
@@ -756,10 +799,14 @@ async function executeBatchTasks(
 
   // Summary line
   lines.push("---");
-  lines.push(`Approved: ${approved.length} | Rework: ${rework.length} | Blocked: ${blocked.length} | Errors: ${errored.length}`);
+  lines.push(`Approved: ${approved.length} | Rework: ${rework.length} | Blocked: ${blocked.length} | Conflicts: ${conflicted.length} | Errors: ${errored.length}`);
   if (rework.length > 0) {
     lines.push("");
     lines.push("\u26a0\ufe0f REWORK tasks need fixes. Read action_items above, then call agile_delegate_task again with bd_id for each.");
+  }
+  if (conflicted.length > 0) {
+    lines.push("");
+    lines.push("\ud83d\udc00 CONFLICT tasks need resolution. Navigate to the worktree, rebase on main, resolve conflicts, then call agile_merge_task.");
   }
 
   return { content: [{ type: "text" as const, text: lines.join("\n") }] };
@@ -1073,6 +1120,12 @@ For each task in the sprint:
    - **approved** → call \`agile_merge_task\` to merge to main
    - **rework** → read action_items, call \`agile_delegate_task\` again for rework
    - **blocked** → task is fundamentally flawed, move to next task
+   - **conflict** (batch only) → merge conflict detected. Worktree kept on disk.
+     To resolve:
+       cd <worktree_dir>
+       git fetch origin main && git rebase origin/main
+       Fix conflicts, git add <files> && git rebase --continue
+       Then call agile_merge_task({ bd_id: "<id>" }) — auto-detects worktree
 4. Repeat until all tasks done/blocked
 
 ### Phase 5: Retrospective
@@ -1681,9 +1734,10 @@ ${workerSummary.slice(0, 1000)}`;
   pi.registerTool({
     name: "agile_merge_task",
     label: "agile_merge_task",
-    description: "Merge an approved task's feature branch to main (squash merge). Run main checks (lint + test). Call only after agile_delegate_task returns 'approved'.",
+    description: "Merge an approved task's feature branch to main (squash merge). Run main checks (lint + test). When from_worktree_dir is provided, fetches from that worktree instead. Auto-detects worktree at ../<repo>-<bdId> when branch not found in main repo.",
     parameters: Type.Object({
       bd_id: Type.String({ description: "bd task ID to merge" }),
+      from_worktree_dir: Type.Optional(Type.String({ description: "Path to worktree dir (for resolving batch conflicts). When provided, fetches from worktree instead of looking for branch in main repo." })),
       cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1695,13 +1749,48 @@ ${workerSummary.slice(0, 1000)}`;
       }
       const bdId = params.bd_id as string;
       const branch = `feat/${bdId}`;
+      const fromWorktreeDir = params.from_worktree_dir as string | undefined;
 
-      // Merge
-      const mergeResult = await gitMergeSquash(pi, workDir, branch, `feat: merge ${bdId}`);
+      // Merge: from worktree (conflict resolution) or main repo branch
+      let mergeResult: string;
+      let usedWorktree = "";
+      if (fromWorktreeDir) {
+        mergeResult = await gitMergeFromWorktree(pi, workDir, fromWorktreeDir, branch, `feat: merge ${bdId}`);
+        usedWorktree = fromWorktreeDir;
+      } else {
+        mergeResult = await gitMergeSquash(pi, workDir, branch, `feat: merge ${bdId}`);
+        // Auto-detect: if branch not found, try ../<repo>-<bdId> worktree
+        if (mergeResult && (mergeResult.includes("did not match any file") || mergeResult.includes("not found"))) {
+          const parentDir2 = path.dirname(workDir);
+          const repoName2 = path.basename(workDir);
+          const autoWt = path.join(parentDir2, `${repoName2}-${bdId}`);
+          if (fs.existsSync(autoWt)) {
+            mergeResult = await gitMergeFromWorktree(pi, workDir, autoWt, branch, `feat: merge ${bdId}`);
+            usedWorktree = autoWt;
+          }
+        }
+      }
       if (mergeResult) {
+        const isConflict = mergeResult.includes("CONFLICT");
+        if (isConflict) {
+          try { await pi.exec("git", ["merge", "--abort"], { cwd: workDir, timeout: 10_000 }); } catch {}
+          const wtHint = fromWorktreeDir || usedWorktree || path.join(path.dirname(workDir), `${path.basename(workDir)}-${bdId}`);
+          return {
+            content: [{ type: "text" as const, text: `🐀 Merge conflict in ${bdId}. Worktree kept at:\n  ${wtHint}\n\nTo resolve:\n1. \`cd ${wtHint}\`\n2. \`git fetch origin main && git rebase origin/main\`\n3. Fix conflicts, \`git add <files> && git rebase --continue\`\n4. Run \`agile_merge_task({ bd_id: "${bdId}", from_worktree_dir: "${wtHint}" })\`` }],
+          };
+        }
         return {
           content: [{ type: "text" as const, text: `❌ Merge failed: ${mergeResult}` }],
         };
+      }
+
+      // Clean up worktree if we merged from one
+      if (usedWorktree || fromWorktreeDir) {
+        const wtCleanup = usedWorktree || fromWorktreeDir || "";
+        if (wtCleanup && wtCleanup !== workDir && fs.existsSync(wtCleanup)) {
+          try { await pi.exec("git", ["worktree", "remove", "--force", wtCleanup], { cwd: workDir, timeout: 10_000 }); } catch {}
+          try { fs.rmSync(wtCleanup, { recursive: true, force: true }); } catch {}
+        }
       }
 
       // Run main checks (test, optionally lint)
