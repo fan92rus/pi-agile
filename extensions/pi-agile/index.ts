@@ -2303,14 +2303,37 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
           return;
         }
 
-        // Parse optional sprint count from command
-        const parts = command.split(/\s+/);
+        // Parse: optional sprint count + optional description
+        // /agile run 5 -> count=5, desc=""
+        // /agile run 5 Improve module boundaries without new features -> count=5, desc="..."
+        // /agile run Improve module boundaries -> count=undefined, desc="..."
+        const parts2 = command.split(/\s+/);
         let maxSprints: number | undefined;
-        if (parts.length >= 2) {
-          const n = parseInt(parts[1], 10);
-          if (!isNaN(n) && n > 0) maxSprints = n;
+        let description = "";
+        if (parts2.length >= 2) {
+          const n = parseInt(parts2[1], 10);
+          if (!isNaN(n) && n > 0) {
+            maxSprints = n;
+            if (parts2.length >= 3) {
+              description = parts2.slice(2).join(" ");
+            }
+          } else {
+            description = parts2.slice(1).join(" ");
+          }
         }
 
+        // If description provided → goal/constraints setup phase (always refill)
+        if (description.trim()) {
+          // Don't start sprint loop yet — agent must fill goal/constraints first
+          runtime.sprintLoopActive = false;
+          ctx.ui.notify(`📋 Setting sprint goal: "${description.slice(0, 80)}${description.length > 80 ? "…" : ""}"`, "info");
+
+          const setupMsg = `## Sprint Goal Setup Required\n\nThe user specified:\n> ${description}\n\n**You MUST fill the project configuration before starting any sprint.**\n\n1. **Read** current \`.agile/project.yaml\` and \`.agile/constraints.yaml\`\n2. **Extract** the goal from the description above — formalize it into \`goal:\` in \`.agile/project.yaml\`\n3. **Extract** constraints (e.g. \"не вводи новых функций\", \"не используй X\") — add them to \`constraints:\` array\n4. **Leave empty** anything not specified — don't invent extra goals or constraints\n5. **Goal is MANDATORY** — you MUST write a goal before proceeding\n6. After filling, call \`agile_start_sprint\` with tasks from \`bd ready\` (or run \`agile_discover\` first if no tasks exist)\n\nDo NOT start sprint work until goal + constraints are written.`;
+          await pi.sendUserMessage(setupMsg, { deliverAs: "followUp" });
+          return;
+        }
+
+        // No description → normal sprint cycle
         // If no count from command, try config.json, then project.yaml budget
         if (maxSprints === undefined) {
           const config = loadAgileConfig(workDir);
@@ -2335,18 +2358,7 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
           : "Continuous mode (no sprint limit).";
 
         ctx.ui.notify(`▶ Sprint loop started (${maxSprints ? maxSprints + " sprints" : "continuous"})`, "info");
-        await pi.sendUserMessage(`/agile run — start the sprint loop.
-
-${sprintsInfo}
-After each retrospective, check remaining sprint count — if 0 remaining, stop.
-
-Execute ONE sprint cycle now:
-1. If no sprint exists, call agile_discover to find work
-2. Create tasks in bd from discovery results (bd create "title" -d "desc")
-3. Call agile_start_sprint with the task IDs
-4. Call agile_delegate_task for each task
-5. Call agile_retrospective after all tasks are done
-6. Read remaining sprints in retrospective output — if none left, stop; otherwise decide: continue or stop`, { deliverAs: "followUp" });
+        await pi.sendUserMessage(`/agile run — start the sprint loop.\n\n${sprintsInfo}\nAfter each retrospective, check remaining sprint count — if 0 remaining, stop.\n\nExecute ONE sprint cycle now:\n1. If no sprint exists, call agile_discover to find work\n2. Create tasks in bd from discovery results (bd create "title" -d "desc")\n3. Call agile_start_sprint with the task IDs\n4. Call agile_delegate_task for each task\n5. Call agile_retrospective after all tasks are done\n6. Read remaining sprints in retrospective output — if none left, stop; otherwise decide: continue or stop`, { deliverAs: "followUp" });
         return;
       }
 
@@ -2724,6 +2736,7 @@ function agileHelp(): string {
 \`/agile off\`      — Disable agile mode
 \`/agile setup\`    — Run setup wizard (creates .agile/project.yaml + constraints.yaml + check scripts)
 \`/agile init-checks\` — Generate/update .agile/checks/ scripts for your project ecosystem
+\`/agile run [count] [description]\` — Start sprint cycle with goal description (agent fills + starts)
 \`/agile status\`   — Show current sprint status
 \`/agile stop\`     — Graceful stop
 \`/agile config\`   — Show configuration
@@ -2733,13 +2746,15 @@ function agileHelp(): string {
 ## Workflow
 1. \`/agile setup\` — configure project
 2. \`/agile on\` — enable agile mode
-3. Call \`agile_discover\` tool — runs check scripts + scout subagent analysis
-4. Create tasks in bd: \`bd create "title" --description "desc"\`
-4. Call \`agile_start_sprint\` — initialize sprint
-5. For each task: call \`agile_delegate_task\` → get verdict
-6. If approved: call \`agile_merge_task\`
-7. Call \`agile_retrospective\` — get velocity + stop-check
-8. Decide: stop or continue
+3. With goal: \`/agile run [count] "refactor module X without new features"\` — agent fills goal+constraints from description, then starts sprint
+4. No goal: \`/agile run [count]\` — normal sprint cycle
+5. Call \`agile_discover\` tool — runs check scripts + scout subagent analysis
+6. Create tasks in bd: \`bd create "title" --description "desc"\`
+7. Call \`agile_start_sprint\` — initialize sprint
+8. For each task: call \`agile_delegate_task\` → get verdict
+9. If approved: call \`agile_merge_task\`
+10. Call \`agile_retrospective\` — get velocity + stop-check
+11. Decide: stop or continue
 
 Architecture: agent decides, extension runs.`;
 }
