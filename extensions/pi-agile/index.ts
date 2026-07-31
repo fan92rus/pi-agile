@@ -101,7 +101,9 @@ function getChainConfig(workDir: string): Record<string, string[]> {
   return (config.agent_chains as Record<string, string[]>) ?? { "default": ["worker", "reviewer"] };
 }
 
-/** Read spawn_timeout from .agile/config.json, default 1800s (1800000ms). */
+/** Read spawn_timeout from .agile/config.json, default 1800s (1800000ms).
+ * This is the timeout for the RPC spawn REPLY (acceptance), not the subagent runtime.
+ * Subagent runtime waits indefinitely — see pollWithProgress (maxWaitSeconds=0). */
 function getSpawnTimeout(workDir: string): number {
   const config = loadAgileConfig(workDir);
   const raw = config.spawn_timeout;
@@ -421,12 +423,12 @@ async function delegateTaskInWorktree(
         context: "fresh",
         output: agentOutput,
         outputMode: "file-only",
-      }, Math.min(spawnTimeout, 120_000));
+      }, spawnTimeout);
     } catch (e: unknown) {
       chainOutputs.push({ agent, output: `[FAILED] ${e instanceof Error ? e.message : String(e)}` });
       continue;
     }
-    const done = await pollWithProgress(pi, workDir, rpc_, spawned.runId, agentOutput, `${agent}-${bdId}`, (s: string) => onProgress?.(`${bdId}: ${s}`), 300);
+    const done = await pollWithProgress(pi, workDir, rpc_, spawned.runId, agentOutput, `${agent}-${bdId}`, (s: string) => onProgress?.(`${bdId}: ${s}`));
     let output = "";
     try { if (fs.existsSync(agentOutput)) output = fs.readFileSync(agentOutput, "utf8"); } catch {}
     chainOutputs.push({ agent, output: output || `(${agent} completed)` });
@@ -848,11 +850,12 @@ async function pollWithProgress(
   outputFile: string,
   role: string,
   onUpdate: (msg: { content: { type: string; text: string }[] }) => void,
-  maxWaitSeconds = 1800,
+  maxWaitSeconds = 0, // 0 = wait indefinitely (subagents run as long as needed)
 ): Promise<boolean> {
   const pollInterval = 5000;
   let attempts = 0;
-  const maxAttempts = Math.ceil(maxWaitSeconds / (pollInterval / 1000));
+  // maxWaitSeconds <= 0 means unlimited — poll until terminal state
+  const maxAttempts = maxWaitSeconds > 0 ? Math.ceil(maxWaitSeconds / (pollInterval / 1000)) : Number.MAX_SAFE_INTEGER;
 
   while (attempts < maxAttempts) {
     await new Promise((r) => setTimeout(r, pollInterval));
@@ -1282,7 +1285,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
               context: "fresh",
               output: scoutOutput,
               outputMode: "file-only",
-            }, Math.min(spawnTimeout, 120_000));
+            }, spawnTimeout);
           } catch (e: unknown) {
             scoutBlock = "\n\n## Scout Analysis\n⚠ Scout spawn failed: " + (e instanceof Error ? e.message : String(e)) + "\n";
           }
@@ -1291,7 +1294,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
             // Poll for completion
             const scoutDone = await pollWithProgress(
               pi, workDir, rpc, spawned.runId, scoutOutput, "scout",
-              () => {}, Math.min(spawnTimeout, 120_000)
+              () => {}
             );
             if (scoutDone && fs.existsSync(scoutOutput)) {
               const scoutResult = fs.readFileSync(scoutOutput, "utf8").trim();
@@ -1386,7 +1389,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       // Poll for completion
       const done = await pollWithProgress(
         pi, workDir, rpc, spawned.runId, detectiveOutput, "detective",
-        () => {}, spawnTimeout,
+        () => {}
       );
 
       let report = "";
@@ -1547,8 +1550,8 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
             agent, model: getAgentModel(workDir, agent),
             task: agentTaskText, cwd: workDir, context: "fresh",
             output: agentOutput, outputMode: "file-only",
-          }, Math.min(getSpawnTimeout(workDir), 120_000));
-          await pollWithProgress(pi, workDir, rpc, spawned.runId, agentOutput, `${agent}-${bdId}`, onUpdate, 300);
+          }, getSpawnTimeout(workDir));
+          await pollWithProgress(pi, workDir, rpc, spawned.runId, agentOutput, `${agent}-${bdId}`, onUpdate);
         } catch (e: unknown) {
           chainOutputs.push({ agent, output: `[FAILED] ${e instanceof Error ? e.message : String(e)}` });
           continue;
