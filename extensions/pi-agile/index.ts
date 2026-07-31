@@ -56,7 +56,28 @@ function ensureAgileDir(workDir: string): void {
 
 function loadProjectConfig(workDir: string): Record<string, unknown> | null {
   const filePath = path.join(workDir, PROJECT_FILE);
-  if (!fs.existsSync(filePath)) return null;
+  if (!fs.existsSync(filePath)) {
+    // Auto-create default project.yaml on first access
+    const name = path.basename(workDir);
+    const defaultYaml = `project:
+  name: "${name}"
+  goal: "Improve code quality and fix issues"
+
+  scope:
+    include:
+      - "src/**"
+    exclude:
+      - "node_modules/**"
+      - "dist/**"
+
+  review_depth: deep
+  max_workers: 5
+`;
+    if (!fs.existsSync(path.join(workDir, AGILE_DIR))) {
+      fs.mkdirSync(path.join(workDir, AGILE_DIR), { recursive: true });
+    }
+    fs.writeFileSync(filePath, defaultYaml, "utf8");
+  }
   const text = fs.readFileSync(filePath, "utf8");
   return parseSimpleYaml(text);
 }
