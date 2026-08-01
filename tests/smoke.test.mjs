@@ -468,6 +468,32 @@ await test("agent_end fires again for a NEW sprint id", () => {
   assert.ok(agentEndShouldFire("planning", tasks, 1, 2)); // new sprint — yes
 });
 
+// Open bd tasks hint: parse bd list lines, excluding tasks already in sprint.
+function parseOpenBdTasks(bdOut, inSprintIds) {
+  const inSprint = new Set(inSprintIds);
+  const open = [];
+  for (const line of bdOut.split(/\r?\n/)) {
+    const m = line.match(/^[○◐]\s+([\w.-]+)\s/);
+    if (m && !inSprint.has(m[1])) open.push(m[1]);
+  }
+  return open;
+}
+
+await test("open bd tasks: collects open/in_progress not in sprint", () => {
+  const out = [
+    "○ pi-autoresearch-22i ● P2 Test agent_end E2E",
+    "◐ pi-autoresearch-33x ● P1 Another task",
+    "✓ pi-autoresearch-11a ● P3 Closed task",
+  ].join("\n");
+  const open = parseOpenBdTasks(out, ["pi-autoresearch-22i"]);
+  assert.deepStrictEqual(open, ["pi-autoresearch-33x"]);
+});
+
+await test("open bd tasks: empty when all open tasks are in sprint", () => {
+  const out = "○ pi-autoresearch-22i ● P2 Test agent_end E2E\n";
+  assert.deepStrictEqual(parseOpenBdTasks(out, ["pi-autoresearch-22i"]), []);
+});
+
 // ── Summary ──────────────────────────────────────────────────────
 console.log(`\n# Results: ${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

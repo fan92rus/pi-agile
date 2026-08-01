@@ -1277,6 +1277,20 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     const totalDone = sprint.tasks.filter((t) => t.status === "done").length;
     const totalBlocked = sprint.tasks.filter((t) => t.status === "blocked").length;
 
+    // Open bd tasks not already in this sprint — they should go into the next sprint.
+    let openTasks: string[] = [];
+    try {
+      const bdOut = await execText(pi, "bd", ["list"], workDir, 10_000);
+      if (!bdOut.includes("[exec error]")) {
+        const inSprint = new Set(sprint.tasks.map((t) => t.bd_id));
+        // Lines like: ○ pi-autoresearch-22i ● P2 Test agent_end E2E
+        for (const line of bdOut.split(/\r?\n/)) {
+          const m = line.match(/^[○◐]\s+([\w.-]+)\s/);
+          if (m && !inSprint.has(m[1])) openTasks.push(m[1]);
+        }
+      }
+    } catch { /* bd may not be initialized — fall back to discovery-only hint */ }
+
     try {
       const contextLines = [`Project goal: ${meta.goal}`];
       if (runtime.originalRequest.trim()) {
@@ -1286,11 +1300,16 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         `All ${sprint.tasks.length} sprint tasks are finished (${totalDone} done, ${totalBlocked} blocked).\n` +
         `Sprints remain — decide whether to continue finding new work.\n` +
         `${contextLines.join("\n")}\n\n` +
+        (openTasks.length > 0
+          ? `Open tasks in bd (not in this sprint) — start the next sprint with them:\n` +
+            openTasks.map((id) => `- \`${id}\``).join("\n") + `\n\n`
+          : ``) +
         `If the original request implies continuing (e.g. improving further, fixing more issues, exploring more areas):\n` +
-        `1. Run \`agile_discover\` to scan the codebase for remaining issues (check scripts + scout subagent)\n` +
-        `2. Review results against project constraints (scope, max tasks from .agile/project.yaml)\n` +
-        `3. Create tasks for the next sprint via \`bd create\` with clear acceptance criteria\n` +
-        `4. Call \`agile_start_sprint\` to initialize the next sprint\n\n` +
+        `1. If open bd tasks exist above — call \`agile_start_sprint\` with them (plus any new tasks)\n` +
+        `2. Run \`agile_discover\` to scan the codebase for remaining issues (check scripts + scout subagent)\n` +
+        `3. Review results against project constraints (scope, max tasks from .agile/project.yaml)\n` +
+        `4. Create tasks for the next sprint via \`bd create\` with clear acceptance criteria\n` +
+        `5. Call \`agile_start_sprint\` to initialize the next sprint\n\n` +
         `If the original request is fully satisfied — end here (no new tasks needed).`,
         { deliverAs: "followUp" }
       );
