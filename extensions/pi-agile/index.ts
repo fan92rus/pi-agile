@@ -262,6 +262,32 @@ function extractProjectMeta(project: Record<string, unknown> | null): {
   };
 }
 
+/**
+ * True when the project requirements (goal + constraints) say to keep
+ * finding new tasks/work between sprints. Matches intent markers in
+ * Russian and English; falls back to a config flag `discover_new_tasks`.
+ */
+function hasDiscoverNewRequirement(workDir: string): boolean {
+  const project = loadProjectConfig(workDir);
+  const meta = extractProjectMeta(project);
+  const constraints = loadConstraintsText(workDir);
+  const text = `${meta.goal}\n${constraints}`.toLowerCase();
+
+  const markers = [
+    // Russian
+    "искать нов", "найти нов", "новые задач", "новую задач", "новых задач",
+    "продолжай искать", "продолжать искать", "постоянно искать",
+    // English
+    "find new", "new task", "new tasks", "search for new", "discover new",
+    "keep looking", "continue finding", "continuously improve",
+  ];
+  if (markers.some((m) => text.includes(m))) return true;
+
+  // Explicit config flag as an escape hatch
+  const config = loadAgileConfig(workDir);
+  return config.discover_new_tasks === true;
+}
+
 // ---------------------------------------------------------------------------
 // Shell + Git helpers (via pi.exec)
 // ---------------------------------------------------------------------------
@@ -1251,6 +1277,15 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     const pending = sprint.tasks.filter((t) => t.status !== "done" && t.status !== "blocked");
     if (pending.length > 0) return;
     if (sprint.tasks.length === 0) return;
+
+    // More sprints ahead? Only then is finding new work meaningful.
+    // remainingSprints === undefined means continuous mode (unlimited).
+    const hasSprintsLeft =
+      runtime.remainingSprints === undefined || runtime.remainingSprints > 0;
+    if (!hasSprintsLeft) return;
+
+    // Only when the project requirements ask to keep finding new tasks.
+    if (!hasDiscoverNewRequirement(workDir)) return;
 
     const totalDone = sprint.tasks.filter((t) => t.status === "done").length;
     const totalBlocked = sprint.tasks.filter((t) => t.status === "blocked").length;

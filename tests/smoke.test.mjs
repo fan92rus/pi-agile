@@ -398,6 +398,39 @@ No hardcoded secrets`;
   assert.ok(descMatch[1].includes("Replace hardcoded"));
 });
 
+// ── index.ts: hasDiscoverNewRequirement markers ──────────────────────
+console.log("\n## index.ts: hasDiscoverNewRequirement");
+
+// The function isn't exported (index.ts needs pi runtime), test the marker
+// logic inline by re-implementing the same matching.
+function markerMatch(text) {
+  const markers = [
+    // Russian
+    "искать нов", "найти нов", "новые задач", "новую задач", "новых задач",
+    "продолжай искать", "продолжать искать", "постоянно искать",
+    // English
+    "find new", "new task", "new tasks", "search for new", "discover new",
+    "keep looking", "continue finding", "continuously improve",
+  ];
+  return markers.some((m) => text.includes(m));
+}
+
+await test("hasDiscoverNewRequirement: Russian marker in goal", () => {
+  assert.ok(markerMatch("постоянно искать новые задачи в кодовой базе".toLowerCase()));
+});
+
+await test("hasDiscoverNewRequirement: English marker in constraints", () => {
+  assert.ok(markerMatch("Always find new tasks to improve quality".toLowerCase()));
+});
+
+await test("hasDiscoverNewRequirement: default goal is NOT a match", () => {
+  assert.ok(!markerMatch("Improve code quality and fix issues".toLowerCase()));
+});
+
+await test("hasDiscoverNewRequirement: unrelated text is NOT a match", () => {
+  assert.ok(!markerMatch("Fix the auth module and add tests for login".toLowerCase()));
+});
+
 // ── Summary ──────────────────────────────────────────────────────
 console.log(`\n# Results: ${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);
