@@ -1237,6 +1237,36 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     event.systemPrompt = event.systemPrompt + extra;
   });
 
+  // Fired when an agent loop ends — remind the agent to run discovery when sprint work is exhausted.
+  pi.on("agent_end", async (event, ctx) => {
+    const runtime = getRuntime(ctx, runtimeStore);
+    if (!runtime.agileMode) return;
+
+    const workDir = ctx.cwd;
+    const sprint = runtime.store.getCurrent(workDir);
+    if (!sprint) return; // No active sprint
+
+    // Only when sprint is active (not completed) and all tasks are terminal
+    if (sprint.status !== "active") return;
+    const pending = sprint.tasks.filter((t) => t.status !== "done" && t.status !== "blocked");
+    if (pending.length > 0) return;
+    if (sprint.tasks.length === 0) return;
+
+    const totalDone = sprint.tasks.filter((t) => t.status === "done").length;
+    const totalBlocked = sprint.tasks.filter((t) => t.status === "blocked").length;
+
+    try {
+      await pi.sendUserMessage(
+        `All ${sprint.tasks.length} sprint tasks are finished (${totalDone} done, ${totalBlocked} blocked).\n` +
+        `1. Run \`agile_discover\` to scan the codebase for remaining issues (check scripts + scout subagent)\n` +
+        `2. Review results against project constraints (scope, max tasks from .agile/project.yaml)\n` +
+        `3. Create tasks for the next sprint via \`bd create\` with clear acceptance criteria\n` +
+        `4. Call \`agile_start_sprint\` to initialize the next sprint, or end here`,
+        { deliverAs: "followUp" }
+      );
+    } catch { /* best effort */ }
+  });
+
   // -----------------------------------------------------------------------
   // Tools
   // -----------------------------------------------------------------------
@@ -1717,8 +1747,13 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         runtime.store.save(workDir, sprint);
 
         // Run observer after task transition
-        const _observerSteers = runSprintObserver(sprint, runtime.observerState, DEFAULT_OBSERVER_CONFIG, workDir);
-        // Observer steers are advisory for the agent — verdict is the primary output
+        const transitionSteers = runSprintObserver(sprint, runtime.observerState, DEFAULT_OBSERVER_CONFIG, workDir);
+        // Deliver observer steers (e.g. all_tasks_exhausted → run agile_discover) as follow-ups
+        for (const steer of transitionSteers) {
+          try {
+            await pi.sendUserMessage(steer.message, { deliverAs: "followUp" });
+          } catch { /* best effort */ }
+        }
       }
 
       // 7. Format verdict for agent
