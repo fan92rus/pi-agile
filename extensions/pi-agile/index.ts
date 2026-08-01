@@ -262,32 +262,6 @@ function extractProjectMeta(project: Record<string, unknown> | null): {
   };
 }
 
-/**
- * True when the project requirements (goal + constraints) say to keep
- * finding new tasks/work between sprints. Matches intent markers in
- * Russian and English; falls back to a config flag `discover_new_tasks`.
- */
-function hasDiscoverNewRequirement(workDir: string): boolean {
-  const project = loadProjectConfig(workDir);
-  const meta = extractProjectMeta(project);
-  const constraints = loadConstraintsText(workDir);
-  const text = `${meta.goal}\n${constraints}`.toLowerCase();
-
-  const markers = [
-    // Russian
-    "искать нов", "найти нов", "новые задач", "новую задач", "новых задач",
-    "продолжай искать", "продолжать искать", "постоянно искать",
-    // English
-    "find new", "new task", "new tasks", "search for new", "discover new",
-    "keep looking", "continue finding", "continuously improve",
-  ];
-  if (markers.some((m) => text.includes(m))) return true;
-
-  // Explicit config flag as an escape hatch
-  const config = loadAgileConfig(workDir);
-  return config.discover_new_tasks === true;
-}
-
 // ---------------------------------------------------------------------------
 // Shell + Git helpers (via pi.exec)
 // ---------------------------------------------------------------------------
@@ -952,6 +926,8 @@ interface AgileRuntime {
   observerConfig: ObserverConfig;
   knowledge: KnowledgeBase;
   store: SprintStore;
+  /** Original user request from /agile run [count] [description...] — the agent judges continuation intent from it. */
+  originalRequest: string;
 }
 
 function createRuntime(events: unknown): AgileRuntime {
@@ -963,6 +939,7 @@ function createRuntime(events: unknown): AgileRuntime {
     rpc: null,
     observerState: createObserverState(),
     observerConfig: { ...DEFAULT_OBSERVER_CONFIG },
+    originalRequest: "",
     knowledge: new KnowledgeBase(),
     store: new SprintStore(),
   };
@@ -1284,19 +1261,29 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       runtime.remainingSprints === undefined || runtime.remainingSprints > 0;
     if (!hasSprintsLeft) return;
 
-    // Only when the project requirements ask to keep finding new tasks.
-    if (!hasDiscoverNewRequirement(workDir)) return;
+    // Ask the agent to judge continuation intent from the original request
+    // (stored from /agile run [count] [description...]) and the project goal.
+    const project = loadProjectConfig(workDir);
+    const meta = extractProjectMeta(project);
+    const originalRequest = runtime.originalRequest.trim();
 
     const totalDone = sprint.tasks.filter((t) => t.status === "done").length;
     const totalBlocked = sprint.tasks.filter((t) => t.status === "blocked").length;
 
     try {
+      const intentLines = originalRequest
+        ? `Original user request: ${originalRequest}`
+        : `Project goal: ${meta.goal}`;
       await pi.sendUserMessage(
         `All ${sprint.tasks.length} sprint tasks are finished (${totalDone} done, ${totalBlocked} blocked).\n` +
+        `Sprints remain — decide whether to continue finding new work.\n` +
+        `${intentLines}\n\n` +
+        `If the original request implies continuing (e.g. improving further, fixing more issues, exploring more areas):\n` +
         `1. Run \`agile_discover\` to scan the codebase for remaining issues (check scripts + scout subagent)\n` +
         `2. Review results against project constraints (scope, max tasks from .agile/project.yaml)\n` +
         `3. Create tasks for the next sprint via \`bd create\` with clear acceptance criteria\n` +
-        `4. Call \`agile_start_sprint\` to initialize the next sprint, or end here`,
+        `4. Call \`agile_start_sprint\` to initialize the next sprint\n\n` +
+        `If the original request is fully satisfied — end here (no new tasks needed).`,
         { deliverAs: "followUp" }
       );
     } catch { /* best effort */ }
@@ -2418,6 +2405,7 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
 
         // If description provided → goal/constraints setup phase (always refill)
         if (description.trim()) {
+          runtime.originalRequest = description.trim();
           // Don't start sprint loop yet — agent must fill goal/constraints first
           runtime.sprintLoopActive = false;
           ctx.ui.notify(`📋 Setting sprint goal: "${description.slice(0, 80)}${description.length > 80 ? "…" : ""}"`, "info");

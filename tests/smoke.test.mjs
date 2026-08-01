@@ -398,37 +398,26 @@ No hardcoded secrets`;
   assert.ok(descMatch[1].includes("Replace hardcoded"));
 });
 
-// ── index.ts: hasDiscoverNewRequirement markers ──────────────────────
-console.log("\n## index.ts: hasDiscoverNewRequirement");
+// ── index.ts: agent_end continuation intent ──────────────────────────
+console.log("\n## index.ts: agent_end continuation intent");
 
-// The function isn't exported (index.ts needs pi runtime), test the marker
-// logic inline by re-implementing the same matching.
-function markerMatch(text) {
-  const markers = [
-    // Russian
-    "искать нов", "найти нов", "новые задач", "новую задач", "новых задач",
-    "продолжай искать", "продолжать искать", "постоянно искать",
-    // English
-    "find new", "new task", "new tasks", "search for new", "discover new",
-    "keep looking", "continue finding", "continuously improve",
-  ];
-  return markers.some((m) => text.includes(m));
+// Logic under test: agent_end followUp uses originalRequest when present,
+// falls back to project goal otherwise. Re-implement the line selection.
+function intentLine(originalRequest, goal) {
+  return originalRequest.trim()
+    ? `Original user request: ${originalRequest}`
+    : `Project goal: ${goal}`;
 }
 
-await test("hasDiscoverNewRequirement: Russian marker in goal", () => {
-  assert.ok(markerMatch("постоянно искать новые задачи в кодовой базе".toLowerCase()));
+await test("agent_end intent: originalRequest wins when present", () => {
+  const line = intentLine("Improve performance of the parser", "Improve code quality");
+  assert.ok(line.includes("Original user request: Improve performance"));
+  assert.ok(!line.includes("Project goal"));
 });
 
-await test("hasDiscoverNewRequirement: English marker in constraints", () => {
-  assert.ok(markerMatch("Always find new tasks to improve quality".toLowerCase()));
-});
-
-await test("hasDiscoverNewRequirement: default goal is NOT a match", () => {
-  assert.ok(!markerMatch("Improve code quality and fix issues".toLowerCase()));
-});
-
-await test("hasDiscoverNewRequirement: unrelated text is NOT a match", () => {
-  assert.ok(!markerMatch("Fix the auth module and add tests for login".toLowerCase()));
+await test("agent_end intent: falls back to project goal when no request", () => {
+  const line = intentLine("", "Improve code quality and fix issues");
+  assert.ok(line.includes("Project goal: Improve code quality"));
 });
 
 // ── Summary ──────────────────────────────────────────────────────
