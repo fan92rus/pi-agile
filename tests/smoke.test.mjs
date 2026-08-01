@@ -494,6 +494,26 @@ await test("open bd tasks: empty when all open tasks are in sprint", () => {
   assert.deepStrictEqual(parseOpenBdTasks(out, ["pi-autoresearch-22i"]), []);
 });
 
+// toStringArray: YAML scope include/exclude may be a single string or a list.
+function toStringArray(value, fallback) {
+  if (Array.isArray(value)) return value.filter((v) => typeof v === "string");
+  if (typeof value === "string" && value.trim() !== "") return [value];
+  return fallback;
+}
+
+await test("toStringArray: string becomes single-element array", () => {
+  assert.deepStrictEqual(toStringArray("src/**", ["src/**"]), ["src/**"]);
+});
+
+await test("toStringArray: array passes through, non-strings filtered", () => {
+  assert.deepStrictEqual(toStringArray(["a", 1, "b"], []), ["a", "b"]);
+});
+
+await test("toStringArray: undefined/empty falls back", () => {
+  assert.deepStrictEqual(toStringArray(undefined, ["src/**"]), ["src/**"]);
+  assert.deepStrictEqual(toStringArray("", ["src/**"]), ["src/**"]);
+});
+
 // ── Summary ──────────────────────────────────────────────────────
 console.log(`\n# Results: ${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

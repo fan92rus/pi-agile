@@ -246,7 +246,14 @@ function extractScope(project: Record<string, unknown> | null): string[] {
   if (!project) return ["src/**"];
   const p = project.project as Record<string, unknown> | undefined;
   const scope = p?.scope as Record<string, unknown> | undefined;
-  return (scope?.include as string[]) ?? ["src/**"];
+  return toStringArray(scope?.include, "src/**");
+}
+
+/** Coerce a YAML value that may be a string or an array into a string[]. */
+function toStringArray(value: unknown, fallback: string[]): string[] {
+  if (Array.isArray(value)) return value.filter((v): v is string => typeof v === "string");
+  if (typeof value === "string" && value.trim() !== "") return [value];
+  return fallback;
 }
 
 function extractProjectMeta(project: Record<string, unknown> | null): {
@@ -1232,8 +1239,9 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
 
     extra += `\n## Project Goal\n${meta.goal}\n`;
     extra += `\n## Scope\nInclude: ${scope.join(", ")}\n`;
-    const exclude = ((project.project as Record<string, unknown>)?.scope as Record<string, unknown>)?.exclude as string[];
-    if (exclude) extra += `Exclude: ${exclude.join(", ")}\n`;
+    const rawScope = (project.project as Record<string, unknown>)?.scope as Record<string, unknown> | undefined;
+    const exclude = toStringArray(rawScope?.exclude, []);
+    if (exclude.length > 0) extra += `Exclude: ${exclude.join(", ")}\n`;
 
     if (constraints) extra += `\n## Constraints (MUST follow)\n${constraints}\n`;
     if (knowledgeText) extra += `\n## Knowledge from Previous Sprints\n${knowledgeText}\n`;
