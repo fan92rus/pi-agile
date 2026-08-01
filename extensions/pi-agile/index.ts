@@ -1265,19 +1265,19 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     // (stored from /agile run [count] [description...]) and the project goal.
     const project = loadProjectConfig(workDir);
     const meta = extractProjectMeta(project);
-    const originalRequest = runtime.originalRequest.trim();
 
     const totalDone = sprint.tasks.filter((t) => t.status === "done").length;
     const totalBlocked = sprint.tasks.filter((t) => t.status === "blocked").length;
 
     try {
-      const intentLines = originalRequest
-        ? `Original user request: ${originalRequest}`
-        : `Project goal: ${meta.goal}`;
+      const contextLines = [`Project goal: ${meta.goal}`];
+      if (runtime.originalRequest.trim()) {
+        contextLines.push(`Original user request: ${runtime.originalRequest.trim()}`);
+      }
       await pi.sendUserMessage(
         `All ${sprint.tasks.length} sprint tasks are finished (${totalDone} done, ${totalBlocked} blocked).\n` +
         `Sprints remain — decide whether to continue finding new work.\n` +
-        `${intentLines}\n\n` +
+        `${contextLines.join("\n")}\n\n` +
         `If the original request implies continuing (e.g. improving further, fixing more issues, exploring more areas):\n` +
         `1. Run \`agile_discover\` to scan the codebase for remaining issues (check scripts + scout subagent)\n` +
         `2. Review results against project constraints (scope, max tasks from .agile/project.yaml)\n` +

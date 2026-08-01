@@ -401,23 +401,29 @@ No hardcoded secrets`;
 // ── index.ts: agent_end continuation intent ──────────────────────────
 console.log("\n## index.ts: agent_end continuation intent");
 
-// Logic under test: agent_end followUp uses originalRequest when present,
-// falls back to project goal otherwise. Re-implement the line selection.
-function intentLine(originalRequest, goal) {
-  return originalRequest.trim()
-    ? `Original user request: ${originalRequest}`
-    : `Project goal: ${goal}`;
+// Logic under test: agent_end followUp always shows the project goal and
+// appends the original request when one was given. Re-implement the logic.
+function buildContextLines(originalRequest, goal) {
+  const lines = [`Project goal: ${goal}`];
+  if (originalRequest.trim()) {
+    lines.push(`Original user request: ${originalRequest}`);
+  }
+  return lines;
 }
 
-await test("agent_end intent: originalRequest wins when present", () => {
-  const line = intentLine("Improve performance of the parser", "Improve code quality");
-  assert.ok(line.includes("Original user request: Improve performance"));
-  assert.ok(!line.includes("Project goal"));
+await test("agent_end context: shows goal and original request", () => {
+  const lines = buildContextLines("Improve performance of the parser", "Improve code quality");
+  const joined = lines.join("\n");
+  assert.ok(joined.includes("Project goal: Improve code quality"));
+  assert.ok(joined.includes("Original user request: Improve performance"));
+  assert.strictEqual(lines.length, 2);
 });
 
-await test("agent_end intent: falls back to project goal when no request", () => {
-  const line = intentLine("", "Improve code quality and fix issues");
-  assert.ok(line.includes("Project goal: Improve code quality"));
+await test("agent_end context: goal only when no original request", () => {
+  const lines = buildContextLines("", "Improve code quality and fix issues");
+  const joined = lines.join("\n");
+  assert.ok(joined.includes("Project goal: Improve code quality"));
+  assert.strictEqual(lines.length, 1);
 });
 
 // ── Summary ──────────────────────────────────────────────────────
