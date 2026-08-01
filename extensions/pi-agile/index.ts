@@ -132,6 +132,16 @@ function getSpawnTimeout(workDir: string): number {
   return 1_800_000;
 }
 
+/** Read worker_stuck_timeout from .agile/config.json, default 30min (1800000ms).
+ * If a subagent shows NO activity (no tool calls, no output writes) for this long,
+ * pollWithProgress interrupts and force-stops it instead of waiting forever. */
+function getStuckTimeout(workDir: string): number {
+  const config = loadAgileConfig(workDir);
+  const raw = config.worker_stuck_timeout;
+  if (typeof raw === "number" && raw >= 60_000) return raw;
+  return 1_800_000;
+}
+
 /** Write progress to .agile/batch-progress.json during parallel execution. */
 function writeBatchProgress(workDir: string, data: { tasks: { bdId: string; round: number; stage: string; status: string }[] }): void {
   try {
@@ -371,25 +381,81 @@ function extractConflictedFiles(text: string): string[] {
   return files;
 }
 
-/** Remove stale git worktrees left from crashed/aborted batch runs. Returns count removed. */
+/**
+ * Worktrees younger than this are never considered stale: a parallel batch may
+ * still be running (its workers may legitimately not have written anything to
+ * .agile yet, e.g. during checkout/build, or they run long PBT tasks). Deleting
+ * a live batch's worktree leaves the worker in a folder without a .git file
+ * ("not a git repository") and breaks commit/merge machinery.
+ */
+const WORKTREE_MIN_AGE_MS = 24 * 60 * 60 * 1000; // 24h
+
+/**
+ * A worktree whose .agile directory was touched within this window is treated
+ * as live — a running worker writes worker-<bdId>-r<N>.txt / review-*.txt there.
+ */
+const WORKTREE_ACTIVITY_WINDOW_MS = 6 * 60 * 60 * 1000; // 6h
+
+function safeMtimeMs(p: string): number {
+  try {
+    return fs.statSync(p).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/** True when any file in <worktree>/.agile was modified within the activity window. */
+function hasRecentAgileActivity(wtPath: string, now: number): boolean {
+  const agileDir = path.join(wtPath, ".agile");
+  let names: string[];
+  try {
+    names = fs.readdirSync(agileDir);
+  } catch {
+    return false;
+  }
+  for (const name of names) {
+    try {
+      if (now - fs.statSync(path.join(agileDir, name)).mtimeMs < WORKTREE_ACTIVITY_WINDOW_MS) return true;
+    } catch {}
+  }
+  return false;
+}
+
+/**
+ * Remove stale git worktrees left from crashed/aborted batch runs. Returns count removed.
+ *
+ * Guards (a worktree is skipped, never deleted, when):
+ *   1. the worktree folder is younger than WORKTREE_MIN_AGE_MS — a fresh worktree
+ *      belongs to a batch that may still be running;
+ *   2. its .agile directory contains files modified within WORKTREE_ACTIVITY_WINDOW_MS
+ *      — a live worker is writing reports there.
+ * Both conditions together mean "definitely dead" before anything is removed.
+ */
 function cleanupStaleWorktrees(workDir: string): number {
   let removed = 0;
   try {
     const listPath = path.join(workDir, ".git", "worktrees");
     if (!fs.existsSync(listPath)) return 0;
+    const now = Date.now();
     const entries = fs.readdirSync(listPath);
     for (const entry of entries) {
       const wtGitDir = path.join(listPath, entry);
       const gitdirFile = path.join(wtGitDir, "gitdir");
       if (!fs.existsSync(gitdirFile)) continue;
       const wtPath = fs.readFileSync(gitdirFile, "utf8").trim().replace(/\/\s*$/, "");
-      if (wtPath && wtPath !== workDir && fs.existsSync(wtPath)) {
-        try {
-          fs.rmSync(wtGitDir, { recursive: true, force: true });
-          fs.rmSync(wtPath, { recursive: true, force: true });
-          removed++;
-        } catch {}
-      }
+      if (!wtPath || wtPath === workDir || !fs.existsSync(wtPath)) continue;
+
+      // Guard 1: freshly-created worktree — likely a live batch.
+      if (now - safeMtimeMs(wtPath) < WORKTREE_MIN_AGE_MS) continue;
+
+      // Guard 2: recent .agile activity — a worker is (or recently was) running.
+      if (hasRecentAgileActivity(wtPath, now)) continue;
+
+      try {
+        fs.rmSync(wtGitDir, { recursive: true, force: true });
+        fs.rmSync(wtPath, { recursive: true, force: true });
+        removed++;
+      } catch {}
     }
   } catch {}
   return removed;
@@ -738,17 +804,34 @@ async function executeBatchTasks(
 
   // Read all task details from bd
   const tasks: { bdId: string; meta: { title: string; description: string; acceptanceCriteria?: string } }[] = [];
+  const failed: string[] = [];
   for (const bdId of bdIds) {
     const bdOutput = await execText(pi, "bd", ["show", bdId], workDir, 10_000);
     const parsed = parseBdShow(bdOutput);
+    const title = parsed.title && parsed.title !== `(task ${bdId})` ? parsed.title : undefined;
+    if (!title) {
+      failed.push(bdId);
+      continue;
+    }
     tasks.push({
       bdId,
       meta: {
-        title: parsed.title ?? `(task ${bdId})`,
+        title,
         description: parsed.description ?? "",
         acceptanceCriteria: parsed.acceptanceCriteria,
       },
     });
+  }
+
+  // Level A guard: refuse to spawn workers with empty task details. A worker
+  // with no title/description (e.g. bd database missing in workDir) wastes the
+  // whole run — it has nothing concrete to implement and may hang forever.
+  if (failed.length > 0) {
+    return {
+      content: [{ type: "text" as const, text: `\u274c Batch aborted: could not read task details for ${failed.join(", ")} — ` +
+        `bd show returned no title (missing .beads database in ${workDir}?). ` +
+        `No workers were spawned. Fix the bd database location or task ids, then retry.` }],
+    };
   }
 
   //
@@ -885,6 +968,13 @@ async function pollWithProgress(
   // maxWaitSeconds <= 0 means unlimited — poll until terminal state
   const maxAttempts = maxWaitSeconds > 0 ? Math.ceil(maxWaitSeconds / (pollInterval / 1000)) : Number.MAX_SAFE_INTEGER;
 
+  // Level B guard: if the subagent shows no activity (no tool calls / output
+  // writes) for worker_stuck_timeout (default 30min), interrupt then force-stop
+  // it instead of waiting forever. A healthy worker updates lastActivityAt on
+  // every tool call; an idle one hangs the whole batch.
+  const stuckTimeoutMs = getStuckTimeout(workDir);
+  let lastActivityWarningShown = false;
+
   while (attempts < maxAttempts) {
     await new Promise((r) => setTimeout(r, pollInterval));
     attempts++;
@@ -896,8 +986,9 @@ async function pollWithProgress(
     }
 
     // Check 2: rpc.status()
+    let status: { state?: string; lastActivityAt?: number } | null = null;
     try {
-      const status = (await rpc.status(runId, 3000)) as { state?: string } | null;
+      status = (await rpc.status(runId, 3000)) as { state?: string; lastActivityAt?: number } | null;
       if (status?.state === "completed" || status?.state === "stopped" || status?.state === "failed") {
         onUpdate?.({ content: [{ type: "text", text: `${role} finished (state: ${status.state})` }] });
         // Give output file a moment to flush
@@ -909,6 +1000,29 @@ async function pollWithProgress(
       }
     } catch {
       // rpc.status failed — ignore, loop continues with file check
+    }
+
+    // Check 3: Level B — stuck detection via lastActivityAt (only while running)
+    if (status?.state === "running" && typeof status.lastActivityAt === "number") {
+      const idleMs = Date.now() - status.lastActivityAt;
+      if (idleMs > stuckTimeoutMs) {
+        onUpdate?.({ content: [{ type: "text", text: `⏱ ${role} idle for ${Math.round(idleMs / 60000)}m (> ${Math.round(stuckTimeoutMs / 60000)}m) — interrupting stuck worker` }] });
+        try { await rpc.interrupt(runId, 5000); } catch {}
+        // Give it a moment to finish the current turn after interrupt
+        for (let w = 0; w < 6; w++) {
+          await new Promise((r) => setTimeout(r, 5000));
+          const s2 = (await rpc.status(runId, 3000)) as { state?: string } | null;
+          if (s2?.state === "stopped" || s2?.state === "failed" || s2?.state === "completed") break;
+          if (fs.existsSync(outputFile)) break;
+        }
+        try { await rpc.stop(runId, 5000); } catch {}
+        onUpdate?.({ content: [{ type: "text", text: `⏱ ${role} force-stopped after ${Math.round(idleMs / 60000)}m of inactivity. Check task description / bd database.` }] });
+        return false;
+      }
+      if (idleMs > stuckTimeoutMs / 2 && !lastActivityWarningShown) {
+        lastActivityWarningShown = true;
+        onUpdate?.({ content: [{ type: "text", text: `⏳ ${role} has been idle ${Math.round(idleMs / 60000)}m — will force-stop after ${Math.round(stuckTimeoutMs / 60000)}m of inactivity` }] });
+      }
     }
 
     // Progress update every ~15s
@@ -1634,9 +1748,19 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       if (!title) {
         const bdOutput = await execText(pi, "bd", ["show", bdId], workDir, 10_000);
         const parsed = parseBdShow(bdOutput);
-        title = parsed.title ?? `(task ${bdId})`;
+        title = parsed.title && parsed.title !== `(task ${bdId})` ? parsed.title : undefined;
         description = parsed.description ?? description;
         acceptanceCriteria = parsed.acceptanceCriteria;
+      }
+      // Level A guard: refuse to spawn a worker with empty task details (missing
+      // .beads database in workDir). A worker with no concrete task hangs or
+      // fabricates work — better to fail fast before spawning.
+      if (!title) {
+        return {
+          content: [{ type: "text" as const, text: `\u274c Delegate aborted: could not read task details for ${bdId} — ` +
+            `bd show returned no title (missing .beads database in ${workDir}?). ` +
+            `No worker was spawned. Fix the bd database location or task id, then retry.` }],
+        };
       }
       const branch = `feat/${bdId}`;
 

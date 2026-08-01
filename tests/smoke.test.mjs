@@ -398,6 +398,57 @@ No hardcoded secrets`;
   assert.ok(descMatch[1].includes("Replace hardcoded"));
 });
 
+// ── index.ts: Level A guard (refuse empty task details) ──────────────
+console.log("\n## index.ts: Level A guard");
+
+// Level A: before spawning a worker, the title must be real (not the
+// `(task <id>)` fallback). Re-implement the guard inline.
+function resolveTaskTitle(parsed, bdId) {
+  const title = parsed.title && parsed.title !== `(task ${bdId})` ? parsed.title : undefined;
+  return title ?? null; // null = refused
+}
+
+await test("Level A: real title passes guard", () => {
+  const title = resolveTaskTitle({ title: "Add config tests" }, "pi-agile-x1");
+  assert.strictEqual(title, "Add config tests");
+});
+
+await test("Level A: missing title refused (no worker spawned)", () => {
+  const title = resolveTaskTitle({}, "pi-agile-x2");
+  assert.strictEqual(title, null);
+});
+
+await test("Level A: fallback title refused (bd show failed)", () => {
+  const title = resolveTaskTitle({ title: "(task pi-agile-x3)" }, "pi-agile-x3");
+  assert.strictEqual(title, null);
+});
+
+// ── index.ts: Level B stuck detection (idle worker force-stop) ───────
+console.log("\n## index.ts: Level B stuck detection");
+
+// Level B: a running worker whose lastActivityAt is older than
+// worker_stuck_timeout (default 30min) is treated as stuck.
+function isStuck(status, stuckTimeoutMs) {
+  if (status?.state !== "running" || typeof status.lastActivityAt !== "number") return false;
+  return Date.now() - status.lastActivityAt > stuckTimeoutMs;
+}
+
+await test("Level B: active worker (recent activity) is not stuck", () => {
+  const status = { state: "running", lastActivityAt: Date.now() - 60_000 };
+  assert.strictEqual(isStuck(status, 1_800_000), false);
+});
+
+await test("Level B: idle worker (>30m) is stuck", () => {
+  const status = { state: "running", lastActivityAt: Date.now() - 2_000_000 };
+  assert.strictEqual(isStuck(status, 1_800_000), true);
+});
+
+await test("Level B: non-running / no activity data never stuck", () => {
+  assert.strictEqual(isStuck({ state: "completed" }, 1_800_000), false);
+  assert.strictEqual(isStuck({ state: "running" }, 1_800_000), false);
+  assert.strictEqual(isStuck(null, 1_800_000), false);
+});
+
 // ── index.ts: agent_end continuation intent ──────────────────────────
 console.log("\n## index.ts: agent_end continuation intent");
 
@@ -561,6 +612,45 @@ await test("effectiveGoal: falls back to project goal when param empty", () => {
 
 await test("effectiveGoal: empty when nothing provided", () => {
   assert.strictEqual(effectiveGoal(undefined, ""), "");
+});
+
+// ── index.ts: cleanupStaleWorktrees guards ────────────────────────────
+console.log("\n## index.ts: cleanupStaleWorktrees guards");
+
+// A worktree is stale only when BOTH: it is older than MIN_AGE (24h) AND it has
+// no .agile file modified within the activity window (6h). Fresh worktrees and
+// worktrees with a live worker must never be deleted.
+const WT_MIN_AGE_MS = 24 * 60 * 60 * 1000;
+const WT_ACTIVITY_MS = 6 * 60 * 60 * 1000;
+
+function isStaleWorktree(now, wtMtimeMs, recentAgileMtimeMs) {
+  if (now - wtMtimeMs < WT_MIN_AGE_MS) return false; // guard 1: too fresh
+  if (recentAgileMtimeMs !== null && now - recentAgileMtimeMs < WT_ACTIVITY_MS) return false; // guard 2: live worker
+  return true;
+}
+
+await test("worktree: fresh worktree (<24h) never stale, even without .agile", () => {
+  const now = Date.now();
+  assert.strictEqual(isStaleWorktree(now, now - 2 * 60 * 60 * 1000, null), false);
+});
+
+await test("worktree: old worktree with no .agile is stale (crashed batch left it)", () => {
+  const now = Date.now();
+  assert.strictEqual(isStaleWorktree(now, now - 48 * 60 * 60 * 1000, null), true);
+});
+
+await test("worktree: old worktree with recently touched .agile is live (worker running)", () => {
+  const now = Date.now();
+  const oldWt = now - 48 * 60 * 60 * 1000;
+  const recentAgile = now - 10 * 60 * 1000; // 10 min ago
+  assert.strictEqual(isStaleWorktree(now, oldWt, recentAgile), false);
+});
+
+await test("worktree: old worktree with old .agile is stale", () => {
+  const now = Date.now();
+  const oldWt = now - 48 * 60 * 60 * 1000;
+  const oldAgile = now - 48 * 60 * 60 * 1000;
+  assert.strictEqual(isStaleWorktree(now, oldWt, oldAgile), true);
 });
 
 // ── Summary ──────────────────────────────────────────────────────
