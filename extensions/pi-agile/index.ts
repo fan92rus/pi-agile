@@ -246,7 +246,7 @@ function extractScope(project: Record<string, unknown> | null): string[] {
   if (!project) return ["src/**"];
   const p = project.project as Record<string, unknown> | undefined;
   const scope = p?.scope as Record<string, unknown> | undefined;
-  return toStringArray(scope?.include, "src/**");
+  return toStringArray(scope?.include, ["src/**"]);
 }
 
 /** Coerce a YAML value that may be a string or an array into a string[]. */

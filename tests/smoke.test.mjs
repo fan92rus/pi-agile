@@ -514,6 +514,36 @@ await test("toStringArray: undefined/empty falls back", () => {
   assert.deepStrictEqual(toStringArray("", ["src/**"]), ["src/**"]);
 });
 
+// extractScope: must ALWAYS return a real array (join() is called on it),
+// even when project.yaml has no scope.include at all.
+function extractScope(project) {
+  if (!project) return ["src/**"];
+  const p = project.project;
+  const scope = p?.scope;
+  return toStringArray(scope?.include, ["src/**"]);
+}
+
+await test("extractScope: no scope.include in yaml → array fallback, join works", () => {
+  const project = { project: { name: "x", goal: "g" } }; // no scope at all
+  const scope = extractScope(project);
+  assert.ok(Array.isArray(scope));
+  assert.strictEqual(scope.join(", "), "src/**");
+});
+
+await test("extractScope: include as string → array, join works", () => {
+  const project = { project: { scope: { include: "src/**" } } };
+  const scope = extractScope(project);
+  assert.ok(Array.isArray(scope));
+  assert.strictEqual(scope.join(", "), "src/**");
+});
+
+await test("extractScope: include as array → array, join works", () => {
+  const project = { project: { scope: { include: ["src/**", "tests/**"] } } };
+  const scope = extractScope(project);
+  assert.ok(Array.isArray(scope));
+  assert.strictEqual(scope.join(", "), "src/**, tests/**");
+});
+
 // ── Summary ──────────────────────────────────────────────────────
 console.log(`\n# Results: ${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);
