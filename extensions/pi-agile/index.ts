@@ -1335,6 +1335,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     label: "agile_discover",
     description: "Run codebase discovery: check scripts (lint/coverage/todos) + scout subagent analysis. Returns raw output for the agent to analyze and decide which findings become tasks.",
     parameters: Type.Object({
+      goal: Type.Optional(Type.String({ description: "Discovery goal — what to look for. Overrides the project goal for this call only (project.yaml is not modified). Falls back to the project goal." })),
       scope: Type.Optional(Type.Array(Type.String(), { description: "Glob patterns to scan. Defaults to project scope." })),
       skip_scout: Type.Optional(Type.Boolean({ description: "Skip the scout subagent (only run check scripts). Default: false." })),
       cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })),
@@ -1347,6 +1348,8 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       const project = loadProjectConfig(workDir);
       const scope = (params.scope as string[]) ?? extractScope(project);
       const skipScout = (params.skip_scout as boolean) ?? false;
+      // Effective goal: per-call override wins, otherwise the project goal.
+      const goal = (params.goal as string | undefined)?.trim() || extractProjectMeta(project).goal || "";
 
       // 1. Run check scripts (lint, coverage, todos)
       const result = await runDiscovery(workDir, scope);
@@ -1375,12 +1378,11 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       let scoutBlock = "";
       if (!skipScout) {
         try {
-          const meta = extractProjectMeta(project);
           const kb = new KnowledgeBase();
           kb.load(workDir);
           const constraintsText = loadConstraintsText(workDir);
           const patternsText = kb.formatPatterns();
-          const scoutTask = buildDiscoveryScoutTask(workDir, meta.goal || "", constraintsText, patternsText, scope);
+          const scoutTask = buildDiscoveryScoutTask(workDir, goal, constraintsText, patternsText, scope);
           const scoutOutput = path.join(workDir, ".agile", "scout-output.txt");
           const spawnTimeout = getSpawnTimeout(workDir);
 
@@ -1420,7 +1422,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       }
 
       return {
-        content: [{ type: "text" as const, text: `# Discovery Results\n\n${missingBlock}${text}${scoutBlock}` }],
+        content: [{ type: "text" as const, text: `# Discovery Results\n\n## Discovery Goal\n${goal || "(not specified)"}\n\n${missingBlock}${text}${scoutBlock}` }],
         details: { scriptsFound: result.scriptsFound, metricCount: Object.keys(result.metrics).length, scoutRan: !skipScout && !scoutBlock.startsWith("\n\n## Scout Analysis\n⚠") },
       };
     },

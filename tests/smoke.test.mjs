@@ -544,6 +544,25 @@ await test("extractScope: include as array → array, join works", () => {
   assert.strictEqual(scope.join(", "), "src/**, tests/**");
 });
 
+// Effective discovery goal: per-call override wins, otherwise project goal.
+function effectiveGoal(paramGoal, projectGoal) {
+  return (paramGoal ?? "").trim() || projectGoal || "";
+}
+
+await test("effectiveGoal: param override wins", () => {
+  assert.strictEqual(effectiveGoal("Find performance issues", "Improve code quality"), "Find performance issues");
+});
+
+await test("effectiveGoal: falls back to project goal when param empty", () => {
+  assert.strictEqual(effectiveGoal("", "Improve code quality"), "Improve code quality");
+  assert.strictEqual(effectiveGoal(undefined, "Improve code quality"), "Improve code quality");
+  assert.strictEqual(effectiveGoal("   ", "Improve code quality"), "Improve code quality");
+});
+
+await test("effectiveGoal: empty when nothing provided", () => {
+  assert.strictEqual(effectiveGoal(undefined, ""), "");
+});
+
 // ── Summary ──────────────────────────────────────────────────────
 console.log(`\n# Results: ${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);
