@@ -928,6 +928,8 @@ interface AgileRuntime {
   store: SprintStore;
   /** Original user request from /agile run [count] [description...] — the agent judges continuation intent from it. */
   originalRequest: string;
+  /** Sprint id for which the agent_end discovery followUp was already sent (prevents spam per sprint). */
+  agentEndSentForSprint: number | null;
 }
 
 function createRuntime(events: unknown): AgileRuntime {
@@ -940,6 +942,7 @@ function createRuntime(events: unknown): AgileRuntime {
     observerState: createObserverState(),
     observerConfig: { ...DEFAULT_OBSERVER_CONFIG },
     originalRequest: "",
+    agentEndSentForSprint: null,
     knowledge: new KnowledgeBase(),
     store: new SprintStore(),
   };
@@ -1249,11 +1252,16 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     const sprint = runtime.store.getCurrent(workDir);
     if (!sprint) return; // No active sprint
 
-    // Only when sprint is active (not completed) and all tasks are terminal
-    if (sprint.status !== "active") return;
+    // Only when sprint is not yet completed and all tasks are terminal.
+    // NOTE: sprints are created as "planning" and finished as "done" —
+    // there is no "active" transition, so check against "done" only.
+    if (sprint.status === "done") return;
     const pending = sprint.tasks.filter((t) => t.status !== "done" && t.status !== "blocked");
     if (pending.length > 0) return;
     if (sprint.tasks.length === 0) return;
+
+    // Already nudged the agent for this sprint — don't spam on every agent_end.
+    if (runtime.agentEndSentForSprint === sprint.id) return;
 
     // More sprints ahead? Only then is finding new work meaningful.
     // remainingSprints === undefined means continuous mode (unlimited).
@@ -1286,6 +1294,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         `If the original request is fully satisfied — end here (no new tasks needed).`,
         { deliverAs: "followUp" }
       );
+      runtime.agentEndSentForSprint = sprint.id;
     } catch { /* best effort */ }
   });
 
@@ -1529,6 +1538,8 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       }
 
       runtime.currentSprintId = sprintId;
+      // New sprint — allow the agent_end discovery nudge to fire again
+      runtime.agentEndSentForSprint = null;
 
       return {
         content: [{

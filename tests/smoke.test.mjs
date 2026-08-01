@@ -426,6 +426,48 @@ await test("agent_end context: goal only when no original request", () => {
   assert.strictEqual(lines.length, 1);
 });
 
+// agent_end guard conditions: sprints never become "active" (only planning/done),
+// so the guard must be against "done", and the anti-spam flag must gate repeats.
+function agentEndShouldFire(sprintStatus, tasks, sentForSprint, sprintId) {
+  if (sprintStatus === "done") return false;
+  const pending = tasks.filter((t) => t.status !== "done" && t.status !== "blocked");
+  if (pending.length > 0) return false;
+  if (tasks.length === 0) return false;
+  if (sentForSprint === sprintId) return false; // already nudged for this sprint
+  return true;
+}
+
+await test("agent_end fires for planning sprint with all terminal tasks", () => {
+  const tasks = [
+    { status: "done" },
+    { status: "blocked" },
+    { status: "done" },
+  ];
+  assert.ok(agentEndShouldFire("planning", tasks, null, 1));
+});
+
+await test("agent_end does NOT fire for completed sprint (status done)", () => {
+  const tasks = [{ status: "done" }];
+  assert.ok(!agentEndShouldFire("done", tasks, null, 1));
+});
+
+await test("agent_end does NOT fire when pending tasks remain", () => {
+  const tasks = [{ status: "done" }, { status: "in_progress" }];
+  assert.ok(!agentEndShouldFire("planning", tasks, null, 1));
+});
+
+await test("agent_end does NOT fire twice for the same sprint (anti-spam)", () => {
+  const tasks = [{ status: "done" }];
+  assert.ok(agentEndShouldFire("planning", tasks, null, 1));
+  assert.ok(!agentEndShouldFire("planning", tasks, 1, 1));
+});
+
+await test("agent_end fires again for a NEW sprint id", () => {
+  const tasks = [{ status: "done" }];
+  assert.ok(!agentEndShouldFire("planning", tasks, 1, 1)); // old sprint — no
+  assert.ok(agentEndShouldFire("planning", tasks, 1, 2)); // new sprint — yes
+});
+
 // ── Summary ──────────────────────────────────────────────────────
 console.log(`\n# Results: ${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);
