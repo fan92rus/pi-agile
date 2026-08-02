@@ -908,6 +908,10 @@ async function executeBatchTasks(
       lines.push("");
     }
   }
+  // Persist batch task-status transitions (markDone/markRework/markBlocked)
+  // to disk — without this save sprint-N.json keeps tasks: [] and agent_end
+  // (which loads the last sprint from disk) never fires after a batch run.
+  if (sprint) runtime.store.save(workDir, sprint);
 
   // Summary line
   lines.push("---");
@@ -1679,6 +1683,10 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
           status: "backlog",
         });
       }
+      // Persist tasks to disk — create() already saved an empty sprint,
+      // so without this save sprint-N.json keeps tasks: [] and agent_end
+      // (which loads the last sprint from disk) never fires.
+      runtime.store.save(workDir, sprint);
 
       runtime.currentSprintId = sprintId;
       // New sprint — allow the agent_end discovery nudge to fire again

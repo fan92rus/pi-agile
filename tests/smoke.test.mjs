@@ -653,6 +653,50 @@ await test("worktree: old worktree with old .agile is stale", () => {
   assert.strictEqual(isStaleWorktree(now, oldWt, oldAgile), true);
 });
 
+// ── sprint.ts: SprintStore persistence + workDir scoping ──────────
+// Regression: agile_start_sprint and batch delegation did not call
+// store.save() after adding/updating tasks, so sprint-N.json stayed
+// tasks: [] and agent_end (which loads the last sprint from disk)
+// never fired. Also getCurrent() leaked sprints across projects.
+// (SprintStore is already imported above.)
+
+async function withTempAgileDir(fn) {
+  const tmpDir = fs.mkdtempSync(path.join("..", ".smoke-"));
+  try {
+    return await fn(tmpDir);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+await test("sprint: addTask then save persists tasks to sprint-N.json", () => {
+  withTempAgileDir((workDir) => {
+    const store = new SprintStore();
+    const sprint = store.create(workDir, 1, "goal");
+    store.addTask(sprint, { bd_id: "abc", title: "T", status: "backlog" });
+    store.save(workDir, sprint); // the missing call in agile_start_sprint
+    const fromDisk = JSON.parse(fs.readFileSync(path.join(workDir, ".agile", "sprint-1.json"), "utf8"));
+    assert.strictEqual(fromDisk.tasks.length, 1);
+    assert.strictEqual(fromDisk.tasks[0].bd_id, "abc");
+    return null;
+  });
+});
+
+await test("sprint: getCurrent scoped by workDir — stale foreign sprint not reused", () => {
+  withTempAgileDir((dirA) => {
+    withTempAgileDir((dirB) => {
+      const store = new SprintStore();
+      store.create(dirA, 1, "goal A");
+      store.create(dirB, 1, "goal B");
+      const curB = store.getCurrent(dirB);
+      assert.ok(curB);
+      assert.strictEqual(curB.goal, "goal B");
+      return null;
+    });
+    return null;
+  });
+});
+
 // ── Summary ──────────────────────────────────────────────────────
 console.log(`\n# Results: ${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

@@ -50,12 +50,15 @@ function sprintFilePath(workDir: string, sprintId: number): string {
 
 export class SprintStore {
   private current: SprintState | null = null;
+  /** WorkDir of the in-memory sprint — getCurrent() refuses to reuse it across projects. */
+  private currentWorkDir: string | null = null;
 
   load(workDir: string, sprintId: number): SprintState | null {
     const filePath = sprintFilePath(workDir, sprintId);
     if (!fs.existsSync(filePath)) return null;
     try {
       this.current = JSON.parse(fs.readFileSync(filePath, "utf8")) as SprintState;
+      this.currentWorkDir = workDir;
       return this.current;
     } catch {
       return null;
@@ -68,6 +71,7 @@ export class SprintStore {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(filePath, JSON.stringify(state, null, 2), "utf8");
     this.current = state;
+    this.currentWorkDir = workDir;
   }
 
   create(workDir: string, id: number, goal: string): SprintState {
@@ -180,7 +184,13 @@ export class SprintStore {
   }
 
   getCurrent(workDir?: string): SprintState | null {
-    if (this.current) return this.current;
+    // If the in-memory sprint belongs to a different workDir, don't reuse it —
+    // agent_end may fire in a session that switched cwd between projects, and
+    // the stale sprint would either suppress the nudge (tasks from another
+    // repo) or leak a foreign sprint into the current one.
+    if (this.current && (!workDir || this.currentWorkDir === workDir)) {
+      return this.current;
+    }
     // Auto-restore from disk if workDir is provided
     if (workDir) {
       const lastId = this.findLastSprintId(workDir);
