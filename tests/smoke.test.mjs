@@ -157,6 +157,12 @@ await test("buildReviewerTask includes diff and dimensions", () => {
   assert.ok(task.includes("approved") || task.includes("rework"));
 });
 
+await test("buildReviewerTask includes acceptance criteria", () => {
+  const task = buildReviewerTask("Title", "Desc", "diff content", "constraints", "patterns", "deep", "AC: must handle empty input");
+  assert.ok(task.includes("Acceptance Criteria"), "reviewer prompt must have an Acceptance Criteria section");
+  assert.ok(task.includes("AC: must handle empty input"), "reviewer prompt must carry the acceptance criteria");
+});
+
 await test("parseReviewVerdict extracts JSON verdict", () => {
   const response = 'Some text\n```json\n{"status":"approved","dimensions":{},"action_items":[],"lessons":["learned"]}\n```\nMore text';
   const verdict = parseReviewVerdict(response);
@@ -1246,6 +1252,37 @@ await test("single delegate breaks the rework loop on approved", async () => {
     const task = sprint.tasks.find((t) => t.bd_id === "t1");
     assert.strictEqual(task.review_rounds, 2, "2 rounds recorded");
     assert.strictEqual(bridge.spawnLog.filter((s) => s.agent === "worker").length, 2, "2 worker spawns only");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("reviewer receives acceptance criteria from bd show (integration)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ac-"));
+  try {
+    const bridge = createFakeBridge({ verdictFor: () => "blocked" });
+    const { pi, tool, command } = createFakePi({
+      bdTasks: new Map([["t1", "Task t1"]]),
+      bdAC: new Map([["t1", "must handle empty input"]]),
+      bridge,
+    });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-ac");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    // No title/description params → the tool reads bd show → parseBdShow → AC
+    await tool("agile_delegate_task").execute("t", { bd_id: "t1" }, null, null, ctx);
+    const reviewerSpawns = bridge.spawnLog.filter((s) => s.agent === "reviewer");
+    assert.ok(reviewerSpawns.length === 1, "one reviewer spawn");
+    assert.ok(
+      /Acceptance Criteria/.test(reviewerSpawns[0].task),
+      "reviewer prompt must contain the Acceptance Criteria section",
+    );
+    assert.ok(
+      /must handle empty input/.test(reviewerSpawns[0].task),
+      "reviewer prompt must carry the bd acceptance criteria",
+    );
     return null;
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

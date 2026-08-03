@@ -38,6 +38,7 @@ export function buildReviewerTask(
   constraints: string,
   patterns: string,
   reviewDepth: "deep" | "standard" = "deep",
+  acceptanceCriteria?: string,
 ): string {
   const deepDimensions = `1. **Architecture** — Does this follow existing patterns? Clean separation of concerns?
 2. **Correctness** — Edge cases? Error handling? Logic errors?
@@ -56,6 +57,9 @@ export function buildReviewerTask(
 
 ## Task Description
 ${taskDescription}
+
+## Acceptance Criteria
+${acceptanceCriteria ?? "(none specified)"}
 
 ## Git Diff
 \`\`\`diff

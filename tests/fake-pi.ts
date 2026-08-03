@@ -51,8 +51,8 @@ export function createEventBus() {
 // Canned bd / git outputs
 // ──────────────────────────────────────────────────────────────────────
 
-function bdShowLine(bdId, title) {
-  return `○ ${bdId} · ${title}   [● P2 · OPEN]\n\nDESCRIPTION\nTask ${bdId} description.\n\nACCEPTANCE CRITERIA\nNone`;
+function bdShowLine(bdId, title, ac) {
+  return `○ ${bdId} · ${title}   [● P2 · OPEN]\n\nDESCRIPTION\nTask ${bdId} description.\n\nACCEPTANCE CRITERIA\n${ac ?? "None"}`;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -158,6 +158,7 @@ export function createFakeBridge({
 
 export function createFakePi({
   bdTasks = new Map(),      // bdId -> title (for bd list / bd show fakes)
+  bdAC = new Map(),         // bdId -> acceptance criteria (bd show fakes)
   execTable = {},           // "cmd args" -> { code, stdout, stderr } override
   bridge,                   // events => handler; if set, registered as RPC bridge
   extraExec,                // (cmd, args, opts) => result | undefined
@@ -215,7 +216,7 @@ export function createFakePi({
         }
         if (args[0] === "show") {
           const title = bdTasks.get(args[1]);
-          if (title) return { code: 0, stdout: bdShowLine(args[1], title), stderr: "" };
+          if (title) return { code: 0, stdout: bdShowLine(args[1], title, bdAC.get(args[1])), stderr: "" };
           return { code: 1, stdout: "", stderr: `no task ${args[1]}` };
         }
         return { code: 0, stdout: "bd v0.0.0\n", stderr: "" };

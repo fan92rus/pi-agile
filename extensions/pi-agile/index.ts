@@ -553,7 +553,7 @@ async function delegateTaskInWorktree(
     }
 
     // 4. Spawn reviewer
-    const reviewerTaskText = buildReviewerTask(meta.title, meta.description, currentDiff, constraints, patterns, reviewDepth);
+    const reviewerTaskText = buildReviewerTask(meta.title, meta.description, currentDiff, constraints, patterns, reviewDepth, meta.acceptanceCriteria);
     onProgress?.(`${bdId} (r${round}): spawning reviewer...`);
     try { pi.notify(`[${bdId}] R${round}: reviewer starting...`, "info"); } catch {}
 
@@ -1976,7 +1976,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         }
 
         // 5. Delegate reviewer via RPC
-        const reviewerTaskText = buildReviewerTask(title, description, diff, constraints, patterns, meta.reviewDepth as "deep" | "standard");
+        const reviewerTaskText = buildReviewerTask(title, description, diff, constraints, patterns, meta.reviewDepth as "deep" | "standard", acceptanceCriteria);
 
         let reviewer: SpawnedWorker;
         try {
