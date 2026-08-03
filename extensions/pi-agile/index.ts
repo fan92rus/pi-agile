@@ -29,6 +29,9 @@ import {
   saveSessionState as saveSessionStateToDisk,
 } from "./parallel/continuation.ts";
 import { runDiscovery, formatDiscoveryResult, initChecks, detectEcosystem, type EcosystemInfo } from "./parallel/discovery.ts";
+import { parseSimpleYaml, parseYamlValue } from "./parallel/yaml.ts";
+import { resolveDefaultBranch, branchExistsInList, branchCheckoutArgs } from "./parallel/git.ts";
+import { parseBdShow } from "./parallel/bd.ts";
 import { buildChainAgentTask, buildReviewerTask, buildWorkerTask, parseReviewVerdict, buildDiscoveryScoutTask, buildDetectiveTask } from "./parallel/review.ts";
 import { RpcClient, type SpawnedWorker } from "./parallel/rpc.ts";
 import {
@@ -58,6 +61,18 @@ const CONFIG_FILE = ".agile/config.json";
 function ensureAgileDir(workDir: string): void {
   const dir = path.join(workDir, AGILE_DIR);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  // Fix #17: agile state files (sprint-*.json, session.json, knowledge.jsonl,
+  // worker-*.txt, batch-progress.json) must never be committed by workers —
+  // they run `git add -A` and would otherwise pollute feature branches/main
+  // on projects that don't already ignore .agile/.
+  try {
+    const giPath = path.join(workDir, ".gitignore");
+    const gi = fs.existsSync(giPath) ? fs.readFileSync(giPath, "utf8") : "";
+    const hasAgile = gi.split(/\r?\n/).some((l) => l.trim() === ".agile/" || l.trim() === ".agile");
+    if (!hasAgile) {
+      fs.writeFileSync(giPath, (gi ? (gi.endsWith("\n") ? gi : gi + "\n") : "") + ".agile/\n", "utf8");
+    }
+  } catch { /* non-fatal */ }
 }
 
 function loadProjectConfig(workDir: string): Record<string, unknown> | null {
@@ -163,100 +178,8 @@ function getAgentModel(workDir: string, role: string): string {
   return models[role] ?? DEFAULT_AGENT_MODELS[role] ?? DEFAULT_AGENT_MODELS.worker;
 }
 
-/** Simple YAML parser (key: value, nested via indent, arrays via "- item", folded scalars). */
-function parseSimpleYaml(text: string): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  const lines = text.split("\n");
-  const stack: { indent: number; obj: Record<string, unknown> }[] = [{ indent: -1, obj: result }];
-  let i = 0;
-
-  while (i < lines.length) {
-    const rawLine = lines[i].replace(/\r$/, "");
-    if (!rawLine.trim() || rawLine.trim().startsWith("#")) { i++; continue; }
-
-    const indent = rawLine.length - rawLine.trimStart().length;
-    const content = rawLine.trim();
-
-    while (stack.length > 1 && stack[stack.length - 1].indent >= indent) {
-      stack.pop();
-    }
-    const current = stack[stack.length - 1].obj;
-
-    if (content.startsWith("- ")) {
-      const value = content.slice(2).trim();
-      const topObj = stack[stack.length - 1].obj;
-      const topKeys = Object.keys(topObj);
-
-      if (stack.length > 1 && topKeys.length === 0) {
-        // Empty placeholder {} from last "key:" → convert to array in parent
-        const parent = stack[stack.length - 2].obj;
-        const parentKeys = Object.keys(parent);
-        for (let k = parentKeys.length - 1; k >= 0; k--) {
-          if (parent[parentKeys[k]] === topObj) {
-            parent[parentKeys[k]] = [parseYamlValue(value)];
-            stack.pop();
-            break;
-          }
-        }
-      } else {
-        // Find existing array on current object (second+ array item)
-        for (let k = topKeys.length - 1; k >= 0; k--) {
-          if (Array.isArray(topObj[topKeys[k]])) {
-            (topObj[topKeys[k]] as unknown[]).push(parseYamlValue(value));
-            break;
-          }
-        }
-      }
-      i++;
-    } else if (content.includes(":")) {
-      const colonIdx = content.indexOf(":");
-      const key = content.slice(0, colonIdx).trim();
-      const valueStr = content.slice(colonIdx + 1).trim();
-
-      if (valueStr === "") {
-        // Empty value — could be nested object or array, create empty object for now
-        current[key] = {};
-        stack.push({ indent, obj: current[key] as Record<string, unknown> });
-        i++;
-      } else if (valueStr === ">" || valueStr === "|") {
-        // Folded (>) or literal (|) block scalar — read subsequent indented lines
-        const blockLines: string[] = [];
-        const blockIndent = indent + 2;
-        i++;
-        while (i < lines.length) {
-          const nextLine = lines[i].replace(/\r$/, "");
-          if (nextLine.trim() === "" && i + 1 < lines.length) { blockLines.push(""); i++; continue; }
-          const nextIndent = nextLine.length - nextLine.trimStart().length;
-          if (nextIndent > indent) {
-            blockLines.push(nextLine.slice(Math.min(blockIndent, nextIndent)).trimEnd());
-            i++;
-          } else {
-            break;
-          }
-        }
-        current[key] = valueStr === ">" ? blockLines.join(" ").replace(/\s+$/g, "\n").trim() : blockLines.join("\n");
-      } else {
-        current[key] = parseYamlValue(valueStr);
-        i++;
-      }
-    } else {
-      i++;
-    }
-  }
-  return result;
-}
-
-function parseYamlValue(s: string): unknown {
-  const t = s.trim();
-  if (t.startsWith('"') && t.endsWith('"')) return t.slice(1, -1);
-  if (t.startsWith("'") && t.endsWith("'")) return t.slice(1, -1);
-  if (t === "true") return true;
-  if (t === "false") return false;
-  if (t === "null" || t === "~") return null;
-  if (/^-?\d+$/.test(t)) return parseInt(t, 10);
-  if (/^-?\d+\.\d+$/.test(t)) return parseFloat(t);
-  return t;
-}
+/** Simple YAML parser (key: value, nested via indent, arrays via "- item", folded scalars).
+ *  Lives in parallel/yaml.ts — moved there so it is unit-testable (Fix #10). */
 
 function extractScope(project: Record<string, unknown> | null): string[] {
   if (!project) return ["src/**"];
@@ -305,11 +228,29 @@ async function execText(
 }
 
 async function gitCreateBranch(pi: ExtensionAPI, workDir: string, branch: string): Promise<void> {
-  await pi.exec("git", ["checkout", "-b", branch], { cwd: workDir, timeout: 10_000 });
+  // Fix #2: re-delegating a task whose feat/<bdId> branch already exists (batch
+  // rework path) must plain-checkout it — `checkout -b` fails with exit 128 and
+  // pi.exec does not throw, so the old code silently kept working on the wrong
+  // branch (main) and the worker committed past review.
+  const branchResult = await pi.exec("git", ["branch", "--list"], { cwd: workDir, timeout: 5_000 });
+  const branchList = (branchResult.stdout ?? "") + (branchResult.stderr ?? "");
+  const exists = branchExistsInList(branchList, branch);
+  const args = branchCheckoutArgs(exists, branch);
+  const checkout = await pi.exec("git", args, { cwd: workDir, timeout: 10_000 });
+  if (checkout.code !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${checkout.stderr}`);
+  }
 }
 
 async function gitDiff(pi: ExtensionAPI, workDir: string, ref: string): Promise<string> {
   return execText(pi, "git", ["diff", ref], workDir, 30_000);
+}
+
+/** Diff against the DETECTED default branch (main|master) — Fix #3. */
+async function gitDiffAgainstDefault(pi: ExtensionAPI, workDir: string, branch: string): Promise<string> {
+  const branchResult = await pi.exec("git", ["branch", "--list"], { cwd: workDir, timeout: 5_000 });
+  const defaultBranch = resolveDefaultBranch((branchResult.stdout ?? "") + (branchResult.stderr ?? ""));
+  return gitDiff(pi, workDir, `${defaultBranch}...${branch}`);
 }
 
 async function gitMergeSquash(pi: ExtensionAPI, workDir: string, branch: string, commitMsg?: string): Promise<string> {
@@ -585,7 +526,7 @@ async function delegateTaskInWorktree(
 
     // 3. Get diff
     try { pi.notify(`[${bdId}] R${round}: worker done, getting diff...`, "info"); } catch {}
-    currentDiff = await gitDiff(pi, workDir, `main...${branch}`);
+    currentDiff = await gitDiffAgainstDefault(pi, workDir, branch);
     if (!currentDiff.trim()) {
       if (round > 1) {
         overallVerdict = { status: "rework", dimensions: {}, action_items: ["Worker reverted all changes after rework feedback."], lessons: [] };
@@ -615,7 +556,12 @@ async function delegateTaskInWorktree(
     }
 
     onProgress?.(`${bdId} (r${round}): reviewer started...`);
-    await pollWithProgress(pi, workDir, rpc_, reviewer.runId, reviewerOutput, `reviewer-${bdId}-r${round}`, (s: string) => onProgress?.(`${bdId}: ${s}`));
+    const reviewerDone = await pollWithProgress(pi, workDir, rpc_, reviewer.runId, reviewerOutput, `reviewer-${bdId}-r${round}`, (s: string) => onProgress?.(`${bdId}: ${s}`));
+    if (!reviewerDone) {
+      // Fix (M3): a dead/force-stopped reviewer must abort the task instead of
+      // parsing an empty verdict → default "rework" → 2 more meaningless rounds.
+      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `⏱ Reviewer r${round} did not complete (stuck or failed). Check ${reviewerOutput}.` };
+    }
 
     let verdictText = "";
     try { if (fs.existsSync(reviewerOutput)) verdictText = fs.readFileSync(reviewerOutput, "utf8"); } catch {}
@@ -778,10 +724,19 @@ async function delegateBatchParallel(
   const conflictedDirs = new Set(
     results.filter((r: any) => r.conflict).map((r: any) => r.conflict.worktreeDir)
   );
-  for (const wt of worktrees) {
+  for (let i = 0; i < worktrees.length; i++) {
+    const wt = worktrees[i];
     if (conflictedDirs.has(wt)) continue;
     try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
     try { fs.rmSync(wt, { recursive: true, force: true }); } catch {}
+    // Fix #2 (H1): delete the feat/<bdId> branch AFTER the worktree is gone
+    // (git refuses to delete a branch checked out in a worktree). A leftover
+    // branch made a later re-delegation fail "branch already exists" and the
+    // worker silently committed to main without review.
+    const r = results[i];
+    if (r && !r.error && r.verdict.status === "approved") {
+      try { await pi.exec("git", ["branch", "-D", r.branch], { cwd: mainWorkDir, timeout: 5_000 }); } catch { /* best effort */ }
+    }
   }
 
   return { results };
@@ -871,6 +826,9 @@ async function executeBatchTasks(
 
   for (const r of results) {
     const rAny = r as any;
+    // Fix #4: record review rounds for velocity (batch rework loops count
+    // real rounds now, previously review_rounds stayed 0 everywhere).
+    if (sprint && r.reviews?.length) runtime.store.setReviewRounds(sprint, r.bdId, r.reviews.length);
     if (rAny.conflict) {
       conflicted.push(r.bdId);
       lines.push(`## ${r.bdId}: \ud83d\udd00 CONFLICT`);
@@ -918,7 +876,34 @@ async function executeBatchTasks(
   // Persist batch task-status transitions (markDone/markRework/markBlocked)
   // to disk — without this save sprint-N.json keeps tasks: [] and agent_end
   // (which loads the last sprint from disk) never fires after a batch run.
-  if (sprint) runtime.store.save(workDir, sprint);
+  if (sprint) {
+    // Fix #7: batch path was missing what the single path does — lessons,
+    // dead-ends, observer transitions and steers. Without this, knowledge
+    // stayed empty and the rework-loop observer never fired after batches.
+    for (const r of results) {
+      if (r.error || r.conflict) continue;
+      trackTaskTransition(runtime.observerState, r.bdId, r.verdict.status === "approved" ? "done" : r.verdict.status);
+      for (const lesson of r.verdict?.lessons ?? []) {
+        runtime.knowledge.append({
+          type: "lesson", task_id: r.bdId, sprint: sprint.id, ts: new Date().toISOString(), finding: lesson,
+        });
+      }
+      if (r.verdict?.do_not_retry) {
+        const taskMeta = tasks.find((t) => t.bdId === r.bdId);
+        runtime.knowledge.append({
+          type: "dead_end", task_id: r.bdId, sprint: sprint.id, ts: new Date().toISOString(),
+          approach: taskMeta?.meta.title ?? r.bdId, do_not_retry: r.verdict.do_not_retry,
+        });
+      }
+    }
+    runtime.knowledge.save(workDir);
+    runtime.store.save(workDir, sprint);
+
+    const batchSteers = runSprintObserver(sprint, runtime.observerState, DEFAULT_OBSERVER_CONFIG, workDir);
+    for (const steer of batchSteers) {
+      try { await pi.sendUserMessage(steer.message, { deliverAs: "followUp" }); } catch { /* best effort */ }
+    }
+  }
 
   // Summary line
   lines.push("---");
@@ -935,29 +920,9 @@ async function executeBatchTasks(
   return { content: [{ type: "text" as const, text: lines.join("\n") }] };
 }
 
-/** Parse `bd show <id>` output to extract title, description, acceptance criteria.
- *  Example output:
- *    ○ agile-test-9do · Task title   [● P2 · OPEN]
- *    DESCRIPTION
- *    Task description text
- *    ACCEPTANCE CRITERIA
- *    Criteria text
+/**
+ * Parse `bd show <id>` output — lives in parallel/bd.ts (unit-testable).
  */
-function parseBdShow(output: string): { title?: string; description?: string; acceptanceCriteria?: string } {
-  const result: { title?: string; description?: string; acceptanceCriteria?: string } = {};
-
-  const firstLine = output.split("\n")[0] ?? "";
-  const titleMatch = firstLine.match(/·\s+(.+?)\s+\[/);
-  if (titleMatch) result.title = titleMatch[1].trim();
-
-  const descMatch = output.match(/DESCRIPTION\n([\s\S]*?)(?:\n\n\n|$|\n[A-Z])/);
-  if (descMatch) result.description = descMatch[1].trim();
-
-  const accMatch = output.match(/ACCEPTANCE CRITERIA\n([\s\S]*?)(?:\n\n\n|$|\n[A-Z])/);
-  if (accMatch) result.acceptanceCriteria = accMatch[1].trim();
-
-  return result;
-}
 
 /**
  * Poll for worker/reviewer completion with progress updates.
@@ -985,6 +950,12 @@ async function pollWithProgress(
   // every tool call; an idle one hangs the whole batch.
   const stuckTimeoutMs = getStuckTimeout(workDir);
   let lastActivityWarningShown = false;
+  // Fix #14: if the RPC bridge is dead (rpc.status keeps failing) and the run
+  // was never confirmed to exist, waiting forever is wrong. Abort after
+  // ~150s of consecutive failures with no "running" sighting.
+  let consecutiveStatusFailures = 0;
+  let everSawRunning = false;
+  const MAX_CONSECUTIVE_STATUS_FAILURES = 30;
 
   while (attempts < maxAttempts) {
     await new Promise((r) => setTimeout(r, pollInterval));
@@ -1009,8 +980,16 @@ async function pollWithProgress(
         }
         return true;
       }
+      if (status?.state === "running") everSawRunning = true;
+      consecutiveStatusFailures = 0;
     } catch {
-      // rpc.status failed — ignore, loop continues with file check
+      // rpc.status failed — bridge may be dead. Count consecutive failures and
+      // abort when the run was never confirmed to exist (Fix #14).
+      consecutiveStatusFailures++;
+      if (!everSawRunning && consecutiveStatusFailures >= MAX_CONSECUTIVE_STATUS_FAILURES) {
+        onUpdate?.({ content: [{ type: "text", text: `⏱ ${role}: RPC bridge unreachable (${consecutiveStatusFailures} status failures, run never confirmed). Aborting wait.` }] });
+        return false;
+      }
     }
 
     // Check 3: Level B — stuck detection via lastActivityAt (only while running)
@@ -1064,6 +1043,8 @@ interface AgileRuntime {
   agentEndSentForSprint: number | null;
   /** Last workDir the agile tools operated on — agent_end falls back to it when ctx.cwd has no sprint (RC2). */
   lastWorkDir: string | null;
+  /** true after /agile stop — the loop was explicitly halted; agent_end must stay silent. */
+  loopStopped: boolean;
 }
 
 function createRuntime(events: unknown): AgileRuntime {
@@ -1078,6 +1059,7 @@ function createRuntime(events: unknown): AgileRuntime {
     originalRequest: "",
     agentEndSentForSprint: null,
     lastWorkDir: null,
+    loopStopped: false,
     knowledge: new KnowledgeBase(),
     store: new SprintStore(),
   };
@@ -1093,17 +1075,7 @@ function getRuntime(ctx: ExtensionContext, store: Map<string, AgileRuntime>): Ag
   return rt;
 }
 
-/** Try to restore sprint state from disk if current is null. */
-function getOrRestoreSprint(rt: AgileRuntime, workDir: string): SprintState | null {
-  const current = rt.store.getCurrent();
-  if (current) return current;
-  const lastId = rt.store.findLastSprintId(workDir);
-  if (lastId > 0) {
-    const sprint = rt.store.load(workDir, lastId);
-    if (sprint) return sprint;
-  }
-  return null;
-}
+/** (dead code removed — SprintStore.getCurrent(workDir) already auto-restores) */
 
 // Module-level runtime store (per-session)
 const runtimeStore = new Map<string, AgileRuntime>();
@@ -1119,6 +1091,7 @@ function persistSessionState(workDir: string, runtime: AgileRuntime): void {
     remainingSprints: runtime.remainingSprints,
     originalRequest: runtime.originalRequest,
     sprintLoopActive: runtime.sprintLoopActive,
+    loopStopped: runtime.loopStopped,
   });
 }
 
@@ -1128,6 +1101,7 @@ function loadSessionIntoRuntime(workDir: string, runtime: AgileRuntime): void {
   if (state.remainingSprints !== undefined) runtime.remainingSprints = state.remainingSprints;
   if (state.originalRequest !== undefined) runtime.originalRequest = state.originalRequest;
   if (state.sprintLoopActive !== undefined) runtime.sprintLoopActive = state.sprintLoopActive;
+  if (state.loopStopped !== undefined) runtime.loopStopped = state.loopStopped;
 }
 
 /**
@@ -1141,6 +1115,9 @@ async function maybeSendContinuation(
   workDir: string,
   sprint: SprintState,
 ): Promise<boolean> {
+  // Fix #11: after /agile stop the loop is halted — no nudges at all.
+  if (runtime.loopStopped) return false;
+
   // Open bd tasks not already in this sprint — they should go into the next sprint.
   let openTasks: string[] = [];
   try {
@@ -1483,6 +1460,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       sentForSprint: runtime.agentEndSentForSprint,
       sprintId: sprint.id,
       remainingSprints: runtime.remainingSprints,
+      loopStopped: runtime.loopStopped, // Fix #11: /agile stop silences agent_end
     })) return;
 
     await maybeSendContinuation(pi, runtime, workDir, sprint);
@@ -1519,17 +1497,14 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       const eco = detectEcosystem(workDir);
       const text = formatDiscoveryResult(result);
 
-      // Detect missing tools
+      // Detect missing tools (Fix #6: async — execSync blocked the event loop)
       let missingBlock = "";
       if (eco) {
-        const missing = eco.tools.filter(t => {
-          try {
-            require("child_process").execSync(t.name.split(" ")[0] + " --version", { cwd: workDir, timeout: 3000, encoding: "utf8", stdio: ["ignore", "ignore", "pipe"] });
-            return false;
-          } catch {
-            return true;
-          }
-        });
+        const missing: { name: string; install: string }[] = [];
+        for (const t of eco.tools) {
+          const probe = await execText(pi, t.name.split(" ")[0], ["--version"], workDir, 3_000);
+          if (probe.startsWith("[exec error]")) missing.push({ name: t.name, install: t.install });
+        }
         if (missing.length > 0) {
           missingBlock = "## ⚙️ Tools Not Found\n" +
             "Run /agile init-checks to generate scripts, or install manually:\n" +
@@ -1686,6 +1661,13 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       // Switch back to original branch
       try {
         await execText(pi, "git", ["checkout", originalBranch || "-"], workDir, 5000);
+        // Fix (M7): verify the checkout actually happened — execText never
+        // throws, so a dirty tree would silently leave the agent on the
+        // investigate branch.
+        const nowOn = (await execText(pi, "git", ["branch", "--show-current"], workDir, 5000)).trim();
+        if (nowOn && nowOn !== (originalBranch || "")) {
+          report = `⚠️ **Checkout back to ${originalBranch || "previous branch"} failed** (uncommitted changes in investigate branch?). You are still on \`${nowOn}\`. Run \`git checkout ${originalBranch || "-"}\` manually.\n\n` + report;
+        }
       } catch { /* best effort */ }
 
       return {
@@ -1715,16 +1697,37 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       const meta = extractProjectMeta(project);
       runtime.lastWorkDir = workDir;
 
-      const sprintId = runtime.store.findLastSprintId(workDir) + 1;      const sprint = runtime.store.create(workDir, sprintId, meta.goal);
-
-      // Add tasks to sprint state (read titles from bd)
+      // Read task details FIRST (Fix M11): creating the sprint with placeholder
+      // titles "(task <bdId>)" (bd database missing) burned the sprint id and
+      // left sprint-N.json with tasks:[] — the same failure mode as 97bf88d.
+      const parsedTasks: { bdId: string; title: string; description?: string }[] = [];
+      const unreadable: string[] = [];
       for (const bdId of params.task_ids as string[]) {
         const bdOutput = await execText(pi, "bd", ["show", bdId], workDir, 10_000);
         const parsed = parseBdShow(bdOutput);
+        const title = parsed.title && parsed.title !== `(task ${bdId})` ? parsed.title : undefined;
+        if (!title) {
+          unreadable.push(bdId);
+          continue;
+        }
+        parsedTasks.push({ bdId, title, description: parsed.description });
+      }
+      if (unreadable.length > 0) {
+        return {
+          content: [{ type: "text" as const, text: `❌ Sprint aborted: could not read task details for ${unreadable.join(", ")} — ` +
+            `bd show returned no title (missing .beads database in ${workDir}?). ` +
+            `No sprint was created. Fix the bd database location or task ids, then retry.` }],
+        };
+      }
+
+      const sprintId = runtime.store.findLastSprintId(workDir) + 1;      const sprint = runtime.store.create(workDir, sprintId, meta.goal);
+
+      // Add tasks to sprint state (titles already verified above)
+      for (const t of parsedTasks) {
         runtime.store.addTask(sprint, {
-          bd_id: bdId,
-          title: parsed.title ?? `(task ${bdId})`,
-          description: parsed.description,
+          bd_id: t.bdId,
+          title: t.title,
+          description: t.description,
           status: "backlog",
         });
       }
@@ -1891,7 +1894,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       } catch { /* best-effort */ }
 
       // 4. Get diff
-      const diff = await gitDiff(pi, workDir, `main...${branch}`);
+      const diff = await gitDiffAgainstDefault(pi, workDir, branch);
 
       if (!diff.trim()) {
         return {
@@ -1942,8 +1945,14 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       const verdict = parseReviewVerdict(verdictText);
 
       // 6. Update sprint state
-      const sprint = runtime.store.getCurrent();
+      // Fix #1: pass workDir — getCurrent() without it bypasses the cross-project
+      // guard AND cannot restore the sprint from disk after a pi restart, so
+      // markRework/markBlocked would silently vanish.
+      const sprint = runtime.store.getCurrent(workDir);
       if (sprint) {
+        // Fix #4: one review round happened here — record it so velocity's
+        // avg_review_rounds is real (markInReview was never called anywhere).
+        runtime.store.setReviewRounds(sprint, bdId, 1);
         if (verdict.status === "approved") {
           // markInReview + markDone will be called by merge tool
         } else if (verdict.status === "rework") {
@@ -2098,6 +2107,10 @@ ${workerSummary.slice(0, 1000)}`;
 
       // Run main checks (test, optionally lint)
       let checksOutput = "";
+      let checksFailed = false;
+
+      // Failure markers: jest/mocha "FAIL", go "FAIL", eslint "error".
+      const hasFailures = (text: string): boolean => /\bFAIL(?:ED)?\b|\berror(?:s)?\b/i.test(text);
 
       // Only run eslint if config exists
       const hasEslint = [".eslintrc", ".eslintrc.js", ".eslintrc.json", ".eslintrc.yaml", "eslint.config.js", "eslint.config.mjs"]
@@ -2105,30 +2118,35 @@ ${workerSummary.slice(0, 1000)}`;
       if (hasEslint) {
         const result = await execText(pi, "npx", ["eslint", "."], workDir, 60_000);
         if (result.trim()) checksOutput += `## Lint\n${result.slice(0, 1000)}\n\n`;
+        if (hasFailures(result)) checksFailed = true;
       }
 
       // Run tests
       if (fs.existsSync(path.join(workDir, "package.json"))) {
         const result = await execText(pi, "npm", ["test"], workDir, 120_000);
         if (result.trim()) checksOutput += `## Tests\n${result.slice(0, 2000)}`;
+        if (hasFailures(result)) checksFailed = true;
       } else if (fs.existsSync(path.join(workDir, "go.mod"))) {
         const result = await execText(pi, "go", ["test", "./..."], workDir, 120_000);
         if (result.trim()) checksOutput += `## Tests\n${result.slice(0, 2000)}`;
+        if (hasFailures(result)) checksFailed = true;
       }
 
       // Update sprint state
-      const sprint = runtime.store.getCurrent();
+      // Fix #1: pass workDir (same rationale as agile_delegate_task above).
+      const sprint = runtime.store.getCurrent(workDir);
       let observerBlock = "";
       if (sprint) {
         runtime.store.markDone(sprint, bdId);
         trackTaskTransition(runtime.observerState, bdId, "done");
 
+        const doneTask = sprint.tasks.find((t) => t.bd_id === bdId);
         runtime.knowledge.append({
           type: "task_done",
           task_id: bdId,
           sprint: sprint.id,
           ts: new Date().toISOString(),
-          title: `(task ${bdId})`,
+          title: doneTask?.title ?? `(task ${bdId})`, // Fix: real title, not placeholder
         });
         runtime.knowledge.save(workDir);
         runtime.store.save(workDir, sprint);
@@ -2143,6 +2161,10 @@ ${workerSummary.slice(0, 1000)}`;
               await pi.sendUserMessage(steer.message, { deliverAs: "followUp" });
             } catch { /* best effort */ }
           }
+          // Fix (M2): the exhausted-steer IS the continuation nudge — suppress
+          // the agent_end duplicate (it would fire next because the sprint is
+          // terminal and no followUp was attributed to it).
+          runtime.agentEndSentForSprint = sprint.id;
         }
       }
 
@@ -2154,7 +2176,11 @@ ${workerSummary.slice(0, 1000)}`;
       return {
         content: [{
           type: "text" as const,
-          text: `✅ Task ${bdId} merged to main.${observerBlock}\n\n## Main Checks Output\n${checksOutput.trim() || "(no lint config or test runner found — verify manually)"}`,
+          text: `✅ Task ${bdId} merged to main.${observerBlock}
+
+## Main Checks Output
+${checksOutput.trim() || "(no lint config or test runner found — verify manually)"}
+${checksFailed ? "\n⚠️ **Checks reported failures above — verify before continuing. The merge happened; broken code is now on main.**" : ""}`,
         }],
       };
     },
@@ -2187,6 +2213,10 @@ ${workerSummary.slice(0, 1000)}`;
       // Compute velocity
       sprint.velocity = runtime.store.computeVelocity(sprint);
 
+      // PBT find: retrospective called twice on the same sprint (agent error)
+      // must be a no-op for budget/messages — the old code double-decremented
+      // remainingSprints and sent a second continuation nudge.
+      const alreadyCompleted = sprint.status === "done";
       // Save sprint summary to knowledge
       runtime.knowledge.load(workDir);
       runtime.knowledge.append({
@@ -2217,26 +2247,28 @@ ${workerSummary.slice(0, 1000)}`;
       // continuous mode (no sprint count) the bounded followUp below does not
       // exist, so the discovery nudge must fire here too, otherwise the loop
       // silently stops after the first sprint.
-      if (runtime.remainingSprints !== undefined) {
-        runtime.remainingSprints--;
-        // Mark the sprint as covered — agent_end must not send a second nudge.
-        runtime.agentEndSentForSprint = sprint.id;
-        persistSessionState(workDir, runtime);
-        if (runtime.remainingSprints <= 0) {
-          runtime.sprintLoopActive = false;
+      if (!alreadyCompleted) {
+        if (runtime.remainingSprints !== undefined) {
+          runtime.remainingSprints--;
+          // Mark the sprint as covered — agent_end must not send a second nudge.
+          runtime.agentEndSentForSprint = sprint.id;
           persistSessionState(workDir, runtime);
-          try {
-            await pi.sendUserMessage("All sprints completed. Stop criteria met — end the sprint loop with /agile stop.", { deliverAs: "followUp" });
-          } catch { /* best effort */ }
+          if (runtime.remainingSprints <= 0) {
+            runtime.sprintLoopActive = false;
+            persistSessionState(workDir, runtime);
+            try {
+              await pi.sendUserMessage("All sprints completed. Stop criteria met — end the sprint loop with /agile stop.", { deliverAs: "followUp" });
+            } catch { /* best effort */ }
+          } else {
+            try {
+              await pi.sendUserMessage(`${runtime.remainingSprints} sprint${runtime.remainingSprints > 1 ? "s" : ""} remaining. Decide: continue to next sprint or stop.`, { deliverAs: "followUp" });
+            } catch { /* best effort */ }
+          }
         } else {
-          try {
-            await pi.sendUserMessage(`${runtime.remainingSprints} sprint${runtime.remainingSprints > 1 ? "s" : ""} remaining. Decide: continue to next sprint or stop.`, { deliverAs: "followUp" });
-          } catch { /* best effort */ }
+          // Continuous mode: no bounded followUp — send the same continuation
+          // nudge the agent_end hook would send.
+          await maybeSendContinuation(pi, runtime, workDir, sprint);
         }
-      } else {
-        // Continuous mode: no bounded followUp — send the same continuation
-        // nudge the agent_end hook would send.
-        await maybeSendContinuation(pi, runtime, workDir, sprint);
       }
 
       // Append observer steers to output if any
@@ -2248,7 +2280,12 @@ ${observerSteers.map((s: { type: string; message: string; severity: string }) =>
         : "";
 
       // Send observer steers as follow-up messages so the agent acts on them
+      // (dedupe: when we already sent the continuation/budget followUp above,
+      // the observer's sprint_completed steer says the same thing — PBT found
+      // two near-identical messages on one completion).
+      const sentOwnFollowUp = !alreadyCompleted && (runtime.remainingSprints !== undefined || !runtime.loopStopped);
       for (const steer of observerSteers) {
+        if (sentOwnFollowUp && (steer.type === "sprint_completed" || steer.type === "all_tasks_exhausted")) continue;
         try {
           await pi.sendUserMessage(steer.message, { deliverAs: "followUp" });
         } catch { /* best effort */ }
@@ -2414,7 +2451,7 @@ ${excludes}
 ${isBudget ? `  stop_when:
     mode: any_of
     conditions:
-      - metric: sprint_count
+      - metric: max_sprints
         target: ${sprints}
         area: "project"
         description: "After ${sprints} sprints"` : ""}
@@ -2482,6 +2519,11 @@ do_not_do:
         checksMsg += `\nThen run \`agile_discover\` to validate.`;
 
         ctx.ui.notify(lines.join("\n") + checksMsg + "\n\n\u2705 Setup complete! Configs created in " + agileDir + "/", "info");
+
+        // Fix #16: the wizard created configs but left agile mode OFF — the
+        // followUp then ordered the agent to call agile_start_sprint, which
+        // answered "Agile mode is OFF. Run /agile on first."
+        setAgileMode(ctx, true, workDir);
 
         // Trigger agent to edit scripts and start discovery
         const ecoLang = eco ? eco.language : "unknown";
@@ -2600,6 +2642,7 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
         const runtime = getRuntime(ctx, runtimeStore);
         runtime.sprintLoopActive = false;
         runtime.remainingSprints = undefined;
+        runtime.loopStopped = true; // Fix #11: explicit stop — agent_end must stay silent
         persistSessionState(workDir, runtime);
         ctx.ui.notify("Sprint loop stopped", "info");
         return;
@@ -2639,6 +2682,13 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
         // If description provided → goal/constraints setup phase (always refill)
         if (description.trim()) {
           runtime.originalRequest = description.trim();
+          // Fix #9: /agile run 5 <desc> must keep the sprint budget, otherwise
+          // the loop silently continues with the stale value from a previous
+          // /agile run (or continuous mode).
+          if (maxSprints !== undefined) {
+            runtime.remainingSprints = maxSprints;
+          }
+          runtime.loopStopped = false;
           // Don't start sprint loop yet — agent must fill goal/constraints first
           runtime.sprintLoopActive = false;
           persistSessionState(workDir, runtime);
@@ -2661,13 +2711,17 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
           const stopWhen = (project as Record<string, unknown>).stop_when as Record<string, unknown> | undefined;
           if (stopWhen && (stopWhen.mode === "any_of" || stopWhen.mode === "all_of")) {
             const conditions = (stopWhen.conditions as Array<Record<string, unknown>>) ?? [];
-            const sprintCond = conditions.find(c => (c as Record<string, unknown>).metric === "sprint_count");
+            // Fix #10: unified metric name — TZ.md and buildStopCheckMessage use
+            // "max_sprints"; the setup wizard used to emit "sprint_count" which
+            // made the budget silently ignored.
+            const sprintCond = conditions.find(c => (c as Record<string, unknown>).metric === "max_sprints");
             if (sprintCond) maxSprints = sprintCond.target as number;
           }
         }
 
         runtime.sprintLoopActive = true;
         runtime.remainingSprints = maxSprints;
+        runtime.loopStopped = false; // starting a fresh loop un-stops it
         persistSessionState(workDir, runtime);
 
         const sprintsInfo = maxSprints

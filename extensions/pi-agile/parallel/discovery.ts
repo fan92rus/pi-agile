@@ -13,7 +13,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { execSync } from "node:child_process";
+import { exec, execSync } from "node:child_process";
 
 export interface DiscoveryResult {
   /** Parsed METRIC lines from all scripts */
@@ -86,19 +86,21 @@ function bashCommand(scriptPath: string): string {
   return `${quoted} --login "${scriptPath.replace(/\\/g, "/")}"`;
 }
 
-/** Try running a command with a timeout. Returns stdout on success, or error text. */
-function tryExecSync(cmd: string, workDir: string, timeoutMs = 60_000): string {
-  try {
-    return execSync(cmd, { cwd: workDir, timeout: timeoutMs, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
-  } catch (e: unknown) {
-    const err = e as { stdout?: string; stderr?: string; message?: string };
-    // Return stdout if non-empty (script ran but exited non-zero)
-    if (err.stdout) return String(err.stdout);
-    // Return stderr if non-empty (script crashed with an error message)
-    if (err.stderr) return String(err.stderr);
-    // Last resort: error message so the report shows the script failed
-    return `[discovery error] ${err.message ?? String(e)}`;
-  }
+/**
+ * Try running a command with a timeout. Returns stdout+stderr, or error text.
+ * Fix #6: async — the old execSync blocked pi's single-threaded event loop for
+ * the whole run (npx eslint / go test -cover / semgrep with 120s timeouts
+ * froze streaming, UI and progress updates).
+ */
+function tryExec(cmd: string, workDir: string, timeoutMs = 60_000): Promise<string> {
+  return new Promise((resolve) => {
+    exec(cmd, { cwd: workDir, timeout: timeoutMs, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+      const out = (stdout ?? "") + (stderr ?? "");
+      if (out) { resolve(out); return; }
+      if (err) { resolve(`[discovery error] ${(err as Error).message ?? String(err)}`); return; }
+      resolve("");
+    });
+  });
 }
 
 // ─── Ecosystem detection ────────────────────────────────────────────────
@@ -302,7 +304,7 @@ export function initChecks(workDir: string): { created: string[]; warnings: stri
     }
   }
 
-  // chmod +x (Unix only)
+  // chmod +x (Unix only) — fast, keep sync: permission flip only.
   if (process.platform !== "win32") {
     try {
       execSync(`chmod +x "${checksDir}"/*.sh`, { timeout: 3000, encoding: "utf8" });
@@ -317,7 +319,7 @@ export function initChecks(workDir: string): { created: string[]; warnings: stri
 /**
  * Run all scripts in .agile/checks/, parse METRIC lines, collect reports.
  */
-export function runChecks(workDir: string): DiscoveryResult {
+export async function runChecks(workDir: string): Promise<DiscoveryResult> {
   const checksDir = path.join(workDir, ".agile", "checks");
   const scripts = fs.readdirSync(checksDir).filter(f => f.endsWith(".sh"));
 
@@ -329,7 +331,7 @@ export function runChecks(workDir: string): DiscoveryResult {
     const name = script.replace(/\.sh$/, "");
     scriptsFound.push(name);
 
-    const raw = tryExecSync(bashCommand(path.join(checksDir, script)), workDir, 120_000);
+    const raw = await tryExec(bashCommand(path.join(checksDir, script)), workDir, 120_000);
 
     // Parse METRIC lines and split from report text
     const reportLines: string[] = [];
@@ -384,12 +386,12 @@ async function runLinters(workDir: string, scope: string[]): Promise<string> {
   if (tools.hasEslint) {
     const scopeStr = buildScopeGlobs(scope);
     output.push("--- ESLint ---");
-    output.push(tryExecSync(`npx eslint ${scopeStr} -f compact 2>&1 || true`, workDir));
+    output.push(await tryExec(`npx eslint ${scopeStr} -f compact 2>&1 || true`, workDir));
   }
 
   if (fs.existsSync(path.join(workDir, "go.mod"))) {
     output.push("--- golangci-lint ---");
-    output.push(tryExecSync("golangci-lint run ./... 2>&1 || true", workDir));
+    output.push(await tryExec("golangci-lint run ./... 2>&1 || true", workDir));
   }
 
   return output.join("\n") || "(no linter found)";
@@ -400,11 +402,11 @@ async function runCoverage(workDir: string, scope: string[]): Promise<string> {
 
   if (tools.hasJest) {
     const scopeStr = buildScopeGlobs(scope);
-    return tryExecSync(`npx jest --coverage --collectCoverageFrom="${scopeStr}" --coverageReporters=text-summary 2>&1 || true`, workDir, 120_000);
+    return tryExec(`npx jest --coverage --collectCoverageFrom="${scopeStr}" --coverageReporters=text-summary 2>&1 || true`, workDir, 120_000);
   }
 
   if (fs.existsSync(path.join(workDir, "go.mod"))) {
-    return tryExecSync("go test -cover ./... 2>&1 || true", workDir, 120_000);
+    return tryExec("go test -cover ./... 2>&1 || true", workDir, 120_000);
   }
 
   return "(no coverage tool found)";
@@ -412,7 +414,7 @@ async function runCoverage(workDir: string, scope: string[]): Promise<string> {
 
 async function runComplexity(workDir: string, _scope: string[]): Promise<string> {
   if (fs.existsSync(path.join(workDir, "go.mod"))) {
-    return tryExecSync("golangci-lint run --enable gocyclo ./... 2>&1 || true", workDir);
+    return tryExec("golangci-lint run --enable gocyclo ./... 2>&1 || true", workDir);
   }
   return "(no complexity analyzer found)";
 }
@@ -464,7 +466,7 @@ async function scanTODOs(workDir: string, scope: string[]): Promise<string> {
 
 async function runSecurityScan(workDir: string, scope: string[]): Promise<string> {
   const scopeStr = buildScopeGlobs(scope);
-  return tryExecSync(`semgrep scan --config p/default ${scopeStr} --json 2>&1 || true`, workDir);
+  return tryExec(`semgrep scan --config p/default ${scopeStr} --json 2>&1 || true`, workDir);
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────
@@ -482,7 +484,7 @@ export async function runDiscovery(workDir: string, scope: string[]): Promise<Di
   if (fs.existsSync(checksDir)) {
     const scripts = fs.readdirSync(checksDir).filter(f => f.endsWith(".sh"));
     if (scripts.length > 0) {
-      return runChecks(workDir);
+      return await runChecks(workDir);
     }
   }
 

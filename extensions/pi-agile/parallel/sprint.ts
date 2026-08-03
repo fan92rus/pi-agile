@@ -137,6 +137,18 @@ export class SprintStore {
     }
   }
 
+  /**
+   * Record the number of review rounds a task went through (velocity input).
+   * Never shrinks — a later markInReview/merge may report fewer rounds than
+   * what already happened in a batch rework loop.
+   */
+  setReviewRounds(state: SprintState, bdId: string, rounds: number): void {
+    const task = state.tasks.find((t) => t.bd_id === bdId);
+    if (task && rounds >= 0) {
+      task.review_rounds = Math.max(task.review_rounds, rounds);
+    }
+  }
+
   markRework(state: SprintState, bdId: string, reason?: string): void {
     const task = state.tasks.find((t) => t.bd_id === bdId);
     if (task) {
@@ -191,11 +203,16 @@ export class SprintStore {
     if (this.current && (!workDir || this.currentWorkDir === workDir)) {
       return this.current;
     }
-    // Auto-restore from disk if workDir is provided
+    // Auto-restore from disk if workDir is provided (PBT find: a torn write on
+    // the newest sprint-N.json must not hide older valid sprints — fall back).
     if (workDir) {
       const lastId = this.findLastSprintId(workDir);
       if (lastId > 0) {
-        return this.load(workDir, lastId);
+        for (let id = lastId; id > 0; id--) {
+          if (!fs.existsSync(sprintFilePath(workDir, id))) continue;
+          const restored = this.load(workDir, id);
+          if (restored) return restored;
+        }
       }
     }
     return null;
@@ -204,9 +221,14 @@ export class SprintStore {
   findLastSprintId(workDir: string): number {
     const agileDir = path.join(workDir, ".agile");
     if (!fs.existsSync(agileDir)) return 0;
-    const files = fs.readdirSync(agileDir).filter((f) => f.startsWith("sprint-") && f.endsWith(".json"));
+    // Exact sprint-<num>.json only — sprint-abc.json (corrupt) and
+    // sprint-2-backup.json (id=2 mis-parse) must not pollute the max.
+    const files = fs.readdirSync(agileDir).filter((f) => /^sprint-(\d+)\.json$/.test(f));
     if (files.length === 0) return 0;
-    const ids = files.map((f) => parseInt(f.replace("sprint-", "").replace(".json", ""), 10));
+    const ids = files
+      .map((f) => parseInt(f.replace("sprint-", "").replace(".json", ""), 10))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    if (ids.length === 0) return 0;
     return Math.max(...ids);
   }
 }

@@ -90,6 +90,11 @@ export function runSprintObserver(
   const emptySteer = checkDiscoveryEmpty(state);
   if (emptySteer) steers.push(emptySteer);
 
+  // 4b. Velocity dropped vs previous sprint (fix: velocityDropThreshold was
+  // never read as a check — the trigger was dead).
+  const velSteer = checkVelocityDrop(state, config, workDir);
+  if (velSteer) steers.push(velSteer);
+
   // 5. All tasks in terminal state (done/blocked) — need new tasks
   const exhaustedSteer = checkAllTasksExhausted(state);
   if (exhaustedSteer) steers.push(exhaustedSteer);
@@ -225,6 +230,44 @@ function checkDiscoveryEmpty(state: SprintState): ObserverSteer | null {
       type: "discovery_empty",
       severity: "info",
       message: "No tasks in sprint. Discovery may have found no new issues, or all tasks are done. Consider ending sprint.",
+    };
+  }
+  return null;
+}
+
+/**
+ * Velocity drop trigger: when the current sprint's done-count is at least
+ * `velocityDropThreshold`% below the previous sprint's done-count, warn.
+ * Loads sprint-(id-1).json from .agile/ — no previous sprint → no steer.
+ */
+function checkVelocityDrop(
+  state: SprintState,
+  config: ObserverConfig,
+  workDir?: string,
+): ObserverSteer | null {
+  if (!workDir || state.id <= 1 || config.velocityDropThreshold <= 0) return null;
+
+  const prevPath = path.join(workDir, ".agile", `sprint-${state.id - 1}.json`);
+  let prev: SprintState | null = null;
+  try {
+    if (fs.existsSync(prevPath)) {
+      prev = JSON.parse(fs.readFileSync(prevPath, "utf8")) as SprintState;
+    }
+  } catch {
+    return null;
+  }
+  if (!prev?.velocity) return null; // previous sprint never completed — no baseline
+
+  const prevDone = prev.velocity.done;
+  const curDone = state.tasks.filter((t) => t.status === "done").length;
+  if (prevDone <= 0) return null; // nothing to compare against
+
+  const dropPct = Math.round(((prevDone - curDone) / prevDone) * 100);
+  if (dropPct >= config.velocityDropThreshold) {
+    return {
+      type: "velocity_drop",
+      severity: "warning",
+      message: `📉 Velocity dropped ${dropPct}% vs sprint ${state.id - 1} (${prevDone} → ${curDone} tasks done). Investigate why — task sizing, blocked work, or context loss.`,
     };
   }
   return null;

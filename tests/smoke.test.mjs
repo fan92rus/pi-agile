@@ -252,83 +252,11 @@ await test("trackConstraintViolation increments", () => {
   assert.strictEqual(obs.constraintViolations.get("rule1"), 3);
 });
 
-// ── YAML parser ──────────────────────────────────────────────
-console.log("\n## YAML parser");
+// ── YAML parser (parallel/yaml.ts — real module) ────────────────
+console.log("\n## YAML parser (parallel/yaml.ts)");
 
-function parseSimpleYaml(text) {
-  const result = {};
-  const lines = text.split('\n');
-  const stack = [{ indent: -1, obj: result }];
-  let i = 0;
-  while (i < lines.length) {
-    const rawLine = lines[i].replace(/\r$/, '');
-    if (!rawLine.trim() || rawLine.trim().startsWith('#')) { i++; continue; }
-    const indent = rawLine.length - rawLine.trimStart().length;
-    const content = rawLine.trim();
-    while (stack.length > 1 && stack[stack.length - 1].indent >= indent) { stack.pop(); }
-    const current = stack[stack.length - 1].obj;
-    if (content.startsWith('- ')) {
-      const value = content.slice(2).trim();
-      const topObj = stack[stack.length - 1].obj;
-      const topKeys = Object.keys(topObj);
-      if (stack.length > 1 && topKeys.length === 0) {
-        const parent = stack[stack.length - 2].obj;
-        const parentKeys = Object.keys(parent);
-        for (let k = parentKeys.length - 1; k >= 0; k--) {
-          if (parent[parentKeys[k]] === topObj) {
-            parent[parentKeys[k]] = [parseYamlValue(value)];
-            stack.pop();
-            break;
-          }
-        }
-      } else {
-        for (let k = topKeys.length - 1; k >= 0; k--) {
-          if (Array.isArray(topObj[topKeys[k]])) {
-            topObj[topKeys[k]].push(parseYamlValue(value));
-            break;
-          }
-        }
-      }
-      i++;
-    } else if (content.includes(':')) {
-      const colonIdx = content.indexOf(':');
-      const key = content.slice(0, colonIdx).trim();
-      const valueStr = content.slice(colonIdx + 1).trim();
-      if (valueStr === '') {
-        current[key] = {};
-        stack.push({ indent, obj: current[key] });
-        i++;
-      } else if (valueStr === '>' || valueStr === '|') {
-        const blockLines = [];
-        const blockIndent = indent + 2;
-        i++;
-        while (i < lines.length) {
-          const nextLine = lines[i].replace(/\r$/, '');
-          if (nextLine.trim() === '' && i + 1 < lines.length) { blockLines.push(''); i++; continue; }
-          const nextIndent = nextLine.length - nextLine.trimStart().length;
-          if (nextIndent > indent) {
-            blockLines.push(nextLine.slice(Math.min(blockIndent, nextIndent)).trimEnd());
-            i++;
-          } else { break; }
-        }
-        current[key] = valueStr === '>' ? blockLines.join(' ').trim() : blockLines.join('\n');
-      } else {
-        current[key] = parseYamlValue(valueStr);
-        i++;
-      }
-    } else { i++; }
-  }
-  return result;
-}
-function parseYamlValue(s) {
-  const t = s.trim();
-  if (t.startsWith('"') && t.endsWith('"')) return t.slice(1, -1);
-  if (t.startsWith("'") && t.endsWith("'")) return t.slice(1, -1);
-  if (t === 'true') return true; if (t === 'false') return false;
-  if (/^-?\d+$/.test(t)) return parseInt(t, 10);
-  if (/^-?\d+\.\d+$/.test(t)) return parseFloat(t);
-  return t;
-}
+const yamlMod = await importModule(path.join("parallel", "yaml.ts"));
+const { parseSimpleYaml } = yamlMod;
 
 await test("YAML: simple key-value", () => {
   const r = parseSimpleYaml("key: value\r\nnum: 42");
@@ -365,11 +293,180 @@ await test("YAML: folded block scalar >", () => {
   assert.strictEqual(r.desc, "line one line two");
 });
 
-// ── index.ts: parseBdShow ────────────────────────────────────────
-console.log("\n## index.ts: parseBdShow");
+// Fix #10: array-of-maps (stop_when.conditions) must parse to objects, not strings.
+await test("YAML: array of maps (stop_when.conditions)", () => {
+  const yaml = [
+    "stop_when:",
+    "  mode: any_of",
+    "  conditions:",
+    "    - metric: max_sprints",
+    "      target: 3",
+    '      area: "project"',
+    '      description: "After 3 sprints"',
+    "    - metric: test_coverage",
+    "      target: 80",
+  ].join("\n");
+  const r = parseSimpleYaml(yaml);
+  const conditions = r.stop_when.conditions;
+  assert.ok(Array.isArray(conditions), "conditions must be an array");
+  assert.strictEqual(conditions.length, 2);
+  assert.strictEqual(conditions[0].metric, "max_sprints");
+  assert.strictEqual(conditions[0].target, 3);
+  assert.strictEqual(conditions[0].area, "project");
+  assert.strictEqual(conditions[1].metric, "test_coverage");
+  assert.strictEqual(conditions[1].target, 80);
+  assert.strictEqual(r.stop_when.mode, "any_of");
+});
 
-// We can't import index.ts directly (needs pi runtime), but parseBdShow is standalone.
-// Test the regex logic inline by re-implementing minimally.
+// ── git.ts: default branch + branch checkout helpers ────────────
+console.log("\n## parallel/git.ts");
+
+const gitMod = await importModule(path.join("parallel", "git.ts"));
+const { resolveDefaultBranch, branchExistsInList, branchCheckoutArgs } = gitMod;
+
+await test("git: resolveDefaultBranch picks main when listed", () => {
+  assert.strictEqual(resolveDefaultBranch("  main\n* master\n"), "main");
+  assert.strictEqual(resolveDefaultBranch("* main\n  feat/x\n"), "main");
+});
+
+await test("git: resolveDefaultBranch falls back to master", () => {
+  assert.strictEqual(resolveDefaultBranch("* master\n  feat/x\n"), "master");
+  assert.strictEqual(resolveDefaultBranch(""), "master");
+});
+
+await test("git: branchExistsInList matches exact branch lines", () => {
+  const list = "  main\n* feat/abc\n  feat/abc2\n";
+  assert.ok(branchExistsInList(list, "feat/abc"));
+  assert.ok(branchExistsInList(list, "main"));
+  assert.ok(!branchExistsInList(list, "feat/abc2x"));
+  assert.ok(!branchExistsInList(list, "nope"));
+});
+
+await test("git: branchCheckoutArgs — existing branch vs create", () => {
+  assert.deepStrictEqual(branchCheckoutArgs(true, "feat/x"), ["checkout", "feat/x"]);
+  assert.deepStrictEqual(branchCheckoutArgs(false, "feat/x"), ["checkout", "-b", "feat/x"]);
+});
+
+// ── sprint.ts: review rounds, NaN ids, restart restore ──────────
+console.log("\n## sprint.ts: review rounds + id robustness");
+
+await test("sprint: setReviewRounds sets review_rounds (max semantics)", () => {
+  const store = new SprintStore();
+  const s = store.create(".", 1, "g");
+  store.addTask(s, { bd_id: "a1", title: "T", status: "backlog" });
+  store.setReviewRounds(s, "a1", 0);
+  assert.strictEqual(s.tasks[0].review_rounds, 0);
+  store.setReviewRounds(s, "a1", 3);
+  assert.strictEqual(s.tasks[0].review_rounds, 3);
+  store.setReviewRounds(s, "a1", 1); // never shrink
+  assert.strictEqual(s.tasks[0].review_rounds, 3);
+});
+
+await test("sprint: findLastSprintId ignores non-numeric/broken files", () => {
+  const tmpDir = fs.mkdtempSync(path.join(import.meta.dirname, "tmp-sprintid-"));
+  try {
+    fs.mkdirSync(path.join(tmpDir, ".agile"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, ".agile", "sprint-2.json"), "{}", "utf8");
+    fs.writeFileSync(path.join(tmpDir, ".agile", "sprint-abc.json"), "{}", "utf8");
+    fs.writeFileSync(path.join(tmpDir, ".agile", "sprint-2-backup.json"), "{}", "utf8");
+    const store = new SprintStore();
+    assert.strictEqual(store.findLastSprintId(tmpDir), 2);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+await test("sprint: getCurrent(workDir) restores sprint from disk after restart", () => {
+  const tmpDir = fs.mkdtempSync(path.join(import.meta.dirname, "tmp-restore-"));
+  try {
+    // Session 1: create + persist sprint 1 with a task
+    const store1 = new SprintStore();
+    const s1 = store1.create(tmpDir, 1, "goal");
+    store1.addTask(s1, { bd_id: "t1", title: "Task", status: "backlog" });
+    store1.markDone(s1, "t1");
+    store1.save(tmpDir, s1);
+
+    // Session 2 (new process): no in-memory state — must restore from disk
+    const store2 = new SprintStore();
+    const restored = store2.getCurrent(tmpDir);
+    assert.ok(restored, "sprint restored from disk");
+    assert.strictEqual(restored.id, 1);
+    assert.strictEqual(restored.tasks[0].status, "done");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+// ── observer.ts: velocity drop trigger ───────────────────────────
+console.log("\n## observer.ts: velocity drop");
+
+await test("observer: velocity drop ≥ threshold fires steer", () => {
+  const tmpDir = fs.mkdtempSync(path.join(import.meta.dirname, "tmp-vel-"));
+  try {
+    fs.mkdirSync(path.join(tmpDir, ".agile"), { recursive: true });
+    // Previous sprint: 4 done
+    const prev = { id: 1, goal: "g", status: "done", tasks: [
+      { bd_id: "a", title: "A", status: "done", review_rounds: 0, branch: "feat/a" },
+      { bd_id: "b", title: "B", status: "done", review_rounds: 0, branch: "feat/b" },
+      { bd_id: "c", title: "C", status: "done", review_rounds: 0, branch: "feat/c" },
+      { bd_id: "d", title: "D", status: "done", review_rounds: 0, branch: "feat/d" },
+    ], started_at: "", completed_at: "", velocity: { attempted: 4, done: 4, rework: 0, blocked: 0, avg_review_rounds: 0 } };
+    fs.writeFileSync(path.join(tmpDir, ".agile", "sprint-1.json"), JSON.stringify(prev), "utf8");
+    // Current sprint: only 1 done of 3 → 75% drop ≥ 50% threshold
+    const cur = { id: 2, goal: "g", status: "planning", tasks: [
+      { bd_id: "e", title: "E", status: "done", review_rounds: 0, branch: "feat/e" },
+      { bd_id: "f", title: "F", status: "done", review_rounds: 0, branch: "feat/f" },
+      { bd_id: "g", title: "G", status: "blocked", review_rounds: 0, branch: "feat/g" },
+    ], started_at: "", completed_at: "" };
+    const steers = runSprintObserver(cur, createObserverState(), DEFAULT_OBSERVER_CONFIG, tmpDir);
+    const vel = steers.find(s => s.type === "velocity_drop");
+    assert.ok(vel, "velocity_drop steer expected");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+await test("observer: no velocity_drop when previous sprint absent", () => {
+  const tmpDir = fs.mkdtempSync(path.join(import.meta.dirname, "tmp-vel2-"));
+  try {
+    fs.mkdirSync(path.join(tmpDir, ".agile"), { recursive: true });
+    const cur = { id: 1, goal: "g", status: "planning", tasks: [
+      { bd_id: "e", title: "E", status: "done", review_rounds: 0, branch: "feat/e" },
+    ], started_at: "", completed_at: "" };
+    const steers = runSprintObserver(cur, createObserverState(), DEFAULT_OBSERVER_CONFIG, tmpDir);
+    assert.ok(!steers.some(s => s.type === "velocity_drop"));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+await test("observer: no velocity_drop when drop below threshold", () => {
+  const tmpDir = fs.mkdtempSync(path.join(import.meta.dirname, "tmp-vel3-"));
+  try {
+    fs.mkdirSync(path.join(tmpDir, ".agile"), { recursive: true });
+    const prev = { id: 1, goal: "g", status: "done", tasks: [
+      { bd_id: "a", title: "A", status: "done", review_rounds: 0, branch: "feat/a" },
+      { bd_id: "b", title: "B", status: "done", review_rounds: 0, branch: "feat/b" },
+    ], started_at: "", completed_at: "", velocity: { attempted: 2, done: 2, rework: 0, blocked: 0, avg_review_rounds: 0 } };
+    fs.writeFileSync(path.join(tmpDir, ".agile", "sprint-1.json"), JSON.stringify(prev), "utf8");
+    // 2 → 2 = 0% drop
+    const cur = { id: 2, goal: "g", status: "planning", tasks: [
+      { bd_id: "e", title: "E", status: "done", review_rounds: 0, branch: "feat/e" },
+      { bd_id: "f", title: "F", status: "done", review_rounds: 0, branch: "feat/f" },
+    ], started_at: "", completed_at: "" };
+    const steers = runSprintObserver(cur, createObserverState(), DEFAULT_OBSERVER_CONFIG, tmpDir);
+    assert.ok(!steers.some(s => s.type === "velocity_drop"));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+// ── index.ts: parseBdShow ────────────────────────────────────────
+console.log("\n## parallel/bd.ts: parseBdShow");
+
+const bdMod = await importModule(path.join("parallel", "bd.ts"));
+const { parseBdShow } = bdMod;
+
 await test("parseBdShow extracts title from bd output", () => {
   const bdOutput = `○ agile-test-9do · Fix hardcoded credentials in auth.js   [● P2 · OPEN]
 Owner: fan92rus · Type: task
@@ -378,10 +475,8 @@ Created: 2026-07-27 · Updated: 2026-07-27
 DESCRIPTION
 Replace hardcoded password check with proper credential validation`;
 
-  const firstLine = bdOutput.split("\n")[0] ?? "";
-  const titleMatch = firstLine.match(/·\s+(.+?)\s+\[/);
-  assert.ok(titleMatch, "title regex should match");
-  assert.strictEqual(titleMatch[1].trim(), "Fix hardcoded credentials in auth.js");
+  const parsed = parseBdShow(bdOutput);
+  assert.strictEqual(parsed.title, "Fix hardcoded credentials in auth.js");
 });
 
 await test("parseBdShow extracts description section", () => {
@@ -393,9 +488,43 @@ Replace hardcoded password check with proper credential validation
 ACCEPTANCE CRITERIA
 No hardcoded secrets`;
 
-  const descMatch = bdOutput.match(/DESCRIPTION\n([\s\S]*?)(?:\n[A-Z]|$)/);
-  assert.ok(descMatch, "description regex should match");
-  assert.ok(descMatch[1].includes("Replace hardcoded"));
+  const parsed = parseBdShow(bdOutput);
+  assert.ok(parsed.description?.includes("Replace hardcoded"), "description captured");
+  assert.strictEqual(parsed.acceptanceCriteria, "No hardcoded secrets");
+});
+
+// Fix #5: multiline descriptions must NOT be truncated at the first
+// capitalised line. Only a section header (ALL-CAPS line), a triple blank
+// line, or EOF ends the description.
+await test("parseBdShow: multiline description not truncated by capitalised lines", () => {
+  const bdOutput = `○ agile-test-9do · Some task   [● P2 · OPEN]
+
+DESCRIPTION
+Fix the bug in the parser
+This is the second line of context
+Third line with more details
+
+ACCEPTANCE CRITERIA
+No regressions in existing tests`;
+
+  const parsed = parseBdShow(bdOutput);
+  assert.ok(parsed.description?.includes("Fix the bug in the parser"), "first line kept");
+  assert.ok(parsed.description?.includes("second line"), "second line kept");
+  assert.ok(parsed.description?.includes("Third line"), "third line kept");
+  assert.ok(!parsed.description?.includes("ACCEPTANCE"), "section header not captured");
+});
+
+// Fix #5: ALL-CAPS section header still terminates the description.
+await test("parseBdShow: ALL-CAPS section header ends description", () => {
+  const bdOutput = `○ agile-test-9do · Some task   [● P2 · OPEN]
+
+DESCRIPTION
+Replace hardcoded password check
+
+ACCEPTANCE CRITERIA
+No hardcoded secrets`;
+  const parsed = parseBdShow(bdOutput);
+  assert.strictEqual(parsed.description, "Replace hardcoded password check");
 });
 
 // ── index.ts: Level A guard (refuse empty task details) ──────────────
@@ -462,40 +591,47 @@ const { shouldSendContinuation, buildContinuationMessage, saveSessionState, load
 // still fires unless a followUp was already sent for it.
 
 await test("continuation: fires for planning sprint with all terminal tasks", () => {
-  assert.ok(shouldSendContinuation({ pendingCount: 0, taskCount: 3, sentForSprint: null, sprintId: 1, remainingSprints: undefined }));
+  assert.ok(shouldSendContinuation({ pendingCount: 0, taskCount: 3, sentForSprint: null, sprintId: 1, remainingSprints: undefined, loopStopped: false }));
 });
 
 await test("continuation: RC1 — done sprint still fires when no followUp sent yet", () => {
-  assert.ok(shouldSendContinuation({ pendingCount: 0, taskCount: 2, sentForSprint: null, sprintId: 1, remainingSprints: undefined }));
+  assert.ok(shouldSendContinuation({ pendingCount: 0, taskCount: 2, sentForSprint: null, sprintId: 1, remainingSprints: undefined, loopStopped: false }));
 });
 
 await test("continuation: done sprint suppressed once retrospective covered it", () => {
-  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 2, sentForSprint: 1, sprintId: 1, remainingSprints: undefined }));
+  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 2, sentForSprint: 1, sprintId: 1, remainingSprints: undefined, loopStopped: false }));
 });
 
 await test("continuation: does NOT fire when pending tasks remain", () => {
-  assert.ok(!shouldSendContinuation({ pendingCount: 1, taskCount: 3, sentForSprint: null, sprintId: 1, remainingSprints: undefined }));
+  assert.ok(!shouldSendContinuation({ pendingCount: 1, taskCount: 3, sentForSprint: null, sprintId: 1, remainingSprints: undefined, loopStopped: false }));
 });
 
 await test("continuation: does NOT fire for empty sprint", () => {
-  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 0, sentForSprint: null, sprintId: 1, remainingSprints: undefined }));
+  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 0, sentForSprint: null, sprintId: 1, remainingSprints: undefined, loopStopped: false }));
 });
 
 await test("continuation: does NOT fire twice for the same sprint (anti-spam)", () => {
-  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 3, sentForSprint: 1, sprintId: 1, remainingSprints: undefined }));
+  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 3, sentForSprint: 1, sprintId: 1, remainingSprints: undefined, loopStopped: false }));
 });
 
 await test("continuation: fires again for a NEW sprint id", () => {
-  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 3, sentForSprint: 1, sprintId: 1, remainingSprints: undefined })); // old sprint — no
-  assert.ok(shouldSendContinuation({ pendingCount: 0, taskCount: 3, sentForSprint: 1, sprintId: 2, remainingSprints: undefined })); // new sprint — yes
+  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 3, sentForSprint: 1, sprintId: 1, remainingSprints: undefined, loopStopped: false })); // old sprint — no
+  assert.ok(shouldSendContinuation({ pendingCount: 0, taskCount: 3, sentForSprint: 1, sprintId: 2, remainingSprints: undefined, loopStopped: false })); // new sprint — yes
 });
 
 await test("continuation: does NOT fire when all bounded sprints consumed", () => {
-  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 2, sentForSprint: null, sprintId: 1, remainingSprints: 0 }));
+  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 2, sentForSprint: null, sprintId: 1, remainingSprints: 0, loopStopped: false }));
 });
 
 await test("continuation: fires with bounded sprints left", () => {
-  assert.ok(shouldSendContinuation({ pendingCount: 0, taskCount: 2, sentForSprint: null, sprintId: 1, remainingSprints: 2 }));
+  assert.ok(shouldSendContinuation({ pendingCount: 0, taskCount: 2, sentForSprint: null, sprintId: 1, remainingSprints: 2, loopStopped: false }));
+});
+
+// Fix #11: after /agile stop the loop is explicitly stopped — no nudges even
+// in continuous mode (remainingSprints === undefined).
+await test("continuation: does NOT fire after /agile stop (loopStopped)", () => {
+  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 2, sentForSprint: null, sprintId: 1, remainingSprints: undefined, loopStopped: true }));
+  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 2, sentForSprint: null, sprintId: 1, remainingSprints: 3, loopStopped: true }));
 });
 
 // buildContinuationMessage — the exact followUp text sent to the agent.
@@ -538,11 +674,40 @@ console.log("\n## continuation.ts: session state persistence (RC3)");
 await test("session state: save + load round-trip", () => {
   const tmpDir = fs.mkdtempSync(path.join(import.meta.dirname, "tmp-session-"));
   try {
-    saveSessionState(tmpDir, { remainingSprints: 2, originalRequest: "fix stuff", sprintLoopActive: true });
+    saveSessionState(tmpDir, { remainingSprints: 2, originalRequest: "fix stuff", sprintLoopActive: true, loopStopped: false });
     const loaded = loadSessionState(tmpDir);
     assert.strictEqual(loaded.remainingSprints, 2);
     assert.strictEqual(loaded.originalRequest, "fix stuff");
     assert.strictEqual(loaded.sprintLoopActive, true);
+    assert.strictEqual(loaded.loopStopped, false);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+await test("session state: loopStopped round-trips (fix #11)", () => {
+  const tmpDir = fs.mkdtempSync(path.join(import.meta.dirname, "tmp-session5-"));
+  try {
+    saveSessionState(tmpDir, { remainingSprints: undefined, originalRequest: "", sprintLoopActive: false, loopStopped: true });
+    const loaded = loadSessionState(tmpDir);
+    assert.strictEqual(loaded.loopStopped, true);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+await test("session state: legacy file without loopStopped loads as undefined", () => {
+  const tmpDir = fs.mkdtempSync(path.join(import.meta.dirname, "tmp-session6-"));
+  try {
+    fs.mkdirSync(path.join(tmpDir, ".agile"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, ".agile", "session.json"),
+      JSON.stringify({ remainingSprints: 3, originalRequest: "x", sprintLoopActive: true }),
+      "utf8",
+    );
+    const loaded = loadSessionState(tmpDir);
+    assert.strictEqual(loaded.loopStopped, undefined); // absent in old file → runtime keeps in-memory default
+    assert.strictEqual(loaded.remainingSprints, 3);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

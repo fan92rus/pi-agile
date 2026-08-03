@@ -26,6 +26,8 @@ export interface ContinuationOptions {
   sprintId: number;
   /** undefined = continuous mode (unlimited). */
   remainingSprints: number | undefined;
+  /** true after /agile stop — the loop was explicitly halted, no more nudges. */
+  loopStopped: boolean;
 }
 
 /**
@@ -34,13 +36,15 @@ export interface ContinuationOptions {
  * - empty sprint → no (nothing to nudge about)
  * - already nudged for this sprint id → no (anti-spam)
  * - bounded loop with 0 sprints left → no (loop is over)
+ * - loop explicitly stopped (/agile stop) → no
  */
 export function shouldSendContinuation(opts: ContinuationOptions): boolean {
-  const { pendingCount, taskCount, sentForSprint, sprintId, remainingSprints } = opts;
+  const { pendingCount, taskCount, sentForSprint, sprintId, remainingSprints, loopStopped } = opts;
   if (pendingCount > 0) return false;
   if (taskCount === 0) return false;
   if (sentForSprint === sprintId) return false;
   if (remainingSprints !== undefined && remainingSprints <= 0) return false;
+  if (loopStopped) return false;
   return true;
 }
 
@@ -96,6 +100,8 @@ export interface SessionState {
   remainingSprints: number | undefined;
   originalRequest: string;
   sprintLoopActive: boolean;
+  /** true after /agile stop — persisted so a restarted session does not re-nudge. */
+  loopStopped: boolean;
 }
 
 export function sessionStateFilePath(workDir: string): string {
@@ -122,6 +128,7 @@ export function loadSessionState(workDir: string): Partial<SessionState> {
     if (typeof data.remainingSprints === "number") result.remainingSprints = data.remainingSprints;
     if (typeof data.originalRequest === "string") result.originalRequest = data.originalRequest;
     if (typeof data.sprintLoopActive === "boolean") result.sprintLoopActive = data.sprintLoopActive;
+    if (typeof data.loopStopped === "boolean") result.loopStopped = data.loopStopped;
     return result;
   } catch {
     return {};
