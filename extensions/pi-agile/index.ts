@@ -157,6 +157,10 @@ function getSpawnTimeout(workDir: string): number {
  * If a subagent shows NO activity (no tool calls, no output writes) for this long,
  * pollWithProgress interrupts and force-stops it instead of waiting forever. */
 function getStuckTimeout(workDir: string): number {
+  // Env override (PI_AGILE_STUCK_TIMEOUT_MS) — lets tests drive the Level B
+  // stuck-worker path without a 30-minute wait; users can tune it too.
+  const envRaw = parseInt(process.env.PI_AGILE_STUCK_TIMEOUT_MS ?? "", 10);
+  if (!Number.isNaN(envRaw) && envRaw > 0) return envRaw;
   const config = loadAgileConfig(workDir);
   const raw = config.worker_stuck_timeout;
   if (typeof raw === "number" && raw >= 60_000) return raw;
@@ -225,6 +229,17 @@ async function execText(
   } catch (e: unknown) {
     return `[exec error] ${e instanceof Error ? e.message : String(e)}`;
   }
+}
+
+/**
+ * Remove a subagent output file before (re-)spawning, so pollWithProgress
+ * cannot short-circuit on a stale file from a PREVIOUS delegation of the same
+ * task (re-delegation after rework read the old verdict — silent staleness).
+ */
+function clearOutputFile(file: string): void {
+  try {
+    fs.rmSync(file, { force: true });
+  } catch { /* best effort */ }
 }
 
 async function gitCreateBranch(pi: ExtensionAPI, workDir: string, branch: string): Promise<void> {
@@ -456,6 +471,7 @@ async function delegateTaskInWorktree(
     const agentTaskText = buildChainAgentTask(agent, meta.title, meta.description, meta.acceptanceCriteria, constraints, patterns, chainOutputs);
     let spawned: SpawnedWorker;
     try {
+      clearOutputFile(agentOutput);
       spawned = await rpc_.spawn({
         agent: agent,
         model: getAgentModel(workDir, agent),
@@ -502,6 +518,7 @@ async function delegateTaskInWorktree(
 
     let worker: SpawnedWorker;
     try {
+      clearOutputFile(workerOutput);
       worker = await rpc_.spawn({
         agent: "worker",
         model: getAgentModel(workDir, "worker"),
@@ -542,6 +559,7 @@ async function delegateTaskInWorktree(
 
     let reviewer: SpawnedWorker;
     try {
+      clearOutputFile(reviewerOutput);
       reviewer = await rpc_.spawn({
         agent: "reviewer",
         model: getAgentModel(workDir, "reviewer"),
@@ -1010,12 +1028,14 @@ async function pollWithProgress(
       if (idleMs > stuckTimeoutMs) {
         onUpdate?.({ content: [{ type: "text", text: `⏱ ${role} idle for ${Math.round(idleMs / 60000)}m (> ${Math.round(stuckTimeoutMs / 60000)}m) — interrupting stuck worker` }] });
         try { await rpc.interrupt(runId, 5000); } catch {}
-        // Give it a moment to finish the current turn after interrupt
+        // Give it a moment to finish the current turn after interrupt — check
+        // status FIRST, sleep only while the run is still not terminal (an
+        // immediate stop returns instantly instead of wasting 5s).
         for (let w = 0; w < 6; w++) {
-          await new Promise((r) => setTimeout(r, 5000));
           const s2 = (await rpc.status(runId, 3000)) as { state?: string } | null;
           if (s2?.state === "stopped" || s2?.state === "failed" || s2?.state === "completed") break;
           if (fs.existsSync(outputFile)) break;
+          await new Promise((r) => setTimeout(r, 5000));
         }
         try { await rpc.stop(runId, 5000); } catch {}
         onUpdate?.({ content: [{ type: "text", text: `⏱ ${role} force-stopped after ${Math.round(idleMs / 60000)}m of inactivity. Check task description / bd database.` }] });
@@ -1538,6 +1558,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
 
           let spawned: SpawnedWorker;
           try {
+            clearOutputFile(scoutOutput);
             spawned = await rpc.spawn({
               agent: "worker",
               model: getAgentModel(workDir, "scout"),
@@ -1630,6 +1651,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       // Spawn detective subagent
       let spawned: SpawnedWorker;
       try {
+        clearOutputFile(detectiveOutput);
         spawned = await rpc.spawn({
           agent: "worker",
           model: modelOverride ?? getAgentModel(workDir, "detective"),
@@ -1847,11 +1869,12 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       // 2b. Run chain agents before worker (scout, researcher, planner, etc.)
       const chainOutputs: { agent: string; output: string }[] = [];
       const preWorker = taskChain.slice(0, taskChain.indexOf("worker"));
-      for (const agent of preWorker) {
+        for (const agent of preWorker) {
         try { pi.notify(`[${bdId}] Chain: ${agent} starting...`, "info"); } catch {}
         const agentOutput = path.join(workDir, ".agile", `${agent}-${bdId}.txt`);
         const agentTaskText = buildChainAgentTask(agent, title, description, acceptanceCriteria, constraints, patterns, chainOutputs);
         try {
+          clearOutputFile(agentOutput);
           const spawned = await rpc.spawn({
             agent, model: getAgentModel(workDir, agent),
             task: agentTaskText, cwd: workDir, context: "fresh",
@@ -1874,6 +1897,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
 
       let worker: SpawnedWorker;
       try {
+        clearOutputFile(workerOutput);
         worker = await rpc.spawn({
           agent: "worker",
           model: getAgentModel(workDir, "worker"),
@@ -1923,6 +1947,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
 
       let reviewer: SpawnedWorker;
       try {
+        clearOutputFile(reviewerOutput);
         reviewer = await rpc.spawn({
           agent: "reviewer",
           model: getAgentModel(workDir, "reviewer"),

@@ -21,6 +21,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 
 export const RPC_REQUEST = "subagents:rpc:v1:request";
 export const RPC_REPLY_PREFIX = "subagents:rpc:v1:reply:";
@@ -76,13 +77,16 @@ export function reviewerVerdictText(status, extra = {}) {
  *   pollWithProgress exercise its RPC-bridge-dead guard instead of the file.
  * statusImpl: (runId) => { state, lastActivityAt } — override status response;
  *   throw to simulate a dead bridge after spawn.
+ * commitWorkerChange: when true, the fake worker also commits a real change in
+ *   its cwd (so the REAL-git integration path produces a non-empty diff).
  */
 export function createFakeBridge({
   verdictFor = () => "blocked",
   workerSummary = "Worker implemented the change.\n",
   writeOutput = true,
   statusImpl,
-  bridgeState = {}, // { dead: false } — mutate to simulate a dead RPC bridge
+  bridgeState = {}, // { dead: false, stuck: false } — mutate to simulate failures
+  commitWorkerChange = false,
 } = {}) {
   return (events) => (req) => {
     const replyEvent = `${RPC_REPLY_PREFIX}${req.requestId}`;
@@ -92,9 +96,11 @@ export function createFakeBridge({
       const runId = `run-${String(req.requestId).slice(0, 8)}`;
       const params = req.params ?? {};
       const outFile = params.output;
-      if (outFile && writeOutput && !bridgeState.dead) {
+      const base = outFile ? path.basename(outFile) : "";
+      // worker-<bdId>.txt (single delegate) AND worker-<bdId>-r<N>.txt (batch rounds)
+      const isRealWorker = /^worker-[\w.-]+\.txt$/.test(base);
+      if (outFile && writeOutput && !bridgeState.dead && !bridgeState.stuck) {
         fs.mkdirSync(path.dirname(outFile), { recursive: true });
-        const base = path.basename(outFile); // e.g. worker-t1-r1.txt, review-t2-r2.txt, scout-output.txt
         const roleMatch = base.match(/^(worker|review)-([\w.-]+?)(?:-r(\d+))?\.txt$/);
         const bdId = roleMatch ? roleMatch[2] : "scout";
         const round = roleMatch && roleMatch[3] ? parseInt(roleMatch[3], 10) : 1;
@@ -114,14 +120,30 @@ export function createFakeBridge({
         }
         fs.writeFileSync(outFile, content, "utf8");
       }
+      if (commitWorkerChange && isRealWorker && !bridgeState.dead && !bridgeState.stuck && params.cwd) {
+        // Fake worker commits a real change so the real-git diff is non-empty.
+        try {
+          fs.writeFileSync(path.join(params.cwd, `change-${runId}.txt`), `work by ${runId}\n`);
+          execFileSync("git", ["add", "-A"], { cwd: params.cwd });
+          execFileSync("git", ["commit", "-m", `feat: ${runId}`], { cwd: params.cwd });
+        } catch { /* non-git cwd — ignore */ }
+      }
       return ok({ details: { runId, asyncDir: outFile ? path.dirname(outFile) : os.tmpdir() } });
     }
     if (req.method === "status") {
       if (bridgeState.dead) throw new Error("RPC bridge unreachable (fake dead bridge)");
+      if (bridgeState.stuck) {
+        return ok({ state: "running", lastActivityAt: Date.now() - 3_600_000 });
+      }
       if (statusImpl) return ok(statusImpl(req.runId));
       return ok({ state: "completed", lastActivityAt: Date.now() });
     }
-    return ok({}); // interrupt / stop / anything else
+    if (req.method === "interrupt" || req.method === "stop") {
+      // After an interrupt in stuck mode the run goes terminal.
+      if (bridgeState.stuck) bridgeState.stuck = false;
+      return ok({});
+    }
+    return ok({}); // anything else
   };
 }
 
@@ -135,6 +157,7 @@ export function createFakePi({
   bridge,                   // events => handler; if set, registered as RPC bridge
   extraExec,                // (cmd, args, opts) => result | undefined
   gitState = {},            // mutable knobs: showCurrent, headBefore, headAfter
+  realGit = false,          // run REAL git (child_process) instead of canned answers
 } = {}) {
   const tools = [];
   const commands = [];
@@ -194,6 +217,18 @@ export function createFakePi({
       }
 
       if (cmd === "git") {
+        if (realGit) {
+          try {
+            const out = execFileSync("git", args, { cwd: opts.cwd, encoding: "utf8" });
+            return { code: 0, stdout: out, stderr: "" };
+          } catch (e) {
+            return {
+              code: e.status ?? 1,
+              stdout: e.stdout ?? "",
+              stderr: `${e.stderr ?? e.message}`,
+            };
+          }
+        }
         const joined = args.join(" ");
         // worktree add -b <branch> <wtDir> <base> — auto-register for cwd-aware answers
         if (joined.startsWith("worktree add") && args.includes("-b")) {

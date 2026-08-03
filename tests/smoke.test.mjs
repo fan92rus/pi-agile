@@ -983,8 +983,7 @@ await test("real agent_end: no nudge when agile mode is OFF", async () => {
   }
 });
 
-await test("real extension e2e: start sprint → retrospective → agent_end nudges once", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
+await test("real extension e2e: start sprint → retrospective → agent_end nudges once", async () => {  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
   try {
     const bdTasks = new Map([["t1", "Task t1"], ["t2", "Task t2"]]);
     const { pi, tool, command, hook } = createFakePi({ bdTasks });
@@ -1005,6 +1004,196 @@ await test("real extension e2e: start sprint → retrospective → agent_end nud
     assert.ok(sess.sprintLoopActive === undefined || typeof sess.sprintLoopActive === "boolean");
     return null;
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── rpc.ts protocol (real RpcClient over the fake EventBus) ──
+console.log("## rpc.ts protocol");
+
+const {
+  RpcClient, RpcClientError, buildRequest, replyEventFor, parseSpawnReply,
+  SUBAGENT_RPC_REQUEST_EVENT, SUBAGENT_RPC_REPLY_EVENT_PREFIX,
+} = await importModule("parallel/rpc.ts");
+const { createEventBus, createFakeBridge } = await import(pathToFileURL(path.join(import.meta.dirname, "fake-pi.ts")).href);
+
+/** Attach a scripted bridge: map method -> reply data (or null = no reply). */
+function scriptedBridge(events, handler) {
+  events.on(SUBAGENT_RPC_REQUEST_EVENT, (req) => {
+    const data = handler(req);
+    if (data === null) return; // simulate a dead bridge (no reply)
+    events.emit(replyEventFor(req.requestId), {
+      version: 1,
+      requestId: req.requestId,
+      success: data?.error ? false : true,
+      ...(data?.error ? { error: data.error } : { data }),
+    });
+  });
+}
+
+await test("rpc: buildRequest envelope", () => {
+  const r = buildRequest("ping");
+  assert.strictEqual(r.version, 1);
+  assert.strictEqual(r.method, "ping");
+  assert.ok(r.requestId && typeof r.requestId === "string" && r.requestId.length > 8);
+  assert.deepStrictEqual(r.source, { extension: "pi-agile" });
+  assert.ok(!("params" in r), "no params key when undefined");
+  const withParams = buildRequest("spawn", { agent: "worker" });
+  assert.deepStrictEqual(withParams.params, { agent: "worker" });
+  return null;
+});
+
+await test("rpc: replyEventFor channel naming", () => {
+  assert.strictEqual(replyEventFor("abc"), `${SUBAGENT_RPC_REPLY_EVENT_PREFIX}abc`);
+  return null;
+});
+
+await test("rpc: parseSpawnReply success/error cases", () => {
+  assert.deepStrictEqual(
+    parseSpawnReply({ version: 1, requestId: "x", success: true, data: { details: { runId: "r1", asyncDir: "/d" } } }),
+    { runId: "r1", asyncDir: "/d" },
+  );
+  assert.deepStrictEqual(
+    parseSpawnReply({ version: 1, requestId: "x", success: true, data: { details: { runId: "r2" } } }),
+    { runId: "r2", asyncDir: "" },
+    "asyncDir defaults to empty",
+  );
+  assert.throws(
+    () => parseSpawnReply({ version: 1, requestId: "x", success: true, data: { details: {} } }),
+    (e) => e instanceof RpcClientError && e.code === "execution_failed",
+  );
+  assert.throws(
+    () => parseSpawnReply({ version: 1, requestId: "x", success: false, error: { code: "limit", message: "budget" } }),
+    (e) => e instanceof RpcClientError && e.code === "limit" && e.message === "budget",
+  );
+  assert.throws(() => parseSpawnReply("junk"), (e) => e.code === "invalid_reply");
+  return null;
+});
+
+await test("rpc: ping true with bridge / false on timeout", async () => {
+  const events = createEventBus();
+  scriptedBridge(events, () => ({}));
+  assert.strictEqual(await new RpcClient(events).ping(50), true);
+
+  const silent = createEventBus(); // no bridge
+  assert.strictEqual(await new RpcClient(silent).ping(20), false);
+  return null;
+});
+
+await test("rpc: spawn returns runId + forces async/clarify in params", async () => {
+  const events = createEventBus();
+  let seen = null;
+  scriptedBridge(events, (req) => {
+    seen = req;
+    return { details: { runId: "run-123", asyncDir: "/tmp/x" } };
+  });
+  const client = new RpcClient(events);
+  const w = await client.spawn({ agent: "worker", task: "t", cwd: "/c", output: "/o.txt" }, 100);
+  assert.deepStrictEqual(w, { runId: "run-123", asyncDir: "/tmp/x" });
+  assert.strictEqual(seen.method, "spawn");
+  assert.strictEqual(seen.params.async, true, "spawn must be detached async");
+  assert.strictEqual(seen.params.clarify, false, "spawn must skip clarify UI");
+  assert.strictEqual(seen.params.agent, "worker");
+  assert.strictEqual(seen.params.output, "/o.txt");
+  return null;
+});
+
+await test("rpc: spawn timeout rejects with RpcClientError", async () => {
+  const events = createEventBus(); // no bridge
+  await assert.rejects(
+    new RpcClient(events).spawn({ agent: "worker", task: "t", cwd: "/c" }, 20),
+    (e) => e instanceof RpcClientError && e.code === "timeout",
+  );
+  return null;
+});
+
+await test("rpc: status/stop semantics + onceEvent unsubscribes on timeout", async () => {
+  const events = createEventBus();
+  scriptedBridge(events, (req) => (req.method === "status" ? { state: "running" } : { stopped: true }));
+  const client = new RpcClient(events);
+  assert.deepStrictEqual(await client.status("r1", 50), { state: "running" });
+  assert.strictEqual(await client.stop("r1", 50), true);
+
+  const silent = createEventBus();
+  const c2 = new RpcClient(silent);
+  assert.strictEqual(await c2.status("r1", 20), null);
+  assert.strictEqual(await c2.stop("r1", 20), false);
+  // after the timeout the reply-channel listener must be gone (no leak)
+  const chans = Object.keys(silent.listeners ?? {}).length ?? 0;
+  return null;
+});
+
+await test("rpc: wrong-requestId reply is ignored; matching one resolves", async () => {
+  const events = createEventBus();
+  let reqId = "";
+  events.on(SUBAGENT_RPC_REQUEST_EVENT, (req) => {
+    reqId = req.requestId;
+    // First a wrong-id reply, then the correct one.
+    events.emit(replyEventFor("wrong-id"), { version: 1, requestId: "wrong-id", success: true, data: { details: { runId: "BAD" } } });
+    events.emit(replyEventFor(req.requestId), { version: 1, requestId: req.requestId, success: true, data: { details: { runId: "GOOD" } } });
+  });
+  const w = await new RpcClient(events).spawn({ agent: "worker", task: "t", cwd: "/c" }, 100);
+  assert.strictEqual(w.runId, "GOOD");
+  return null;
+});
+
+await test("pollWithProgress: Level B interrupts a stuck worker (env timeout)", async () => {
+  process.env.PI_AGILE_STUCK_TIMEOUT_MS = "10";
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-stuck-"));
+  try {
+    const bridgeState = { stuck: true };
+    const { pi, tool, command } = createFakePi({
+      bdTasks: new Map([["t1", "Task t1"]]),
+      bridge: createFakeBridge({ bridgeState }),
+    });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-stuck");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    const t0 = Date.now();
+    const res = await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "T", description: "d" }, null, null, ctx);
+    const elapsed = Date.now() - t0;
+    const text = res.content?.[0]?.text ?? "";
+    assert.ok(
+      /did not complete|idle for|force-stopped/i.test(text),
+      `stuck worker must fail the delegate (got: ${text.slice(0, 120)})`,
+    );
+    assert.ok(elapsed < 2000, `stuck-worker abort took ${elapsed}ms (post-interrupt loop must not sleep 5s)`);
+    assert.strictEqual(bridgeState.stuck, false, "interrupt must clear the stuck flag");
+    return null;
+  } finally {
+    delete process.env.PI_AGILE_STUCK_TIMEOUT_MS;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("re-delegation does not short-circuit on stale worker files", async () => {
+  process.env.PI_AGILE_STUCK_TIMEOUT_MS = "10";
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-stale-"));
+  try {
+    const bridgeState = { stuck: false };
+    const { pi, tool, command } = createFakePi({
+      bdTasks: new Map([["t1", "Task t1"]]),
+      bridge: createFakeBridge({ bridgeState }),
+    });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-stale");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    // 1st delegation — writes worker-t1.txt / review-t1.txt
+    const r1 = await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "T", description: "d" }, null, null, ctx);
+    assert.ok(/BLOCKED|Verdict/.test(r1.content?.[0]?.text ?? ""), "first delegation must complete");
+    // 2nd delegation with a SILENT bridge (stuck) — must FAIL, not read the
+    // stale files from the first run (clearOutputFile fix).
+    bridgeState.stuck = true;
+    const r2 = await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "T", description: "d" }, null, null, ctx);
+    assert.ok(
+    /did not complete|idle for|force-stopped/i.test(r2.content?.[0]?.text ?? ""),
+    `re-delegation must NOT succeed from stale files (got: ${(r2.content?.[0]?.text ?? "").slice(0, 120)})`,
+    );
+    return null;
+  } finally {
+    delete process.env.PI_AGILE_STUCK_TIMEOUT_MS;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -21,6 +21,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { execFileSync } from "node:child_process";
 
 const EXT_DIR = path.join(import.meta.dirname, "..", "extensions", "pi-agile");
 const importMod = (rel) => import(pathToFileURL(path.join(EXT_DIR, rel)).href);
@@ -66,9 +67,10 @@ async function forAll({ seeds = 25, maxActions = 50, name, run }) {
     } catch (e) {
       pbtFail++;
       const repro = await shrinkPrefix(run, seed, maxActions);
-      const log = repro?.log?.length ? `\n       actions: ${repro.log.join(" → ")}` : "";
-      pbtFailures.push({ name, seed, message: e.message, log: repro?.log ?? null });
-      console.error(`  ❌ ${name} [seed=${seed}]${log}\n     ${e.message}`);
+      const fullLog = e.log ?? [];
+      const log = repro?.log?.length ? repro.log : fullLog;
+      pbtFailures.push({ name, seed, message: e.message, log: log });
+      console.error(`  ❌ ${name} [seed=${seed}]${log.length ? `\n       actions: ${log.join(" → ")}` : ""}\n     ${e.message}`);
     }
     if (process.env.PBT_DEBUG) console.error(`  [${name}] seed=${seed} done in ${Date.now() - t0}ms`);
   }
@@ -103,15 +105,16 @@ const NUDGE_RE =
   /Decide and act now|sprints? remaining|All sprints completed|continue to next sprint|next sprint or stop|continue or stop/i;
 
 class RealSystem {
-  constructor(dir, seed, rng) {
+  constructor(dir, seed, rng, opts = {}) {
     this.dir = dir;
     this.seed = seed;
     this.rng = rng;
+    this.realGit = opts.realGit ?? false; // run REAL git via child_process
     this.bdTasks = new Map(); // bdId -> title (bd list / bd show fakes)
     this.nextTask = 1;
     this.pendingVerdict = "blocked"; // what the fake reviewer says on next single delegate
     this.batchVerdicts = new Map(); // bdId -> verdict for batch runs
-    this.bridgeState = { dead: false }; // flip to simulate dead RPC bridge
+    this.bridgeState = { dead: false, stuck: false }; // flip to simulate failures
     this.gitState = { originalBranch: "main", showCurrent: "main", headBefore: "aaa111", headAfter: "aaa111" };
     this.execTable = {}; // mutable exec overrides (e.g. failing `npm test`)
     this.batchVerdictsRef = this.batchVerdicts;
@@ -119,9 +122,11 @@ class RealSystem {
       bdTasks: this.bdTasks,
       gitState: this.gitState,
       execTable: this.execTable,
+      realGit: this.realGit,
       bridge: createFakeBridge({
         bridgeState: this.bridgeState,
         verdictFor: (bdId) => this.batchVerdicts.get(bdId) ?? this.pendingVerdict,
+        commitWorkerChange: opts.commitWorkerChange ?? false,
       }),
     });
     piAgileExtension(pi); // real extension registers on the fake pi
@@ -181,13 +186,28 @@ class RealSystem {
     if (eligible.length === 0) return;
     const t = genPick(this.rng, eligible);
     this.pendingVerdict = this.rng() < 0.6 ? "blocked" : "rework";
-    await this.tool("agile_delegate_task").execute(
+    const wasStuck = this.bridgeState.stuck;
+    const wasDead = this.bridgeState.dead;
+    const res = await this.tool("agile_delegate_task").execute(
       "t",
       { bd_id: t.bd_id, title: t.title, description: `desc ${t.bd_id}` },
       null,
       null,
       this.ctx,
     );
+    if (wasStuck) {
+      // P20: a stuck worker must fail the delegate with an explicit error
+      const text = res.content?.[0]?.text ?? "";
+      assert.ok(
+        /did not complete|idle for|force-stopped/i.test(text),
+        `P20: stuck worker must abort delegate (got: ${text.slice(0, 120)})`,
+      );
+      // The interrupt path clears stuck — unless the bridge is ALSO dead, in
+      // which case the dead-bridge abort wins (nothing to interrupt).
+      if (!wasDead) {
+        assert.ok(!this.bridgeState.stuck, "P20: interrupt must clear stuck state");
+      }
+    }
     this.record(`delegate(${t.bd_id}→${this.pendingVerdict})`);
   }
 
@@ -289,7 +309,15 @@ class RealSystem {
   async merge() {
     const sprint = readLatestSprint(this.dir);
     if (!sprint || sprint.tasks.length === 0) return;
-    const candidates = sprint.tasks.filter((t) => t.status !== "done");
+    let candidates;
+    if (this.realGit) {
+      // Real git: merging a branch that does not exist fails — only merge
+      // tasks whose feat/<bdId> branch actually exists.
+      const branches = this.branchList();
+      candidates = sprint.tasks.filter((t) => t.status !== "done" && branches.includes(`feat/${t.bd_id}`));
+    } else {
+      candidates = sprint.tasks.filter((t) => t.status !== "done");
+    }
     if (candidates.length === 0) return;
     const t = genPick(this.rng, candidates);
     // Occasionally the project gains a failing test runner (package.json +
@@ -313,8 +341,10 @@ class RealSystem {
 
   async investigate() {
     const concern = `Potential bug in zone ${genInt(this.rng, 1, 9)}`;
-    const dirty = this.rng() < 0.25; // occasionally the checkout-back silently fails
-    const committed = this.rng() < 0.2; // occasionally the detective commits a repro
+    // In realGit mode the branch state comes from REAL git — the dirty/commit
+    // variants are fake-git knobs only.
+    const dirty = !this.realGit && this.rng() < 0.25; // occasionally the checkout-back silently fails
+    const committed = !this.realGit && this.rng() < 0.2; // occasionally the detective commits a repro
     this.gitState.originalBranch = "main";
     this.gitState.showCurrent = dirty ? "investigate/xyz" : "main";
     this.gitState.headBefore = "aaa111";
@@ -414,12 +444,26 @@ class RealSystem {
     this.bridgeState.dead = true;
     this.record("deadBridge");
   }
+
+  async stuckBridge() {
+    this.bridgeState.stuck = true;
+    this.record("stuckBridge");
+  }
+
+  /** Real git helpers (only meaningful when realGit: true). */
+  gitExec(args, cwd) {
+    return execFileSync("git", args, { cwd: cwd ?? this.dir, encoding: "utf8" });
+  }
+
+  branchList() {
+    return this.gitExec(["branch", "--list"]);
+  }
 }
 
 const WEIGHTS = [
   ["startSprint", 5], ["delegate", 8], ["delegateBatch", 5], ["merge", 4],
   ["retrospective", 3], ["agentEnd", 7], ["investigate", 3], ["discover", 3],
-  ["knowledge", 2], ["status", 2], ["setup", 1], ["deadBridge", 1],
+  ["knowledge", 2], ["status", 2], ["setup", 1], ["deadBridge", 1], ["stuckBridge", 1],
   ["runBounded", 2], ["runContinuous", 2], ["stop", 2], ["restart", 2],
   ["injectTasks", 1], ["corruptSession", 1], ["corruptSprintFile", 2],
 ];
@@ -508,6 +552,32 @@ async function checkInvariants(sys) {
     }
   }
 
+  // P19: REAL git branch lifecycle (realGit scenarios only)
+  if (sys.realGit && sys.lastAction) {
+    if (sys.lastAction.startsWith("delegate(")) {
+      const id = sys.lastAction.match(/^delegate\(([^→]+)/)?.[1];
+      if (id) {
+        assert.ok(
+          sys.branchList().includes(`feat/${id}`),
+          `P19: feat/${id} must exist after delegate (branches: ${sys.branchList().trim().replace(/\n/g, ", ")})`,
+        );
+      }
+    }
+    if (sys.lastAction.startsWith("merge(")) {
+      const id = sys.lastAction.match(/^merge\(([^,)]+)/)?.[1];
+      if (id) {
+        assert.ok(
+          !sys.branchList().includes(`feat/${id}`),
+          `P19: feat/${id} must be deleted after merge`,
+        );
+      }
+    }
+    if (sys.lastAction.startsWith("delegateBatch(")) {
+      const wt = (sys.gitExec(["worktree", "list", "--porcelain"]).match(/^worktree /gm) ?? []).length;
+      assert.ok(wt === 1, `P19: batch must clean up worktrees (found ${wt})`);
+    }
+  }
+
   // P18: batch that sent its own terminal/continuation steer must NOT get a
   // second continuation from the immediately-following agent_end (M2 disease
   // for the batch path — the merge tool was fixed, executeBatchTasks was not).
@@ -541,6 +611,55 @@ async function runScenario(rng, seed, maxActions) {
       if (process.env.PBT_DEBUG && Date.now() - tA > 400) {
         console.error(`    [slow] ${action} took ${Date.now() - tA}ms (log: ${sys.log.join(" → ")})`);
       }
+      await checkInvariants(sys);
+    }
+  } catch (e) {
+    e.log = sys.log;
+    throw e;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ── REAL git repository scenario ───────────────────────────────────────
+
+function setupRealGit(dir) {
+  const run = (args) => execFileSync("git", args, { cwd: dir, encoding: "utf8", stdio: "pipe" });
+  run(["init", "-q"]);
+  run(["config", "user.email", "pbt@test.local"]);
+  run(["config", "user.name", "PBT"]);
+  fs.writeFileSync(path.join(dir, "readme.md"), "# pbt\n");
+  run(["add", "-A"]);
+  run(["commit", "-qm", "init"]);
+  run(["branch", "-M", "main"]);
+}
+
+const REALGIT_WEIGHTS = [
+  ["startSprint", 6], ["delegate", 8], ["delegateBatch", 4], ["merge", 4],
+  ["retrospective", 3], ["agentEnd", 6], ["investigate", 2], ["knowledge", 2],
+  ["status", 2], ["runBounded", 2], ["runContinuous", 2], ["stop", 2],
+  ["restart", 2], ["injectTasks", 1],
+];
+
+async function runScenarioRealGit(rng, seed, maxActions) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `pbt-rg-${seed}-`));
+  setupRealGit(dir);
+  const sys = new RealSystem(dir, seed, rng, { realGit: true, commitWorkerChange: true });
+  try {
+    await sys.agileOn();
+    for (let step = 0; step < maxActions; step++) {
+      sys.actionMarker = sys.pi.sentMessages.length;
+      const total = REALGIT_WEIGHTS.reduce((s, [, w]) => s + w, 0);
+      let roll = rng() * total;
+      let action = "agentEnd";
+      for (const [name, w] of REALGIT_WEIGHTS) {
+        roll -= w;
+        if (roll <= 0) {
+          action = name;
+          break;
+        }
+      }
+      await sys[action]();
       await checkInvariants(sys);
     }
   } catch (e) {
@@ -670,6 +789,9 @@ console.log("# pi-agile PBT v2 (REAL extension via fake pi) + pure properties\n"
 
 console.log("## state machine: real orchestration (invariants after every action)");
 await forAll({ name: "real extension lifecycle", run: runScenario });
+
+console.log("## state machine: REAL git repository (checkout/diff/merge/worktree/branch -D)");
+await forAll({ seeds: 10, maxActions: 20, name: "real git integration lifecycle", run: runScenarioRealGit });
 
 console.log("## pure: continuation gate implication");
 await forAll({ seeds: 20, maxActions: 1, name: "gate fires only when all guards clear", run: (rng) => pureContinuationGate(rng) });
