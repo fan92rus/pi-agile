@@ -959,7 +959,7 @@ const { createFakePi, makeCtx, readSession, createFakeBridge, makeFakeUi, readLa
   pathToFileURL(path.join(import.meta.dirname, "fake-pi.ts")).href
 );
 
-await test("real extension registers 7 tools + 2 hooks + 1 command on fake pi", () => {
+await test("real extension registers 8 tools + 2 hooks + 1 command on fake pi", () => {
   const { pi, tool, command, hook } = createFakePi({});
   piAgileExtension(pi);
   assert.ok(tool("agile_discover"), "missing agile_discover");
@@ -969,6 +969,7 @@ await test("real extension registers 7 tools + 2 hooks + 1 command on fake pi", 
   assert.ok(tool("agile_merge_task"), "missing agile_merge_task");
   assert.ok(tool("agile_retrospective"), "missing agile_retrospective");
   assert.ok(tool("agile_knowledge"), "missing agile_knowledge");
+  assert.ok(tool("agile_run"), "missing agile_run");
   assert.ok(hook("before_agent_start"), "missing before_agent_start hook");
   assert.ok(hook("agent_end"), "missing agent_end hook");
   assert.ok(command("agile"), "missing /agile command");
@@ -1465,6 +1466,119 @@ await test("reviewer receives acceptance criteria from bd show (integration)", a
       /must handle empty input/.test(reviewerSpawns[0].task),
       "reviewer prompt must carry the bd acceptance criteria",
     );
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── agile_run tool (autonomous bootstrap for headless `pi -p`) ──────────
+
+console.log("## agile_run tool");
+
+await test("agile_run: enables mode, continuous mode, goal-setup followUp", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-run-"));
+  try {
+    const { pi, tool } = createFakePi({});
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-run-1", null, pi);
+    const res = await tool("agile_run").execute("t", { description: "Fix all module boundary bugs" }, null, null, ctx);
+
+    // 1. agile mode persisted ON
+    const config = JSON.parse(fs.readFileSync(path.join(dir, ".agile", "config.json"), "utf8"));
+    assert.strictEqual(config.agile_mode, true, "agile_run must persist agile_mode: true");
+
+    // 2. session: continuous (no budget), originalRequest, loop un-stopped
+    const sess = readSession(dir);
+    assert.strictEqual(sess.originalRequest, "Fix all module boundary bugs");
+    assert.strictEqual(sess.remainingSprints, undefined, "no max_sprints → continuous mode");
+    assert.strictEqual(sess.loopStopped, false, "agile_run must clear a persisted /agile stop");
+    assert.strictEqual(sess.sprintLoopActive, true, "agile_run marks the loop active");
+
+    // 3. goal-setup followUp carries the description
+    const last = pi.sentMessages[pi.sentMessages.length - 1];
+    assert.ok(last.text.includes("Sprint Goal Setup Required"), "goal-setup followUp sent");
+    assert.ok(last.text.includes("Fix all module boundary bugs"), "description in followUp");
+    assert.strictEqual(last.opts.deliverAs, "followUp");
+
+    // 4. tool result confirms
+    assert.ok(res.content[0].text.includes("Agile mode ON"), "result confirms mode ON");
+
+    // 5. other agile tools now callable (not gated)
+    const k = await tool("agile_knowledge").execute("t", { action: "read" }, null, null, ctx);
+    assert.ok(!k.content[0].text.includes("Agile mode is OFF"), "agile tools usable after agile_run");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("agile_run: max_sprints bounds the session", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-run-"));
+  try {
+    const { pi, tool } = createFakePi({});
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-run-2", null, pi);
+    await tool("agile_run").execute("t", { description: "d", max_sprints: 3 }, null, null, ctx);
+    const sess = readSession(dir);
+    assert.strictEqual(sess.remainingSprints, 3, "budget persisted");
+    const last = pi.sentMessages[pi.sentMessages.length - 1];
+    assert.ok(last.text.includes("3 sprints"), "budget mentioned in goal-setup followUp");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("agile_run: max_sprints 0 → continuous mode", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-run-"));
+  try {
+    const { pi, tool } = createFakePi({});
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-run-3", null, pi);
+    await tool("agile_run").execute("t", { description: "d", max_sprints: 0 }, null, null, ctx);
+    assert.strictEqual(readSession(dir).remainingSprints, undefined, "0 → continuous");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("agile_run: description is required (no side effects)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-run-"));
+  try {
+    const { pi, tool } = createFakePi({});
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-run-4", null, pi);
+    const res = await tool("agile_run").execute("t", {}, null, null, ctx);
+    assert.ok(res.content[0].text.includes("description is required"), "explicit error");
+    assert.strictEqual(res.content[0].text.includes("Agile mode ON"), false, "no success claim");
+    assert.strictEqual(readSession(dir).originalRequest, undefined, "no session written");
+    assert.ok(!fs.existsSync(path.join(dir, ".agile", "config.json")), "mode not enabled");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("agile_run: re-enabling after /agile off restores the gated tools", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-run-"));
+  try {
+    const { pi, tool, command } = createFakePi({});
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-run-5", null, pi);
+
+    // /agile off removes the gated agile tools from the active set
+    await command("agile").handler("off", ctx);
+    const afterOff = pi.getActiveTools();
+    assert.ok(!afterOff.includes("agile_discover"), "off removes agile tools");
+    assert.ok(afterOff.includes("agile_run"), "agile_run itself must never be gated");
+
+    // agile_run re-enables mode AND restores the tools (no human to /agile on)
+    await tool("agile_run").execute("t", { description: "d" }, null, null, ctx);
+    const afterRun = pi.getActiveTools();
+    assert.ok(afterRun.includes("agile_discover"), "re-enable restores agile tools");
+    assert.ok(afterRun.includes("agile_delegate_task"), "delegate restored");
     return null;
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

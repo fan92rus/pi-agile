@@ -684,7 +684,18 @@ async function delegateBatchParallel(
   try {
     for (const t of tasks) {
       const wtDir = path.join(parentDir, `${repoName}-${t.bdId}`);
-      await pi.exec("git", ["worktree", "add", "-b", `feat/${t.bdId}`, wtDir, mainBranch], { cwd: mainWorkDir, timeout: 30_000 });
+      const addRes = await pi.exec("git", ["worktree", "add", "-b", `feat/${t.bdId}`, wtDir, mainBranch], { cwd: mainWorkDir, timeout: 30_000 });
+      if (addRes.code !== 0) {
+        // feat/<bdId> may already exist — e.g. a previous single-path delegate
+        // left the branch on a rework verdict (accumulated diff kept for
+        // re-delegation). Attach the existing branch instead of failing the
+        // whole batch; delegateTaskInWorktree's gitCreateBranch then does a
+        // plain checkout (branch-exists path) and the rework diff continues.
+        const attachRes = await pi.exec("git", ["worktree", "add", wtDir, `feat/${t.bdId}`], { cwd: mainWorkDir, timeout: 30_000 });
+        if (attachRes.code !== 0) {
+          throw new Error(`git worktree add failed for feat/${t.bdId}: ${(attachRes.stderr || addRes.stderr || "").trim()}`);
+        }
+      }
       worktrees.push(wtDir);
       wrappedOnProgress(`${t.bdId}: worktree created`);
     }
@@ -699,62 +710,67 @@ async function delegateBatchParallel(
   // 3. Run ALL tasks in parallel — each its own worktree, each has its own loop
   wrappedOnProgress?.("Running all tasks in parallel...");
   const spawnTimeout = getSpawnTimeout(mainWorkDir);
-  const taskPromises = tasks.map((t, i) =>
-    delegateTaskInWorktree(pi, rpc_, worktrees[i], t.bdId, t.meta, constraints, deadEnds, patterns, reviewDepth, spawnTimeout, wrappedOnProgress, chain)
-  );
-  const results = await Promise.all(taskPromises);
+  let results: Awaited<ReturnType<typeof delegateTaskInWorktree>>[] = [];
+  try {
+    const taskPromises = tasks.map((t, i) =>
+      delegateTaskInWorktree(pi, rpc_, worktrees[i], t.bdId, t.meta, constraints, deadEnds, patterns, reviewDepth, spawnTimeout, wrappedOnProgress, chain)
+    );
+    results = await Promise.all(taskPromises);
 
-  // 5. For approved tasks: merge to main
-  for (let i = 0; i < results.length; i++) {
-    const r = results[i];
-    if (r.verdict.status === "approved" && !r.error) {
-      wrappedOnProgress(`${r.bdId}: approved, merging...`);
-      let mergeResult: string;
-      try {
-        mergeResult = await gitMergeFromWorktree(pi, mainWorkDir, worktrees[i], r.branch, `feat: merge ${r.bdId}`);
-      } catch (e: unknown) {
-        mergeResult = `merge error: ${e instanceof Error ? e.message : String(e)}`;
-      }
-      if (mergeResult) {
-        const isConflict = mergeResult.includes("CONFLICT");
-        if (isConflict) {
-          try { await pi.exec("git", ["merge", "--abort"], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
-          (r as any).conflict = {
-            files: extractConflictedFiles(mergeResult),
-            worktreeDir: worktrees[i],
-          };
-        } else {
-          r.error = `merge failed: ${mergeResult}`;
+    // 5. For approved tasks: merge to main
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.verdict.status === "approved" && !r.error) {
+        wrappedOnProgress(`${r.bdId}: approved, merging...`);
+        let mergeResult: string;
+        try {
+          mergeResult = await gitMergeFromWorktree(pi, mainWorkDir, worktrees[i], r.branch, `feat: merge ${r.bdId}`);
+        } catch (e: unknown) {
+          mergeResult = `merge error: ${e instanceof Error ? e.message : String(e)}`;
+        }
+        if (mergeResult) {
+          const isConflict = mergeResult.includes("CONFLICT");
+          if (isConflict) {
+            try { await pi.exec("git", ["merge", "--abort"], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
+            (r as any).conflict = {
+              files: extractConflictedFiles(mergeResult),
+              worktreeDir: worktrees[i],
+            };
+          } else {
+            r.error = `merge failed: ${mergeResult}`;
+          }
         }
       }
+      // Mark task done in progress tracker
+      const prog = progressMap.get(r.bdId);
+      if (prog) {
+        prog.status = r.error ? "error" : "done";
+        prog.stage = r.error ? "error" : r.verdict.status === "approved" ? "merged" : r.verdict.status;
+      }
     }
-    // Mark task done in progress tracker
-    const prog = progressMap.get(r.bdId);
-    if (prog) {
-      prog.status = r.error ? "error" : "done";
-      prog.stage = r.error ? "error" : r.verdict.status === "approved" ? "merged" : r.verdict.status;
+  } finally {
+    // 6. Clean up worktrees — ALWAYS (even when step 3 aborts mid-flight, e.g.
+    // a phantom worktree slot whose branch exists outside the batch). Skip
+    // conflicted ones — the agent needs them to resolve.
+    onProgress?.("Cleaning up worktrees...");
+    const conflictedDirs = new Set(
+      results.filter((r: any) => r?.conflict).map((r: any) => r.conflict.worktreeDir)
+    );
+    for (let i = 0; i < worktrees.length; i++) {
+      const wt = worktrees[i];
+      if (conflictedDirs.has(wt)) continue;
+      try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
+      try { fs.rmSync(wt, { recursive: true, force: true }); } catch {}
+      // Fix #2 (H1): delete the feat/<bdId> branch AFTER the worktree is gone
+      // (git refuses to delete a branch checked out in a worktree). A leftover
+      // branch made a later re-delegation fail "branch already exists" and the
+      // worker silently committed to main without review.
+      const r = results[i];
+      if (r && !r.error && r.verdict.status === "approved") {
+        try { await pi.exec("git", ["branch", "-D", r.branch], { cwd: mainWorkDir, timeout: 5_000 }); } catch { /* best effort */ }
+      }
     }
-  }
-  showBatchSummary();
-
-  // 6. Clean up worktrees (skip conflicted — agent needs them)
-  onProgress?.("Cleaning up worktrees...");
-  const conflictedDirs = new Set(
-    results.filter((r: any) => r.conflict).map((r: any) => r.conflict.worktreeDir)
-  );
-  for (let i = 0; i < worktrees.length; i++) {
-    const wt = worktrees[i];
-    if (conflictedDirs.has(wt)) continue;
-    try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
-    try { fs.rmSync(wt, { recursive: true, force: true }); } catch {}
-    // Fix #2 (H1): delete the feat/<bdId> branch AFTER the worktree is gone
-    // (git refuses to delete a branch checked out in a worktree). A leftover
-    // branch made a later re-delegation fail "branch already exists" and the
-    // worker silently committed to main without review.
-    const r = results[i];
-    if (r && !r.error && r.verdict.status === "approved") {
-      try { await pi.exec("git", ["branch", "-D", r.branch], { cwd: mainWorkDir, timeout: 5_000 }); } catch { /* best effort */ }
-    }
+    showBatchSummary();
   }
 
   return { results };
@@ -1150,7 +1166,7 @@ async function maybeSendContinuation(
   prefix?: string,
 ): Promise<boolean> {
   // Fix #11: after /agile stop the loop is halted — no nudges at all.
-  if (runtime.loopStopped) return false;
+  if (runtime.loopStopped) { if (process.env.PBT_DBG) console.error('[DBG-MSC] blocked by loopStopped'); return false; }
 
   // Open bd tasks not already in this sprint — they should go into the next sprint.
   let openTasks: string[] = [];
@@ -1203,7 +1219,16 @@ function setAgileMode(ctx: ExtensionContext, enabled: boolean, workDir?: string)
     config.agile_mode = enabled;
     saveAgileConfig(workDir, config);
   }
-  if (!enabled) {
+  if (enabled) {
+    // Fix: /agile off removes the gated agile tools from the active set, but
+    // re-enabling never restored them — after an off→on cycle the tools stayed
+    // missing for the rest of the session, silently breaking the autonomous
+    // loop. Restore any registered tool that is no longer active.
+    const all = (ctx.getAllTools?.() ?? []).map((t) => (typeof t === "string" ? t : t.name));
+    const current = new Set(ctx.getActiveTools?.() ?? []);
+    const missing = all.filter((n) => !current.has(n));
+    if (missing.length > 0) ctx.setActiveTools?.([...current, ...missing]);
+  } else {
     // Remove gated tools from active set when turning off
     const tools = ctx.getActiveTools?.() ?? [];
     const gated = ["agile_discover", "agile_start_sprint", "agile_delegate_task", "agile_merge_task", "agile_retrospective", "agile_knowledge", "agile_investigate"];
@@ -1519,6 +1544,50 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
   // -----------------------------------------------------------------------
 
   // Tool: agile_discover — run discovery, return raw output
+  pi.registerTool({
+    name: "agile_run",
+    label: "agile_run",
+    description: "Bootstrap the autonomous sprint loop — behaves like `/agile run`, but callable even when agile mode is OFF (it enables agile mode itself, no human needed). Use for headless launches (`pi -p`) without any human interaction. REQUIRED: description of the work to complete — the agent keeps running sprints until these conditions are met. OPTIONAL: max_sprints — omit (or 0) for continuous mode.",
+    parameters: Type.Object({
+      description: Type.String({ description: "The work to complete autonomously. The agent works until these conditions are met (continuous mode) or the sprint budget runs out." }),
+      max_sprints: Type.Optional(Type.Integer({ description: "Max sprint count. Omit or 0 for continuous mode — run until the description's conditions are met." })),
+      cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx, runtimeStore);
+      const workDir = (params.cwd as string) || ctx.cwd;
+      const description = String(params.description ?? "").trim();
+      const maxSprintsRaw = params.max_sprints as number | undefined;
+
+      if (!description) {
+        return { content: [{ type: "text" as const, text: "❌ agile_run: description is required — the agent needs to know what to accomplish. Call agile_run with a description of the work (optionally max_sprints for a bounded run)." }] };
+      }
+
+      // 1. Enable agile mode ourselves — the whole point: no human to type /agile on.
+      setAgileMode(ctx, true, workDir);
+      const cleaned = cleanupStaleWorktrees(workDir);
+
+      // 2. Session state: bounded (max_sprints) or continuous until conditions met.
+      const maxSprints = maxSprintsRaw !== undefined && maxSprintsRaw > 0 ? maxSprintsRaw : undefined;
+      runtime.originalRequest = description;
+      runtime.remainingSprints = maxSprints;
+      runtime.sprintLoopActive = true;
+      runtime.loopStopped = false; // re-launch un-stops a persisted /agile stop
+      persistSessionState(workDir, runtime);
+
+      // 3. Goal-setup followUp (same as /agile run <desc>) — the agent must
+      // formalize goal + constraints from the description before any sprint.
+      const budgetLine = maxSprints
+        ? `This session is budgeted for ${maxSprints} sprint${maxSprints > 1 ? "s" : ""} — stop when the budget is consumed.`
+        : "Continuous mode — no sprint limit. Work until the description's conditions are met.";
+
+      const setupMsg = `## Sprint Goal Setup Required (autonomous run)\n\nThe user requested:\n> ${description}\n\n${budgetLine}\n\n**Work autonomously — no human is available to answer questions.** You MUST fill the project configuration before starting any sprint:\n\n1. **Read** current \`.agile/project.yaml\` and \`.agile/constraints.yaml\`\n2. **Extract** the goal from the description above — formalize it into \`goal:\` in \`.agile/project.yaml\`\n3. **Extract** constraints (e.g. \"не вводи новых функций\", \"не используй X\") — add them to \`constraints:\` array\n4. **Leave empty** anything not specified — don't invent extra goals or constraints\n5. **Goal is MANDATORY** — you MUST write a goal before proceeding\n6. After filling, call \`agile_start_sprint\` with tasks from \`bd ready\` (or run \`agile_discover\` first if no tasks exist)\n\nDo NOT start sprint work until goal + constraints are written.`;
+      await pi.sendUserMessage(setupMsg, { deliverAs: "followUp" });
+
+      return { content: [{ type: "text" as const, text: `✅ Agile mode ON. Autonomous sprint loop ${maxSprints ? `budgeted for ${maxSprints} sprint${maxSprints > 1 ? "s" : ""}` : "in continuous mode — run until the description's conditions are met"}. Fill goal + constraints in .agile/project.yaml, then start the sprint cycle.${cleaned > 0 ? ` Cleaned ${cleaned} stale worktree(s).` : ""}` }] };
+    },
+  });
+
   pi.registerTool({
     name: "agile_discover",
     label: "agile_discover",

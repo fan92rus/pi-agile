@@ -174,6 +174,11 @@ export function createFakePi({
   const events = createEventBus();
   if (bridge) events.on(RPC_REQUEST, bridge(events));
 
+  // Active-tools model (for setAgileMode's on/off gating): null = all
+  // registered tools are active (the default). /agile off removes the gated
+  // agile tools; re-enabling restores them via getAllTools/setActiveTools.
+  let activeToolNames = null;
+
   // worktreeDir -> feat branch (registered on `git worktree add -b`)
   const worktrees = new Map();
 
@@ -198,6 +203,18 @@ export function createFakePi({
 
     registerCommand(name, def) {
       commands.push({ name, ...def });
+    },
+
+    getActiveTools() {
+      return activeToolNames ?? tools.map((t) => t.name);
+    },
+
+    getAllTools() {
+      return tools.map((t) => ({ name: t.name }));
+    },
+
+    setActiveTools(names) {
+      activeToolNames = names;
     },
 
     async exec(cmd, args = [], opts = {}) {
@@ -310,11 +327,16 @@ export function makeFakeUi(answers = []) {
 }
 
 /** Fake extension context: { cwd, sessionId, ui }. */
-export function makeCtx(dir, sessionId, ui) {
+export function makeCtx(dir, sessionId, ui, piRef) {
   return {
     cwd: dir,
     sessionId,
     ui: ui ?? { notify() {}, input: async () => "" },
+    // Active-tools accessors (setAgileMode gates tools via these) — wired to
+    // the fake pi when provided so the on/off tool-restore logic is testable.
+    getActiveTools: () => piRef?.getActiveTools?.() ?? [],
+    getAllTools: () => piRef?.getAllTools?.() ?? [],
+    setActiveTools: (names) => piRef?.setActiveTools?.(names),
   };
 }
 

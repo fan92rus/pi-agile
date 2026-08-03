@@ -70,7 +70,7 @@ async function forAll({ seeds = 25, maxActions = 50, name, run }) {
       const fullLog = e.log ?? [];
       const log = repro?.log?.length ? repro.log : fullLog;
       pbtFailures.push({ name, seed, message: e.message, log: log });
-      console.error(`  ❌ ${name} [seed=${seed}]${log.length ? `\n       actions: ${log.join(" → ")}` : ""}\n     ${e.message}`);
+      console.error(`  ❌ ${name} [seed=${seed}]${log.length ? `\n       actions: ${log.join(" → ")}` : ""}\n     ${e.message}${process.env.PBT_STACK ? `\n${e.stack?.split("\n").slice(0, 8).join("\n")}` : ""}`);
     }
     if (process.env.PBT_DEBUG) console.error(`  [${name}] seed=${seed} done in ${Date.now() - t0}ms`);
   }
@@ -141,6 +141,23 @@ class RealSystem {
     this.boundedInitial = undefined;
     this.actionMarker = 0;
     this.nudgePerSprint = 0; // total continuation messages for the current sprint (design A)
+    // Mirror of the runtime's IN-MEMORY current sprint (the real tool operates
+    // on it, not on the disk view). corruptSprintFile tears the file but the
+    // runtime keeps its in-memory sprint and heals the file on the next save —
+    // eligibility must come from this mirror, otherwise a torn current sprint
+    // makes the harness pick tasks from a stale OLDER sprint file.
+    this.liveSprint = null;
+    // True after agile_start_sprint ran in the CURRENT session — the runtime's
+    // store has an in-memory sprint that survives torn files. After a session
+    // change (restart/injectTasks) the fresh runtime has none — getCurrent
+    // falls back to the disk view (skips torn files → may be null).
+    this.runtimeInMemorySprint = false;
+  }
+
+  /** Sprint the runtime is actually operating on (in-memory mirror ?? disk view). */
+  currentSprint() {
+    if (this.runtimeInMemorySprint) return this.liveSprint ?? readLatestSprint(this.dir);
+    return readLatestSprint(this.dir); // disk fallback — null when the file is torn
   }
 
   record(k) {
@@ -179,11 +196,16 @@ class RealSystem {
     await this.tool("agile_start_sprint").execute("t", { task_ids: ids }, null, null, this.ctx);
     this.record(`startSprint(${k})`);
     this.nudgePerSprint = 0; // new sprint → fresh per-sprint message window
+    this.runtimeInMemorySprint = true; // agile_start_sprint set the runtime's in-memory sprint
+    this.liveSprint = readLatestSprint(this.dir); // (null on abort — no new sprint)
   }
 
   async delegate() {
-    const sprint = readLatestSprint(this.dir);
+    const sprint = this.currentSprint();
     if (!sprint) return;
+    // The tool's getCurrent(workDir) ADOPTS the disk sprint as the runtime's
+    // in-memory one — from here on it survives torn files (like startSprint).
+    this.runtimeInMemorySprint = true;
     const eligible = sprint.tasks.filter((t) => t.status === "backlog" || t.status === "rework");
     if (eligible.length === 0) return;
     const t = genPick(this.rng, eligible);
@@ -219,21 +241,26 @@ class RealSystem {
       // rework with the real round count recorded for velocity.
       const spr = readLatestSprint(this.dir);
       const st = spr.tasks.find((x) => x.bd_id === t.bd_id);
-      assert.strictEqual(st.status, "rework", `P21: rework verdict must mark the task rework (found ${st?.status} id=${spr?.id} files=[${fs.readdirSync(path.join(this.dir, ".agile")).filter((f) => /^sprint-/.test(f)).join(",")}] res=${JSON.stringify(resText).slice(0, 150)})`);
-      assert.strictEqual(st.review_rounds, 3, `P21: rework must consume all 3 rounds (got ${st.review_rounds})`);
+      assert.ok(st, `P21: task ${t.bd_id} missing from sprint ${spr?.id} after rework (files=[${fs.readdirSync(path.join(this.dir, ".agile")).filter((f) => /^sprint-/.test(f)).join(",")}])`);
+      if (st) assert.strictEqual(st.status, "rework", `P21: rework verdict must mark the task rework (found ${st?.status} id=${spr?.id} files=[${fs.readdirSync(path.join(this.dir, ".agile")).filter((f) => /^sprint-/.test(f)).join(",")}])`);
+      assert.strictEqual(st?.review_rounds, 3, `P21: rework must consume all 3 rounds (got ${st?.review_rounds})`);
     }
     this.record(`delegate(${t.bd_id}→${actualStatus ?? "?"})`);
+    this.liveSprint = readLatestSprint(this.dir); // delegate saved the sprint (healed)
   }
 
   async retrospective() {
-    if (!readLatestSprint(this.dir)) return;
+    if (!this.currentSprint()) return;
+    this.runtimeInMemorySprint = true; // the tool adopts the sprint in-memory
     await this.tool("agile_retrospective").execute("t", {}, null, null, this.ctx);
     this.record("retrospective");
+    this.liveSprint = readLatestSprint(this.dir); // completeSprint saved it (status done)
   }
 
   async agentEnd() {
     await this.hook("agent_end")({ messages: [] }, this.ctx);
     this.record("agentEnd");
+    this.liveSprint = readLatestSprint(this.dir); // auto-close may have saved (healed)
   }
 
   async runBounded() {
@@ -255,6 +282,28 @@ class RealSystem {
     this.record("stop");
   }
 
+  async agileRun() {
+    const desc = genPick(this.rng, [
+      "Fix all module boundary bugs",
+      "Improve test coverage to 80%",
+      "Refactor the core module without new features",
+    ]);
+    const withBudget = this.rng() < 0.4;
+    const budget = withBudget ? genInt(this.rng, 1, 4) : undefined;
+    this.lastAgileDesc = desc;
+    this.lastAgileBudget = budget;
+    // A new agile_run re-defines the session budget (P7 tracks the LATEST one).
+    this.boundedInitial = budget;
+    await this.tool("agile_run").execute(
+      "t",
+      { description: desc, ...(budget !== undefined ? { max_sprints: budget } : {}) },
+      null,
+      null,
+      this.ctx,
+    );
+    this.record(`agileRun(${budget ?? "∞"})`);
+  }
+
   async restart() {
     // new session = fresh in-memory runtime (real restart semantics) + restore
     this.session++;
@@ -262,6 +311,8 @@ class RealSystem {
     await this.beforeStart();
     this.record("restart");
     this.nudgePerSprint = 0; // fresh runtime — restart recovery may re-nudge once (by design)
+    this.runtimeInMemorySprint = false; // fresh session runtime has no in-memory sprint
+    this.liveSprint = null; // restored from disk on demand (skips torn)
   }
 
   async injectTasks() {
@@ -286,6 +337,8 @@ class RealSystem {
     await this.beforeStart();
     this.record(`injectTasks(${n})`);
     this.nudgePerSprint = 0; // injected sprint = fresh per-sprint message window
+    this.runtimeInMemorySprint = false; // fresh session — disk fallback only
+    this.liveSprint = null;
   }
 
   async corruptSession() {
@@ -303,14 +356,17 @@ class RealSystem {
     const id = new SprintStore().findLastSprintId(this.dir);
     if (id <= 0) return;
     fs.writeFileSync(path.join(this.dir, ".agile", `sprint-${id}.json`), "{torn write", "utf8");
+    // NOTE: liveSprint deliberately NOT touched — the runtime keeps its
+    // in-memory sprint and heals the file on the next save.
     this.record(`corruptSprint#${id}`);
   }
 
   // ---- batch / merge / investigate / discover / knowledge / status / setup ----
 
   async delegateBatch() {
-    const sprint = readLatestSprint(this.dir);
+    const sprint = this.currentSprint();
     if (!sprint) return;
+    this.runtimeInMemorySprint = true; // the tool adopts the sprint in-memory
     this.lastBatchWasDone = sprint.status === "done"; // covered-sprint guard for P18
     const eligible = sprint.tasks.filter((t) => t.status === "backlog" || t.status === "rework");
     if (eligible.length === 0) return;
@@ -321,21 +377,25 @@ class RealSystem {
       const v = this.rng() < 0.45 ? "blocked" : this.rng() < 0.5 ? "approved" : "rework";
       this.batchVerdicts.set(t.bd_id, v);
     }
-    await this.tool("agile_delegate_task").execute("t", { bd_ids: ids }, null, null, this.ctx);
+    const res = await this.tool("agile_delegate_task").execute("t", { bd_ids: ids }, null, null, this.ctx);
+    this.lastBatchText = res.content?.[0]?.text ?? "";
     this.record(`delegateBatch(${ids.join(",")})`);
+    this.liveSprint = readLatestSprint(this.dir); // batch saved the sprint (healed)
   }
 
   async merge() {
-    const sprint = readLatestSprint(this.dir);
+    const sprint = this.currentSprint();
     if (!sprint || sprint.tasks.length === 0) return;
+    this.runtimeInMemorySprint = true; // the tool adopts the sprint in-memory
     let candidates;
     if (this.realGit) {
       // Real git: merging a branch that does not exist fails — only merge
-      // tasks whose feat/<bdId> branch actually exists.
+      // tasks whose feat/<bdId> branch actually exists. Blocked tasks are not
+      // mergeable (they need unblocking, not merging).
       const branches = this.branchList();
-      candidates = sprint.tasks.filter((t) => t.status !== "done" && branches.includes(`feat/${t.bd_id}`));
+      candidates = sprint.tasks.filter((t) => t.status !== "done" && t.status !== "blocked" && branches.includes(`feat/${t.bd_id}`));
     } else {
-      candidates = sprint.tasks.filter((t) => t.status !== "done");
+      candidates = sprint.tasks.filter((t) => t.status !== "done" && t.status !== "blocked");
     }
     if (candidates.length === 0) return;
     const t = genPick(this.rng, candidates);
@@ -352,10 +412,12 @@ class RealSystem {
     }
     const res = await this.tool("agile_merge_task").execute("t", { bd_id: t.bd_id }, null, null, this.ctx);
     const text = res.content?.[0]?.text ?? "";
+    this.lastMergeSucceeded = /Merged to main/.test(text);
     if (this.checksFailArmed) {
       assert.ok(text.includes("Checks reported failures"), "P16: merge must flag failing checks");
     }
     this.record(`merge(${t.bd_id}${this.checksFailArmed ? ",failChecks" : ""})`);
+    this.liveSprint = readLatestSprint(this.dir); // merge saved the sprint
   }
 
   async investigate() {
@@ -485,6 +547,7 @@ const WEIGHTS = [
   ["knowledge", 2], ["status", 2], ["setup", 1], ["deadBridge", 1], ["stuckBridge", 1],
   ["runBounded", 2], ["runContinuous", 2], ["stop", 2], ["restart", 2],
   ["injectTasks", 1], ["corruptSession", 1], ["corruptSprintFile", 2],
+  ["agileRun", 2],
 ];
 
 function pickAction(rng) {
@@ -564,8 +627,9 @@ async function checkInvariants(sys) {
     assert.ok(v.avg_review_rounds >= 0, "P11: negative avg review rounds");
   }
 
-  // P14: merging a task marks it done on disk
-  if (sys.lastAction && sys.lastAction.startsWith("merge(")) {
+  // P14: a SUCCESSFUL merge marks the task done on disk (a failed merge — e.g.
+  // missing branch — legitimately leaves the status unchanged).
+  if (sys.lastAction && sys.lastAction.startsWith("merge(") && sys.lastMergeSucceeded) {
     const id = sys.lastAction.match(/^merge\(([^,)]+)/)?.[1];
     const sprintNow = readLatestSprint(sys.dir);
     const t = sprintNow?.tasks.find((x) => x.bd_id === id);
@@ -595,8 +659,9 @@ async function checkInvariants(sys) {
       }
     }
     if (sys.lastAction.startsWith("delegateBatch(")) {
-      const wt = (sys.gitExec(["worktree", "list", "--porcelain"]).match(/^worktree /gm) ?? []).length;
-      assert.ok(wt === 1, `P19: batch must clean up worktrees (found ${wt})`);
+      const wtOut = sys.gitExec(["worktree", "list", "--porcelain"]);
+      const wt = (wtOut.match(/^worktree /gm) ?? []).length;
+      assert.ok(wt === 1, `P19: batch must clean up worktrees (found ${wt}) | out: ${wtOut.slice(0, 400).replace(/\n/g, " || ")}`);
     }
   }
 
@@ -615,12 +680,19 @@ async function checkInvariants(sys) {
     // sprint already done/covered before the batch (its continuation was
     // already sent by e.g. a retrospective) is also exempt.
     if (terminal && !sys.lastBatchWasDone && readSession(sys.dir).loopStopped !== true) {
+      const preStatus = readLatestSprint(sys.dir)?.status;
+      const preSprintJson = JSON.stringify(readLatestSprint(sys.dir));
       const marker = sys.pi.sentMessages.length;
       await sys.hook("agent_end")({ messages: [] }, sys.ctx);
-      const nudges = sys.nudgeCount(sys.pi.sentMessages.slice(marker));
-      assert.strictEqual(nudges, 1, `P18: agent_end must auto-close a terminal batch + nudge once (got ${nudges})`);
+      const probeMsgs = sys.pi.sentMessages.slice(marker);
+      const nudges = sys.nudgeCount(probeMsgs);
+      assert.strictEqual(nudges, 1, `P18: agent_end must auto-close a terminal batch + nudge once (got ${nudges}) | preStatus: ${preStatus} | preSprint: ${preSprintJson?.slice(0, 300)} | ALL-MSGS: ${sys.pi.sentMessages.slice(sys.actionMarker).map((m) => m.text.slice(0, 60)).join(" || ")} | probe: ${probeMsgs.map((m) => m.text.slice(0, 90)).join(" || ")} | batchText: ${(sys.lastBatchText ?? "").slice(0, 120).replace(/\n/g, " ")} | sprStatus: ${readLatestSprint(sys.dir)?.status} | lastDone: ${sys.lastBatchWasDone} | sess: ${JSON.stringify(readSession(sys.dir))}`);
       const spr = readLatestSprint(sys.dir);
       assert.strictEqual(spr.status, "done", "P18: auto-close must set status done");
+      // P18 probe MUTATES state (auto-closes the sprint) — mark lastAction so
+      // a following no-op delegateBatch (early-return without record) does not
+      // re-trigger this block against the now-closed sprint.
+      sys.lastAction = "batchClosedByProbe";
     }
   }
 
@@ -636,6 +708,26 @@ async function checkInvariants(sys) {
         assert.strictEqual(spr.status, "done", `P22: agent_end that nudges a terminal sprint must close it (id=${spr.id} status=${spr.status})`);
       }
     }
+  }
+
+  // P23 agile_run bootstrap: mode on + session fields + goal-setup followUp.
+  // agile_run persists a fresh session, so corruptSession junk never reaches
+  // this assertion (it only fires right after the agileRun action itself).
+  if (sys.lastAction?.startsWith("agileRun")) {
+    const s = readSession(sys.dir);
+    assert.strictEqual(s.originalRequest, sys.lastAgileDesc, "P23: originalRequest not set");
+    assert.strictEqual(s.loopStopped, false, "P23: agile_run must un-stop the loop");
+    assert.strictEqual(s.sprintLoopActive, true, "P23: loop must be marked active");
+    if (sys.lastAgileBudget !== undefined) {
+      assert.strictEqual(s.remainingSprints, sys.lastAgileBudget, "P23: budget not persisted");
+    } else {
+      assert.strictEqual(s.remainingSprints, undefined, "P23: no budget → continuous mode");
+    }
+    const cfg = JSON.parse(fs.readFileSync(path.join(sys.dir, ".agile", "config.json"), "utf8"));
+    assert.strictEqual(cfg.agile_mode, true, "P23: agile mode not persisted");
+    const last = sys.pi.sentMessages[sys.pi.sentMessages.length - 1];
+    assert.ok(last.text.includes("Sprint Goal Setup Required"), "P23: no goal-setup followUp");
+    assert.ok(last.text.includes(sys.lastAgileDesc), "P23: description missing from followUp");
   }
 
   // P8b (design A): at most ONE continuation message per sprint within one
@@ -689,7 +781,7 @@ const REALGIT_WEIGHTS = [
   ["startSprint", 6], ["delegate", 8], ["delegateBatch", 4], ["merge", 4],
   ["retrospective", 3], ["agentEnd", 6], ["investigate", 2], ["knowledge", 2],
   ["status", 2], ["runBounded", 2], ["runContinuous", 2], ["stop", 2],
-  ["restart", 2], ["injectTasks", 1],
+  ["restart", 2], ["injectTasks", 1], ["agileRun", 2],
 ];
 
 async function runScenarioRealGit(rng, seed, maxActions) {
