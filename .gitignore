@@ -16,3 +16,8 @@ Thumbs.db
 # Agile state (per-project, not in this repo)
 .agile/
 .auto/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key

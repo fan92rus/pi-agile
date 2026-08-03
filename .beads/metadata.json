@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "pi_agile",
+  "project_id": "d295052e-927f-41e3-a01f-8d1f831f56ac"
+}
