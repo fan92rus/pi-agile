@@ -1015,7 +1015,7 @@ const {
   RpcClient, RpcClientError, buildRequest, replyEventFor, parseSpawnReply,
   SUBAGENT_RPC_REQUEST_EVENT, SUBAGENT_RPC_REPLY_EVENT_PREFIX,
 } = await importModule("parallel/rpc.ts");
-const { createEventBus, createFakeBridge } = await import(pathToFileURL(path.join(import.meta.dirname, "fake-pi.ts")).href);
+const { createEventBus, createFakeBridge, readLatestSprint } = await import(pathToFileURL(path.join(import.meta.dirname, "fake-pi.ts")).href);
 
 /** Attach a scripted bridge: map method -> reply data (or null = no reply). */
 function scriptedBridge(events, handler) {
@@ -1194,6 +1194,60 @@ await test("re-delegation does not short-circuit on stale worker files", async (
     return null;
   } finally {
     delete process.env.PI_AGILE_STUCK_TIMEOUT_MS;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("single delegate runs the rework loop (3 rounds) with feedback", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-rework-"));
+  try {
+    const bridge = createFakeBridge({
+      verdictFor: () => "rework",
+      verdictExtra: () => ({ action_items: ["fix the bug"], lessons: ["lesson x"] }),
+    });
+    const { pi, tool, command } = createFakePi({ bdTasks: new Map([["t1", "Task t1"]]), bridge });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-rework");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    const res = await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "T", description: "d" }, null, null, ctx);
+    const text = res.content?.[0]?.text ?? "";
+    assert.ok(/REWORK/.test(text), `final verdict must be REWORK (got: ${text.slice(0, 160)})`);
+    assert.ok(/Rounds:\*{0,2}\s*3/.test(text), `must report 3 rounds (got: ${text.slice(0, 160)})`);
+    const sprint = readLatestSprint(dir);
+    const task = sprint.tasks.find((t) => t.bd_id === "t1");
+    assert.strictEqual(task.status, "rework", "task must be marked rework");
+    assert.strictEqual(task.review_rounds, 3, "setReviewRounds must record 3 rounds");
+    assert.strictEqual(bridge.spawnLog.filter((s) => s.agent === "worker").length, 3, "3 worker spawns");
+    const r2 = bridge.spawnLog.find((s) => s.agent === "worker" && /-r2\.txt$/.test(s.output));
+    assert.ok(r2, "round-2 worker must exist");
+    assert.ok(/Round 1 review found/.test(r2.task), "round-2 worker must receive feedback");
+    assert.ok(/- fix the bug/.test(r2.task), "feedback must carry the round-1 action items");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("single delegate breaks the rework loop on approved", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-rework2-"));
+  try {
+    const bridge = createFakeBridge({ verdictFor: (_bd, round) => (round === 1 ? "rework" : "approved") });
+    const { pi, tool, command } = createFakePi({ bdTasks: new Map([["t1", "Task t1"]]), bridge });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-rework2");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    const res = await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "T", description: "d" }, null, null, ctx);
+    const text = res.content?.[0]?.text ?? "";
+    assert.ok(/APPROVED/.test(text), `must break to APPROVED (got: ${text.slice(0, 160)})`);
+    assert.ok(/Rounds:\*{0,2}\s*2/.test(text), `must report 2 rounds (got: ${text.slice(0, 160)})`);
+    const sprint = readLatestSprint(dir);
+    const task = sprint.tasks.find((t) => t.bd_id === "t1");
+    assert.strictEqual(task.review_rounds, 2, "2 rounds recorded");
+    assert.strictEqual(bridge.spawnLog.filter((s) => s.agent === "worker").length, 2, "2 worker spawns only");
+    return null;
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

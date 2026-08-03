@@ -82,13 +82,15 @@ export function reviewerVerdictText(status, extra = {}) {
  */
 export function createFakeBridge({
   verdictFor = () => "blocked",
+  verdictExtra,
   workerSummary = "Worker implemented the change.\n",
   writeOutput = true,
   statusImpl,
   bridgeState = {}, // { dead: false, stuck: false } — mutate to simulate failures
   commitWorkerChange = false,
 } = {}) {
-  return (events) => (req) => {
+  const spawnLog = [];
+  const bridge = (events) => (req) => {
     const replyEvent = `${RPC_REPLY_PREFIX}${req.requestId}`;
     const ok = (data) => events.emit(replyEvent, { version: 1, requestId: req.requestId, success: true, data });
     if (req.method === "ping") return ok({});
@@ -114,12 +116,13 @@ export function createFakeBridge({
             "Recommend creating tasks for both findings.",
           ].join("\n");
         } else if (params.agent === "reviewer") {
-          content = reviewerVerdictText(verdictFor(bdId, round));
+          content = reviewerVerdictText(verdictFor(bdId, round), verdictExtra ? verdictExtra(bdId, round) : {});
         } else {
           content = workerSummary;
         }
         fs.writeFileSync(outFile, content, "utf8");
       }
+      spawnLog.push({ agent: params.agent, task: params.task, output: outFile, runId });
       if (commitWorkerChange && isRealWorker && !bridgeState.dead && !bridgeState.stuck && params.cwd) {
         // Fake worker commits a real change so the real-git diff is non-empty.
         try {
@@ -145,6 +148,8 @@ export function createFakeBridge({
     }
     return ok({}); // anything else
   };
+  bridge.spawnLog = spawnLog;
+  return bridge;
 }
 
 // ──────────────────────────────────────────────────────────────────────

@@ -195,12 +195,15 @@ class RealSystem {
       null,
       this.ctx,
     );
+    const resText = res.content?.[0]?.text ?? "";
+    // The ACTUAL verdict (batchVerdicts from a previous batch action may
+    // override the intended pendingVerdict for this task).
+    const actualStatus = (resText.match(/\*\*Status:\*\* (approved|rework|blocked)/i) ?? [])[1]?.toLowerCase();
     if (wasStuck) {
       // P20: a stuck worker must fail the delegate with an explicit error
-      const text = res.content?.[0]?.text ?? "";
       assert.ok(
-        /did not complete|idle for|force-stopped/i.test(text),
-        `P20: stuck worker must abort delegate (got: ${text.slice(0, 120)})`,
+        /did not complete|idle for|force-stopped/i.test(resText),
+        `P20: stuck worker must abort delegate (got: ${resText.slice(0, 120)})`,
       );
       // The interrupt path clears stuck — unless the bridge is ALSO dead, in
       // which case the dead-bridge abort wins (nothing to interrupt).
@@ -208,7 +211,16 @@ class RealSystem {
         assert.ok(!this.bridgeState.stuck, "P20: interrupt must clear stuck state");
       }
     }
-    this.record(`delegate(${t.bd_id}→${this.pendingVerdict})`);
+    if (!wasStuck && !wasDead && actualStatus === "rework") {
+      // P21: a rework verdict in single mode consumes the FULL internal loop
+      // (MAX_REWORK_ROUNDS = 3) — every round runs, then the task is marked
+      // rework with the real round count recorded for velocity.
+      const spr = readLatestSprint(this.dir);
+      const st = spr.tasks.find((x) => x.bd_id === t.bd_id);
+      assert.strictEqual(st.status, "rework", `P21: rework verdict must mark the task rework (found ${st?.status} id=${spr?.id} files=[${fs.readdirSync(path.join(this.dir, ".agile")).filter((f) => /^sprint-/.test(f)).join(",")}] res=${JSON.stringify(resText).slice(0, 150)})`);
+      assert.strictEqual(st.review_rounds, 3, `P21: rework must consume all 3 rounds (got ${st.review_rounds})`);
+    }
+    this.record(`delegate(${t.bd_id}→${actualStatus ?? "?"})`);
   }
 
   async retrospective() {
