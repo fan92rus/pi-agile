@@ -918,15 +918,16 @@ async function executeBatchTasks(
     runtime.store.save(workDir, sprint);
 
     const batchSteers = runSprintObserver(sprint, runtime.observerState, DEFAULT_OBSERVER_CONFIG, workDir);
-    for (const steer of batchSteers) {
-      try { await pi.sendUserMessage(steer.message, { deliverAs: "followUp" }); } catch { /* best effort */ }
-    }
-    // Fix (P18): the exhausted/blocked steer IS the continuation nudge — mark
-    // this sprint covered so the next agent_end (which fires because the sprint
-    // is terminal) does not send a second, near-identical nudge. The merge tool
-    // already did this; the batch path was missing it (M2 disease).
-    if (batchSteers.length > 0) {
-      runtime.agentEndSentForSprint = sprint.id;
+    // Design A: agent_end is the single closer + messenger for terminal sprints —
+    // deliver ONLY non-terminal steers mid-turn; terminal ones (all_blocked /
+    // all_tasks_exhausted) are replaced by the agent_end auto-close message, and
+    // no dedupe flag is set here anymore (P18 old semantics: the exhausted steer
+    // was the continuation — now agent_end owns it).
+    const batchTerminal = sprint.tasks.every((t) => t.status === "done" || t.status === "blocked");
+    if (!batchTerminal) {
+      for (const steer of batchSteers) {
+        try { await pi.sendUserMessage(steer.message, { deliverAs: "followUp" }); } catch { /* best effort */ }
+      }
     }
   }
 
@@ -1146,6 +1147,7 @@ async function maybeSendContinuation(
   runtime: AgileRuntime,
   workDir: string,
   sprint: SprintState,
+  prefix?: string,
 ): Promise<boolean> {
   // Fix #11: after /agile stop the loop is halted — no nudges at all.
   if (runtime.loopStopped) return false;
@@ -1179,9 +1181,13 @@ async function maybeSendContinuation(
     openTasks,
   });
 
+  // Design A: agent_end auto-close prefixes the nudge with the retrospective
+  // summary so the agent sees the sprint was closed automatically.
+  const full = prefix ? `${prefix}\n\n${message}` : message;
+
   runtime.agentEndSentForSprint = sprint.id; // optimistic dedupe (RC4)
   try {
-    await pi.sendUserMessage(message, { deliverAs: "followUp" });
+    await pi.sendUserMessage(full, { deliverAs: "followUp" });
     return true;
   } catch {
     return false;
@@ -1495,7 +1501,17 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       loopStopped: runtime.loopStopped, // Fix #11: /agile stop silences agent_end
     })) return;
 
-    await maybeSendContinuation(pi, runtime, workDir, sprint);
+    // Design A: agent_end is the single place that closes a terminal sprint
+    // and sends THE continuation message ('start the next sprint'). If the
+    // agent never called agile_retrospective, close the sprint here — the
+    // close flow itself sends the nudge (prefixed with the auto-completed
+    // summary). A sprint already done (e.g. restart recovery with a lost
+    // in-memory flag) falls back to the plain continuation nudge.
+    if (sprint.status !== "done") {
+      await closeSprint(pi, runtime, workDir, sprint, { autoCompleted: true });
+    } else {
+      await maybeSendContinuation(pi, runtime, workDir, sprint);
+    }
   });
 
   // -----------------------------------------------------------------------
@@ -2085,22 +2101,19 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
 
         // Run observer after task transition
         const transitionSteers = runSprintObserver(sprint, runtime.observerState, DEFAULT_OBSERVER_CONFIG, workDir);
-        // Deliver observer steers (e.g. all_tasks_exhausted → run agile_discover) as follow-ups
-        for (const steer of transitionSteers) {
-          try {
-            await pi.sendUserMessage(steer.message, { deliverAs: "followUp" });
-          } catch { /* best effort */ }
-        }
-        // Fix (agent_end stability, M2 for the single path): when this transition
-        // exhausted the sprint, the all_blocked/all_tasks_exhausted steer IS the
-        // continuation nudge — mark the sprint covered so the next agent_end does
-        // not send a second near-identical message (mirrors executeBatchTasks/P18
-        // and the merge tool). Only terminal sprints count: a stagnation or
-        // constraint_spam steer with pending tasks must NOT suppress the later
-        // agent_end nudge.
+        // Design A: agent_end is the single closer + messenger for terminal
+        // sprints — deliver ONLY non-terminal steers (stagnation/constraint_spam/
+        // velocity_drop) mid-turn; terminal steers (all_blocked/all_tasks_exhausted)
+        // are replaced by the agent_end auto-close message, and no dedupe flag is
+        // set here anymore (the exhausted steer was previously the continuation
+        // nudge — now agent_end owns it).
         const terminalNow = sprint.tasks.every((t) => t.status === "done" || t.status === "blocked");
-        if (transitionSteers.length > 0 && terminalNow) {
-          runtime.agentEndSentForSprint = sprint.id;
+        if (!terminalNow) {
+          for (const steer of transitionSteers) {
+            try {
+              await pi.sendUserMessage(steer.message, { deliverAs: "followUp" });
+            } catch { /* best effort */ }
+          }
         }
       }
 
@@ -2286,6 +2299,118 @@ ${checksFailed ? "\n⚠️ **Checks reported failures above — verify before co
     },
   });
 
+  /**
+   * Design A: complete a sprint — shared by agile_retrospective (agent-called)
+   * and agent_end (auto-close when the agent never called the retrospective).
+   *
+   * State: velocity, ONE sprint_summary in knowledge (alreadyCompleted → no-op
+   * for budget/messages/knowledge — a second close must not append a duplicate
+   * summary), completeSprint (status done), observer, bounded budget decrement.
+   * Message: the single continuation message ('start the next sprint') — full
+   * buildContinuationMessage in BOTH modes (bounded gets the mode line
+   * 'N sprint(s) remaining.' + next steps), prefixed with the auto-completed
+   * summary when opts.autoCompleted.
+   */
+  async function closeSprint(
+    pi: ExtensionAPI,
+    runtime: AgileRuntime,
+    workDir: string,
+    sprint: SprintState,
+    opts?: { autoCompleted?: boolean },
+  ): Promise<{ retroText: string; steers: { type: string; message: string; severity: string }[] }> {
+    // Compute velocity
+    sprint.velocity = runtime.store.computeVelocity(sprint);
+
+    // PBT find: closing twice on the same sprint (agent error / agent_end
+    // auto-close followed by an explicit retrospective) must be a no-op for
+    // budget, messages AND knowledge — the old code appended a second
+    // sprint_summary and double-decremented remainingSprints.
+    const alreadyCompleted = sprint.status === "done";
+    if (!alreadyCompleted) {
+      // Save sprint summary to knowledge
+      runtime.knowledge.load(workDir);
+      runtime.knowledge.append({
+        type: "sprint_summary",
+        sprint: sprint.id,
+        ts: new Date().toISOString(),
+        ...sprint.velocity,
+      });
+      runtime.knowledge.save(workDir);
+    }
+
+    // Complete sprint
+    runtime.store.completeSprint(sprint, workDir);
+
+    // Run observer on sprint completion
+    const observerSteers = runSprintObserver(sprint, runtime.observerState, {
+      reworkStuckThreshold: 3,
+      constraintSpamThreshold: 3,
+      velocityDropThreshold: 50,
+      observerEnabled: true,
+    }, workDir);
+
+    // Build retrospective text
+    const v = sprint.velocity;
+    const retroText = buildRetrospectiveText(sprint, workDir, v, runtime.knowledge);
+
+    // Design A: agent_end auto-close prefixes the nudge with the retrospective
+    // summary so the agent knows the sprint was closed without an explicit
+    // retrospective call.
+    const autoPrefix = opts?.autoCompleted
+      ? `Sprint ${sprint.id} auto-completed: ${v.done} done, ${v.rework} rework, ${v.blocked} blocked, avg review rounds ${Math.round((v.avg_review_rounds ?? 0) * 10) / 10}.`
+      : undefined;
+
+    // Decrement remaining sprints (if bounded) and send follow-up.
+    // RC1: the retrospective is the natural end of a sprint cycle — in
+    // continuous mode (no sprint count) the bounded followUp below does not
+    // exist, so the discovery nudge must fire here too, otherwise the loop
+    // silently stops after the first sprint.
+    if (!alreadyCompleted) {
+      if (runtime.remainingSprints !== undefined) {
+        runtime.remainingSprints--;
+        // Mark the sprint as covered — agent_end must not send a second nudge.
+        runtime.agentEndSentForSprint = sprint.id;
+        persistSessionState(workDir, runtime);
+        if (runtime.remainingSprints <= 0) {
+          runtime.sprintLoopActive = false;
+          persistSessionState(workDir, runtime);
+          try {
+            await pi.sendUserMessage("All sprints completed. Stop criteria met — end the sprint loop with /agile stop.", { deliverAs: "followUp" });
+          } catch { /* best effort */ }
+        } else {
+          // Bounded with sprints left: the FULL continuation message (mode line
+          // 'N sprint(s) remaining.' + next steps), not the terse one-liner.
+          await maybeSendContinuation(pi, runtime, workDir, sprint, autoPrefix);
+        }
+      } else {
+        // Continuous mode: the same continuation nudge the agent_end hook would send.
+        await maybeSendContinuation(pi, runtime, workDir, sprint, autoPrefix);
+      }
+    }
+
+    // Append observer steers to output if any
+    const steerText = observerSteers.length > 0
+      ? `
+## Observer
+${observerSteers.map((s: { type: string; message: string; severity: string }) => `[${s.severity}] ${s.message}`).join("\n")}
+`
+      : "";
+
+    // Send observer steers as follow-up messages so the agent acts on them
+    // (dedupe: when we already sent the continuation/budget followUp above,
+    // the observer's sprint_completed steer says the same thing — PBT found
+    // two near-identical messages on one completion).
+    const sentOwnFollowUp = !alreadyCompleted && (runtime.remainingSprints !== undefined || !runtime.loopStopped);
+    for (const steer of observerSteers) {
+      if (sentOwnFollowUp && (steer.type === "sprint_completed" || steer.type === "all_tasks_exhausted")) continue;
+      try {
+        await pi.sendUserMessage(steer.message, { deliverAs: "followUp" });
+      } catch { /* best effort */ }
+    }
+
+    return { retroText: retroText + steerText, steers: observerSteers };
+  }
+
   // Tool: agile_retrospective — compute velocity, build stop-check message
   pi.registerTool({
     name: "agile_retrospective",
@@ -2310,90 +2435,11 @@ ${checksFailed ? "\n⚠️ **Checks reported failures above — verify before co
         };
       }
 
-      // Compute velocity
-      sprint.velocity = runtime.store.computeVelocity(sprint);
-
-      // PBT find: retrospective called twice on the same sprint (agent error)
-      // must be a no-op for budget/messages — the old code double-decremented
-      // remainingSprints and sent a second continuation nudge.
-      const alreadyCompleted = sprint.status === "done";
-      // Save sprint summary to knowledge
-      runtime.knowledge.load(workDir);
-      runtime.knowledge.append({
-        type: "sprint_summary",
-        sprint: sprint.id,
-        ts: new Date().toISOString(),
-        ...sprint.velocity,
-      });
-      runtime.knowledge.save(workDir);
-
-      // Complete sprint
-      runtime.store.completeSprint(sprint, workDir);
-
-      // Run observer on sprint completion
-      const observerSteers = runSprintObserver(sprint, runtime.observerState, {
-        reworkStuckThreshold: 3,
-        constraintSpamThreshold: 3,
-        velocityDropThreshold: 50,
-        observerEnabled: true,
-      }, workDir);
-
-      // Build retrospective text
-      const v = sprint.velocity;
-      const retroText = buildRetrospectiveText(sprint, workDir, v, runtime.knowledge);
-
-      // Decrement remaining sprints (if bounded) and send follow-up.
-      // RC1: the retrospective is the natural end of a sprint cycle — in
-      // continuous mode (no sprint count) the bounded followUp below does not
-      // exist, so the discovery nudge must fire here too, otherwise the loop
-      // silently stops after the first sprint.
-      if (!alreadyCompleted) {
-        if (runtime.remainingSprints !== undefined) {
-          runtime.remainingSprints--;
-          // Mark the sprint as covered — agent_end must not send a second nudge.
-          runtime.agentEndSentForSprint = sprint.id;
-          persistSessionState(workDir, runtime);
-          if (runtime.remainingSprints <= 0) {
-            runtime.sprintLoopActive = false;
-            persistSessionState(workDir, runtime);
-            try {
-              await pi.sendUserMessage("All sprints completed. Stop criteria met — end the sprint loop with /agile stop.", { deliverAs: "followUp" });
-            } catch { /* best effort */ }
-          } else {
-            try {
-              await pi.sendUserMessage(`${runtime.remainingSprints} sprint${runtime.remainingSprints > 1 ? "s" : ""} remaining. Decide: continue to next sprint or stop.`, { deliverAs: "followUp" });
-            } catch { /* best effort */ }
-          }
-        } else {
-          // Continuous mode: no bounded followUp — send the same continuation
-          // nudge the agent_end hook would send.
-          await maybeSendContinuation(pi, runtime, workDir, sprint);
-        }
-      }
-
-      // Append observer steers to output if any
-      const steerText = observerSteers.length > 0
-        ? `
-## Observer
-${observerSteers.map((s: { type: string; message: string; severity: string }) => `[${s.severity}] ${s.message}`).join("\n")}
-`
-        : "";
-
-      // Send observer steers as follow-up messages so the agent acts on them
-      // (dedupe: when we already sent the continuation/budget followUp above,
-      // the observer's sprint_completed steer says the same thing — PBT found
-      // two near-identical messages on one completion).
-      const sentOwnFollowUp = !alreadyCompleted && (runtime.remainingSprints !== undefined || !runtime.loopStopped);
-      for (const steer of observerSteers) {
-        if (sentOwnFollowUp && (steer.type === "sprint_completed" || steer.type === "all_tasks_exhausted")) continue;
-        try {
-          await pi.sendUserMessage(steer.message, { deliverAs: "followUp" });
-        } catch { /* best effort */ }
-      }
+      const { retroText, steers } = await closeSprint(pi, runtime, workDir, sprint);
 
       return {
-        content: [{ type: "text" as const, text: retroText + steerText }],
-        details: { sprintId: sprint.id, velocity: v, observerSteers },
+        content: [{ type: "text" as const, text: retroText }],
+        details: { sprintId: sprint.id, velocity: sprint.velocity, observerSteers: steers },
       };
     },
   });
@@ -2836,11 +2882,11 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
         persistSessionState(workDir, runtime);
 
         const sprintsInfo = maxSprints
-          ? `You have ${maxSprints} sprint${maxSprints > 1 ? "s" : ""} remaining in this session.`
+          ? `This session is budgeted for ${maxSprints} sprint${maxSprints > 1 ? "s" : ""}.`
           : "Continuous mode (no sprint limit).";
 
         ctx.ui.notify(`▶ Sprint loop started (${maxSprints ? maxSprints + " sprints" : "continuous"})`, "info");
-        await pi.sendUserMessage(`/agile run — start the sprint loop.\n\n${sprintsInfo}\nAfter each retrospective, check remaining sprint count — if 0 remaining, stop.\n\nExecute ONE sprint cycle now:\n1. If no sprint exists, call agile_discover to find work\n2. Create tasks in bd from discovery results (bd create "title" -d "desc")\n3. Call agile_start_sprint with the task IDs\n4. Call agile_delegate_task for each task\n5. Call agile_retrospective after all tasks are done\n6. Read remaining sprints in retrospective output — if none left, stop; otherwise decide: continue or stop`, { deliverAs: "followUp" });
+        await pi.sendUserMessage(`/agile run — start the sprint loop.\n\n${sprintsInfo}\nAfter each retrospective, check the sprint count — if 0 left, stop.\n\nExecute ONE sprint cycle now:\n1. If no sprint exists, call agile_discover to find work\n2. Create tasks in bd from discovery results (bd create "title" -d "desc")\n3. Call agile_start_sprint with the task IDs\n4. Call agile_delegate_task for each task\n5. OPTIONAL: call agile_retrospective — agent_end auto-closes terminal sprints; call it only to close early or see the full retrospective text\n6. Read the sprint count in the retrospective output — if none left, stop; otherwise continue the cycle`, { deliverAs: "followUp" });
         return;
       }
 

@@ -955,7 +955,7 @@ process.env.PI_AGILE_POLL_INTERVAL_MS = "10";
 const { default: piAgileExtension } = await import(
   pathToFileURL(path.join(EXT_DIR, "index.ts")).href
 );
-const { createFakePi, makeCtx, readSession, createFakeBridge, makeFakeUi } = await import(
+const { createFakePi, makeCtx, readSession, createFakeBridge, makeFakeUi, readLatestSprint } = await import(
   pathToFileURL(path.join(import.meta.dirname, "fake-pi.ts")).href
 );
 
@@ -1094,24 +1094,83 @@ await test("agile_start_sprint aborts on empty task_ids (no zombie sprint)", asy
   }
 });
 
-await test("single delegate exhausted steers suppress the agent_end duplicate (M2 for single)", async () => {
+await test("agent_end auto-closes terminal sprint + single start-next message", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
   try {
     const bdTasks = new Map([["t1", "Task t1"]]);
     const bridge = createFakeBridge({ verdictFor: () => "blocked" });
     const { pi, tool, command, hook } = createFakePi({ bdTasks, bridge });
     piAgileExtension(pi);
-    const ctx = makeCtx(dir, "smoke-ext-singlededupe");
+    const ctx = makeCtx(dir, "smoke-ext-autoclose");
     await command("agile").handler("on", ctx);
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
     await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
-    // The delegate's observer already sent terminal steers (all_blocked + exhausted)
-    const exhausted = pi.sentMessages.filter((m) => /All 1 tasks are exhausted/.test(m.text));
-    assert.ok(exhausted.length >= 1, "single delegate must send the exhausted steer");
+    // Delegate no longer sends terminal steers / sets the flag — the sprint
+    // stays planning until agent_end auto-closes it.
+    assert.strictEqual(readLatestSprint(dir).status, "planning", "delegate must not close the sprint");
     const before = pi.sentMessages.length;
     await hook("agent_end")({ messages: [] }, ctx);
-    const nudges = pi.sentMessages.slice(before).filter((m) => /Decide and act now/.test(m.text));
-    assert.strictEqual(nudges.length, 0, "agent_end must not duplicate the exhausted steer");
+    const msgs = pi.sentMessages.slice(before);
+    const nudges = msgs.filter((m) => /Decide and act now/.test(m.text));
+    assert.strictEqual(nudges.length, 1, "agent_end must auto-close and nudge exactly once");
+    assert.ok(/auto-completed/.test(nudges[0].text), "nudge must carry the auto-completed line");
+    const spr = readLatestSprint(dir);
+    assert.strictEqual(spr.status, "done", "auto-close must set status done on disk");
+    assert.ok(spr.velocity && spr.velocity.done + spr.velocity.blocked > 0, "velocity must be computed");
+    const m2 = pi.sentMessages.length;
+    await hook("agent_end")({ messages: [] }, ctx);
+    assert.strictEqual(pi.sentMessages.length - m2, 0, "second agent_end must stay silent");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("retrospective after auto-close is a no-op (no double summary)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
+  try {
+    const bdTasks = new Map([["t1", "Task t1"]]);
+    const bridge = createFakeBridge({ verdictFor: () => "blocked" });
+    const { pi, tool, command, hook } = createFakePi({ bdTasks, bridge });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-ext-retronoop");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
+    await hook("agent_end")({ messages: [] }, ctx); // auto-close + nudge
+    const before = pi.sentMessages.length;
+    const res = await tool("agile_retrospective").execute("t", {}, null, null, ctx);
+    const nudges = pi.sentMessages.slice(before).filter((m) => /Decide and act now|sprints? remaining/.test(m.text));
+    assert.strictEqual(nudges.length, 0, "retrospective on an auto-closed sprint must not re-nudge");
+    assert.ok((res.content?.[0]?.text ?? "").includes("Sprint"), "retrospective must still return its text");
+    const kb = fs.readFileSync(path.join(dir, ".agile", "knowledge.jsonl"), "utf8");
+    const summaries = kb.split("\n").filter((l) => l.includes('"type":"sprint_summary"')).length;
+    assert.strictEqual(summaries, 1, "exactly one sprint_summary per sprint (no double append)");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("bounded agent_end auto-close sends full continuation with remaining count", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
+  try {
+    const bdTasks = new Map([["t1", "Task t1"]]);
+    const bridge = createFakeBridge({ verdictFor: () => "blocked" });
+    const { pi, tool, command, hook } = createFakePi({ bdTasks, bridge });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-ext-bound");
+    await command("agile").handler("on", ctx);
+    await command("agile").handler("run 2", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
+    const before = pi.sentMessages.length;
+    await hook("agent_end")({ messages: [] }, ctx);
+    const msgs = pi.sentMessages.slice(before);
+    const nudges = msgs.filter((m) => /Decide and act now|sprints? remaining/.test(m.text));
+    assert.strictEqual(nudges.length, 1, "bounded auto-close must send exactly one continuation message");
+    assert.ok(/1 sprint/.test(nudges[0].text), `bounded nudge must show remaining count (got: ${nudges[0].text.slice(0, 120)})`);
+    assert.ok(/agile_start_sprint/.test(nudges[0].text), "bounded nudge must be the full continuation with next steps");
     return null;
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -1144,7 +1203,7 @@ const {
   RpcClient, RpcClientError, buildRequest, replyEventFor, parseSpawnReply,
   SUBAGENT_RPC_REQUEST_EVENT, SUBAGENT_RPC_REPLY_EVENT_PREFIX,
 } = await importModule("parallel/rpc.ts");
-const { createEventBus, readLatestSprint } = await import(pathToFileURL(path.join(import.meta.dirname, "fake-pi.ts")).href);
+const { createEventBus } = await import(pathToFileURL(path.join(import.meta.dirname, "fake-pi.ts")).href);
 
 /** Attach a scripted bridge: map method -> reply data (or null = no reply). */
 function scriptedBridge(events, handler) {

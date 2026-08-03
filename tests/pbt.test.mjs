@@ -140,6 +140,7 @@ class RealSystem {
     this.lastAction = null;
     this.boundedInitial = undefined;
     this.actionMarker = 0;
+    this.nudgePerSprint = 0; // total continuation messages for the current sprint (design A)
   }
 
   record(k) {
@@ -177,6 +178,7 @@ class RealSystem {
     }
     await this.tool("agile_start_sprint").execute("t", { task_ids: ids }, null, null, this.ctx);
     this.record(`startSprint(${k})`);
+    this.nudgePerSprint = 0; // new sprint → fresh per-sprint message window
   }
 
   async delegate() {
@@ -239,11 +241,13 @@ class RealSystem {
     this.boundedInitial = n;
     await this.command("agile").handler(`run ${n}`, this.ctx);
     this.record(`runBounded(${n})`);
+    this.nudgePerSprint = 0; // loop-start message is loop-level, not per-sprint
   }
 
   async runContinuous() {
     await this.command("agile").handler("run Improve the module boundaries", this.ctx);
     this.record("runContinuous");
+    this.nudgePerSprint = 0;
   }
 
   async stop() {
@@ -257,6 +261,7 @@ class RealSystem {
     this.ctx = makeCtx(this.dir, `pbt-${this.seed}-s${this.session}`);
     await this.beforeStart();
     this.record("restart");
+    this.nudgePerSprint = 0; // fresh runtime — restart recovery may re-nudge once (by design)
   }
 
   async injectTasks() {
@@ -280,6 +285,7 @@ class RealSystem {
     store.save(this.dir, sprint);
     await this.beforeStart();
     this.record(`injectTasks(${n})`);
+    this.nudgePerSprint = 0; // injected sprint = fresh per-sprint message window
   }
 
   async corruptSession() {
@@ -305,6 +311,7 @@ class RealSystem {
   async delegateBatch() {
     const sprint = readLatestSprint(this.dir);
     if (!sprint) return;
+    this.lastBatchWasDone = sprint.status === "done"; // covered-sprint guard for P18
     const eligible = sprint.tasks.filter((t) => t.status === "backlog" || t.status === "rework");
     if (eligible.length === 0) return;
     const n = Math.min(genInt(this.rng, 1, Math.min(3, eligible.length)), eligible.length);
@@ -495,6 +502,9 @@ function pickAction(rng) {
 // ──────────────────────────────────────────────────────────────────────
 
 async function checkInvariants(sys) {
+  // Action-scoped messages (captured BEFORE any probe below, so harness
+  // probe agent_end calls — P9/P10/P18 — do not pollute the per-sprint counter).
+  const actionMsgs = sys.newMessages();
   const sprint = readLatestSprint(sys.dir);
 
   // P1 persist-echo: disk state === what the real code last wrote
@@ -519,7 +529,7 @@ async function checkInvariants(sys) {
   }
 
   // P8 ≤1 continuation-type message per action
-  assert.ok(sys.nudgeCount(sys.newMessages()) <= 1, `P8: ${sys.nudgeCount(sys.newMessages())} continuation messages in one action`);
+  assert.ok(sys.nudgeCount(actionMsgs) <= 1, `P8: ${sys.nudgeCount(actionMsgs)} continuation messages in one action`);
 
   // P9 anti-spam: an agent_end right after an agent_end never nudges twice
   if (sys.lastAction === "agentEnd") {
@@ -590,24 +600,53 @@ async function checkInvariants(sys) {
     }
   }
 
-  // P18: batch that sent its own terminal/continuation steer must NOT get a
-  // second continuation from the immediately-following agent_end (M2 disease
-  // for the batch path — the merge tool was fixed, executeBatchTasks was not).
+  // P18 (design A, positive): a terminal delegateBatch leaves the sprint
+  // un-closed (the batch no longer sets the dedupe flag) — the immediately-
+  // following agent_end MUST auto-close it (status done) and send exactly ONE
+  // continuation message. The old negative invariant (agent_end must stay
+  // silent after a batch steer) is obsolete: agent_end is now the single
+  // closer + messenger.
   if (sys.lastAction && sys.lastAction.startsWith("delegateBatch(")) {
     const sprintNow = readLatestSprint(sys.dir);
     const terminal =
       sprintNow && sprintNow.tasks.length > 0 && sprintNow.tasks.every((t) => t.status === "done" || t.status === "blocked");
-    const batchMsgs = sys.newMessages();
-    if (terminal && batchMsgs.length > 0 && sys.nudgeCount(batchMsgs) === 0) {
+    // After /agile stop agent_end stays silent by design (loopStopped gate) —
+    // the positive auto-close assertion only applies to a running loop. A
+    // sprint already done/covered before the batch (its continuation was
+    // already sent by e.g. a retrospective) is also exempt.
+    if (terminal && !sys.lastBatchWasDone && readSession(sys.dir).loopStopped !== true) {
       const marker = sys.pi.sentMessages.length;
       await sys.hook("agent_end")({ messages: [] }, sys.ctx);
-      assert.strictEqual(
-        sys.nudgeCount(sys.pi.sentMessages.slice(marker)),
-        0,
-        "P18: agent_end double-nudges after batch exhausted-steer",
-      );
+      const nudges = sys.nudgeCount(sys.pi.sentMessages.slice(marker));
+      assert.strictEqual(nudges, 1, `P18: agent_end must auto-close a terminal batch + nudge once (got ${nudges})`);
+      const spr = readLatestSprint(sys.dir);
+      assert.strictEqual(spr.status, "done", "P18: auto-close must set status done");
     }
   }
+
+  // P22 (design A, positive): an agent_end that nudges a terminal sprint MUST
+  // have closed it (status done) — auto-close runs before the nudge. This is
+  // the invariant that catches the original "agent never called the
+  // retrospective → sprint stuck in planning" disease.
+  if (sys.lastAction === "agentEnd") {
+    const spr = readLatestSprint(sys.dir);
+    if (spr && spr.tasks.length > 0) {
+      const pending = spr.tasks.filter((t) => t.status !== "done" && t.status !== "blocked");
+      if (sys.nudgeCount(sys.newMessages()) >= 1 && pending.length === 0) {
+        assert.strictEqual(spr.status, "done", `P22: agent_end that nudges a terminal sprint must close it (id=${spr.id} status=${spr.status})`);
+      }
+    }
+  }
+
+  // P8b (design A): at most ONE continuation message per sprint within one
+  // runtime (across actions, not per-action) — auto-close / retrospective /
+  // maybeSendContinuation are all flag-gated, so a cross-action duplicate
+  // (e.g. a steer in one action + a nudge in the next) is now impossible.
+  sys.nudgePerSprint += sys.nudgeCount(actionMsgs);
+  assert.ok(
+    sys.nudgePerSprint <= 1,
+    `P8b: ${sys.nudgePerSprint} continuation messages for the current sprint (must be <= 1)`,
+  );
 }
 
 async function runScenario(rng, seed, maxActions) {
