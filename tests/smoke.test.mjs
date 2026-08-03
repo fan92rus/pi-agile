@@ -449,74 +449,141 @@ await test("Level B: non-running / no activity data never stuck", () => {
   assert.strictEqual(isStuck(null, 1_800_000), false);
 });
 
-// ── index.ts: agent_end continuation intent ──────────────────────────
-console.log("\n## index.ts: agent_end continuation intent");
+// ── continuation.ts: auto-continuation nudge (agent_end + retrospective) ──
+console.log("\n## continuation.ts: auto-continuation nudge");
 
-// Logic under test: agent_end followUp always shows the project goal and
-// appends the original request when one was given. Re-implement the logic.
-function buildContextLines(originalRequest, goal) {
-  const lines = [`Project goal: ${goal}`];
-  if (originalRequest.trim()) {
-    lines.push(`Original user request: ${originalRequest}`);
+const continuation = await importModule(path.join("parallel", "continuation.ts"));
+const { shouldSendContinuation, buildContinuationMessage, saveSessionState, loadSessionState } = continuation;
+
+// shouldSendContinuation — real gate logic used by agent_end. RC1 regression:
+// the old implementation had a `status === "done"` gate that killed the nudge
+// after agile_retrospective (which marks the sprint done) in continuous mode.
+// The anti-spam flag is now the single source of truth, so a done sprint
+// still fires unless a followUp was already sent for it.
+
+await test("continuation: fires for planning sprint with all terminal tasks", () => {
+  assert.ok(shouldSendContinuation({ pendingCount: 0, taskCount: 3, sentForSprint: null, sprintId: 1, remainingSprints: undefined }));
+});
+
+await test("continuation: RC1 — done sprint still fires when no followUp sent yet", () => {
+  assert.ok(shouldSendContinuation({ pendingCount: 0, taskCount: 2, sentForSprint: null, sprintId: 1, remainingSprints: undefined }));
+});
+
+await test("continuation: done sprint suppressed once retrospective covered it", () => {
+  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 2, sentForSprint: 1, sprintId: 1, remainingSprints: undefined }));
+});
+
+await test("continuation: does NOT fire when pending tasks remain", () => {
+  assert.ok(!shouldSendContinuation({ pendingCount: 1, taskCount: 3, sentForSprint: null, sprintId: 1, remainingSprints: undefined }));
+});
+
+await test("continuation: does NOT fire for empty sprint", () => {
+  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 0, sentForSprint: null, sprintId: 1, remainingSprints: undefined }));
+});
+
+await test("continuation: does NOT fire twice for the same sprint (anti-spam)", () => {
+  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 3, sentForSprint: 1, sprintId: 1, remainingSprints: undefined }));
+});
+
+await test("continuation: fires again for a NEW sprint id", () => {
+  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 3, sentForSprint: 1, sprintId: 1, remainingSprints: undefined })); // old sprint — no
+  assert.ok(shouldSendContinuation({ pendingCount: 0, taskCount: 3, sentForSprint: 1, sprintId: 2, remainingSprints: undefined })); // new sprint — yes
+});
+
+await test("continuation: does NOT fire when all bounded sprints consumed", () => {
+  assert.ok(!shouldSendContinuation({ pendingCount: 0, taskCount: 2, sentForSprint: null, sprintId: 1, remainingSprints: 0 }));
+});
+
+await test("continuation: fires with bounded sprints left", () => {
+  assert.ok(shouldSendContinuation({ pendingCount: 0, taskCount: 2, sentForSprint: null, sprintId: 1, remainingSprints: 2 }));
+});
+
+// buildContinuationMessage — the exact followUp text sent to the agent.
+
+await test("continuation message: goal + original request + continuous mode", () => {
+  const msg = buildContinuationMessage({
+    goal: "Improve code quality", originalRequest: "Improve performance of the parser",
+    remainingSprints: undefined, totalTasks: 3, totalDone: 2, totalBlocked: 1, openTasks: [],
+  });
+  assert.ok(msg.includes("Project goal: Improve code quality"));
+  assert.ok(msg.includes("Original user request: Improve performance"));
+  assert.ok(msg.includes("Continuous mode"));
+  assert.ok(msg.includes("2 done, 1 blocked"));
+});
+
+await test("continuation message: goal only when no original request", () => {
+  const msg = buildContinuationMessage({
+    goal: "Improve code quality and fix issues", originalRequest: "   ",
+    remainingSprints: undefined, totalTasks: 1, totalDone: 1, totalBlocked: 0, openTasks: [],
+  });
+  assert.ok(msg.includes("Project goal: Improve code quality"));
+  assert.ok(!msg.includes("Original user request"));
+});
+
+await test("continuation message: bounded mode + open bd tasks hint + instructions", () => {
+  const msg = buildContinuationMessage({
+    goal: "G", originalRequest: "", remainingSprints: 2, totalTasks: 1, totalDone: 1, totalBlocked: 0,
+    openTasks: ["pi-autoresearch-22i"],
+  });
+  assert.ok(msg.includes("2 sprints remaining"));
+  assert.ok(msg.includes("`pi-autoresearch-22i`"));
+  assert.ok(msg.includes("agile_discover"));
+  assert.ok(msg.includes("agile_start_sprint"));
+  assert.ok(msg.includes("Decide and act now")); // RC5: actionable, not advisory-only
+});
+
+// ── continuation.ts: session state persistence (RC3) ─────────────────
+console.log("\n## continuation.ts: session state persistence (RC3)");
+
+await test("session state: save + load round-trip", () => {
+  const tmpDir = fs.mkdtempSync(path.join(import.meta.dirname, "tmp-session-"));
+  try {
+    saveSessionState(tmpDir, { remainingSprints: 2, originalRequest: "fix stuff", sprintLoopActive: true });
+    const loaded = loadSessionState(tmpDir);
+    assert.strictEqual(loaded.remainingSprints, 2);
+    assert.strictEqual(loaded.originalRequest, "fix stuff");
+    assert.strictEqual(loaded.sprintLoopActive, true);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
-  return lines;
-}
-
-await test("agent_end context: shows goal and original request", () => {
-  const lines = buildContextLines("Improve performance of the parser", "Improve code quality");
-  const joined = lines.join("\n");
-  assert.ok(joined.includes("Project goal: Improve code quality"));
-  assert.ok(joined.includes("Original user request: Improve performance"));
-  assert.strictEqual(lines.length, 2);
 });
 
-await test("agent_end context: goal only when no original request", () => {
-  const lines = buildContextLines("", "Improve code quality and fix issues");
-  const joined = lines.join("\n");
-  assert.ok(joined.includes("Project goal: Improve code quality"));
-  assert.strictEqual(lines.length, 1);
+await test("session state: load on missing file returns {}", () => {
+  const tmpDir = fs.mkdtempSync(path.join(import.meta.dirname, "tmp-session2-"));
+  try {
+    assert.deepStrictEqual(loadSessionState(tmpDir), {});
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
-// agent_end guard conditions: sprints never become "active" (only planning/done),
-// so the guard must be against "done", and the anti-spam flag must gate repeats.
-function agentEndShouldFire(sprintStatus, tasks, sentForSprint, sprintId) {
-  if (sprintStatus === "done") return false;
-  const pending = tasks.filter((t) => t.status !== "done" && t.status !== "blocked");
-  if (pending.length > 0) return false;
-  if (tasks.length === 0) return false;
-  if (sentForSprint === sprintId) return false; // already nudged for this sprint
-  return true;
-}
-
-await test("agent_end fires for planning sprint with all terminal tasks", () => {
-  const tasks = [
-    { status: "done" },
-    { status: "blocked" },
-    { status: "done" },
-  ];
-  assert.ok(agentEndShouldFire("planning", tasks, null, 1));
+await test("session state: corrupt file ignored, returns {}", () => {
+  const tmpDir = fs.mkdtempSync(path.join(import.meta.dirname, "tmp-session3-"));
+  try {
+    fs.mkdirSync(path.join(tmpDir, ".agile"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, ".agile", "session.json"), "{not json", "utf8");
+    assert.deepStrictEqual(loadSessionState(tmpDir), {});
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
-await test("agent_end does NOT fire for completed sprint (status done)", () => {
-  const tasks = [{ status: "done" }];
-  assert.ok(!agentEndShouldFire("done", tasks, null, 1));
-});
-
-await test("agent_end does NOT fire when pending tasks remain", () => {
-  const tasks = [{ status: "done" }, { status: "in_progress" }];
-  assert.ok(!agentEndShouldFire("planning", tasks, null, 1));
-});
-
-await test("agent_end does NOT fire twice for the same sprint (anti-spam)", () => {
-  const tasks = [{ status: "done" }];
-  assert.ok(agentEndShouldFire("planning", tasks, null, 1));
-  assert.ok(!agentEndShouldFire("planning", tasks, 1, 1));
-});
-
-await test("agent_end fires again for a NEW sprint id", () => {
-  const tasks = [{ status: "done" }];
-  assert.ok(!agentEndShouldFire("planning", tasks, 1, 1)); // old sprint — no
-  assert.ok(agentEndShouldFire("planning", tasks, 1, 2)); // new sprint — yes
+await test("session state: unknown fields filtered on load", () => {
+  const tmpDir = fs.mkdtempSync(path.join(import.meta.dirname, "tmp-session4-"));
+  try {
+    fs.mkdirSync(path.join(tmpDir, ".agile"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, ".agile", "session.json"),
+      JSON.stringify({ remainingSprints: "5", originalRequest: "x", sprintLoopActive: "yes", junk: 1 }),
+      "utf8",
+    );
+    const loaded = loadSessionState(tmpDir);
+    assert.strictEqual(loaded.remainingSprints, undefined); // string rejected
+    assert.strictEqual(loaded.originalRequest, "x");
+    assert.strictEqual(loaded.sprintLoopActive, undefined); // string rejected
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 // Open bd tasks hint: parse bd list lines, excluding tasks already in sprint.

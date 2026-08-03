@@ -22,6 +22,12 @@ import * as path from "node:path";
 
 import { KnowledgeBase } from "./parallel/knowledge.ts";
 import { SprintStore, type SprintState, type SprintTask, type SprintVelocity } from "./parallel/sprint.ts";
+import {
+  shouldSendContinuation,
+  buildContinuationMessage,
+  loadSessionState as loadSessionStateFromDisk,
+  saveSessionState as saveSessionStateToDisk,
+} from "./parallel/continuation.ts";
 import { runDiscovery, formatDiscoveryResult, initChecks, detectEcosystem, type EcosystemInfo } from "./parallel/discovery.ts";
 import { buildChainAgentTask, buildReviewerTask, buildWorkerTask, parseReviewVerdict, buildDiscoveryScoutTask, buildDetectiveTask } from "./parallel/review.ts";
 import { RpcClient, type SpawnedWorker } from "./parallel/rpc.ts";
@@ -798,6 +804,7 @@ async function executeBatchTasks(
   const meta = extractProjectMeta(project);
   const constraints = loadConstraintsText(workDir);
   const patterns = runtime.knowledge.formatPatterns();
+  runtime.lastWorkDir = workDir;
   const deadEnds = runtime.knowledge.formatDeadEnds();
 
   //
@@ -1055,6 +1062,8 @@ interface AgileRuntime {
   originalRequest: string;
   /** Sprint id for which the agent_end discovery followUp was already sent (prevents spam per sprint). */
   agentEndSentForSprint: number | null;
+  /** Last workDir the agile tools operated on — agent_end falls back to it when ctx.cwd has no sprint (RC2). */
+  lastWorkDir: string | null;
 }
 
 function createRuntime(events: unknown): AgileRuntime {
@@ -1068,6 +1077,7 @@ function createRuntime(events: unknown): AgileRuntime {
     observerConfig: { ...DEFAULT_OBSERVER_CONFIG },
     originalRequest: "",
     agentEndSentForSprint: null,
+    lastWorkDir: null,
     knowledge: new KnowledgeBase(),
     store: new SprintStore(),
   };
@@ -1097,6 +1107,77 @@ function getOrRestoreSprint(rt: AgileRuntime, workDir: string): SprintState | nu
 
 // Module-level runtime store (per-session)
 const runtimeStore = new Map<string, AgileRuntime>();
+
+// ---------------------------------------------------------------------------
+// Session state (RC3): persist sprint-loop intent per project so it survives
+// pi restarts. All mutations of remainingSprints/originalRequest/
+// sprintLoopActive must go through persistSessionState.
+// ---------------------------------------------------------------------------
+
+function persistSessionState(workDir: string, runtime: AgileRuntime): void {
+  saveSessionStateToDisk(workDir, {
+    remainingSprints: runtime.remainingSprints,
+    originalRequest: runtime.originalRequest,
+    sprintLoopActive: runtime.sprintLoopActive,
+  });
+}
+
+/** Restore persisted loop state for this project into the runtime (no-op when absent). */
+function loadSessionIntoRuntime(workDir: string, runtime: AgileRuntime): void {
+  const state = loadSessionStateFromDisk(workDir);
+  if (state.remainingSprints !== undefined) runtime.remainingSprints = state.remainingSprints;
+  if (state.originalRequest !== undefined) runtime.originalRequest = state.originalRequest;
+  if (state.sprintLoopActive !== undefined) runtime.sprintLoopActive = state.sprintLoopActive;
+}
+
+/**
+ * Send the continuation nudge (RC1/RC4): build the message, mark the sprint
+ * as covered BEFORE sending (optimistic — a delivery failure must not cause a
+ * retry storm on every agent_end), then fire the followUp.
+ */
+async function maybeSendContinuation(
+  pi: ExtensionAPI,
+  runtime: AgileRuntime,
+  workDir: string,
+  sprint: SprintState,
+): Promise<boolean> {
+  // Open bd tasks not already in this sprint — they should go into the next sprint.
+  let openTasks: string[] = [];
+  try {
+    const bdOut = await execText(pi, "bd", ["list"], workDir, 10_000);
+    if (!bdOut.includes("[exec error]")) {
+      const inSprint = new Set(sprint.tasks.map((t) => t.bd_id));
+      // Lines like: ○ pi-autoresearch-22i ● P2 Test agent_end E2E
+      for (const line of bdOut.split(/\r?\n/)) {
+        const m = line.match(/^[○◐]\s+([\w.-]+)\s/);
+        if (m && !inSprint.has(m[1])) openTasks.push(m[1]);
+      }
+    }
+  } catch { /* bd may not be initialized — fall back to discovery-only hint */ }
+
+  const project = loadProjectConfig(workDir);
+  const meta = extractProjectMeta(project);
+  const totalDone = sprint.tasks.filter((t) => t.status === "done").length;
+  const totalBlocked = sprint.tasks.filter((t) => t.status === "blocked").length;
+
+  const message = buildContinuationMessage({
+    goal: meta.goal,
+    originalRequest: runtime.originalRequest,
+    remainingSprints: runtime.remainingSprints,
+    totalTasks: sprint.tasks.length,
+    totalDone,
+    totalBlocked,
+    openTasks,
+  });
+
+  runtime.agentEndSentForSprint = sprint.id; // optimistic dedupe (RC4)
+  try {
+    await pi.sendUserMessage(message, { deliverAs: "followUp" });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** Set agile mode flag — gates tool execution and system prompt injection. */
 function setAgileMode(ctx: ExtensionContext, enabled: boolean, workDir?: string): void {
@@ -1341,6 +1422,9 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     }
     if (!runtime.agileMode) return;
 
+    // RC3: restore persisted sprint-loop state (remainingSprints, originalRequest)
+    loadSessionIntoRuntime(ctx.cwd, runtime);
+
     const workDir = ctx.cwd;
     const project = loadProjectConfig(workDir);
     if (!project) return; // Not an agile project
@@ -1374,73 +1458,34 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     const runtime = getRuntime(ctx, runtimeStore);
     if (!runtime.agileMode) return;
 
-    const workDir = ctx.cwd;
-    const sprint = runtime.store.getCurrent(workDir);
+    // RC2: the agile tools accept an explicit cwd param, so the session cwd
+    // may differ from the workDir the sprint actually lives in. Fall back to
+    // the last known agile workDir before giving up.
+    let workDir = ctx.cwd;
+    let sprint = runtime.store.getCurrent(workDir);
+    if (!sprint && runtime.lastWorkDir && runtime.lastWorkDir !== workDir) {
+      sprint = runtime.store.getCurrent(runtime.lastWorkDir);
+      if (sprint) workDir = runtime.lastWorkDir;
+    }
     if (!sprint) return; // No active sprint
+    runtime.lastWorkDir = workDir;
 
-    // Only when sprint is not yet completed and all tasks are terminal.
-    // NOTE: sprints are created as "planning" and finished as "done" —
-    // there is no "active" transition, so check against "done" only.
-    if (sprint.status === "done") return;
+    // RC1: NO status==="done" gate. A completed sprint still deserves the
+    // continuation nudge unless a followUp was already sent for it — the
+    // anti-spam flag is the single source of truth (agile_retrospective marks
+    // the sprint as covered when it sends its own followUp, and the flag
+    // dedupes repeated agent_end firings). This keeps the loop alive in
+    // continuous mode where the retrospective sends no bounded followUp.
     const pending = sprint.tasks.filter((t) => t.status !== "done" && t.status !== "blocked");
-    if (pending.length > 0) return;
-    if (sprint.tasks.length === 0) return;
+    if (!shouldSendContinuation({
+      pendingCount: pending.length,
+      taskCount: sprint.tasks.length,
+      sentForSprint: runtime.agentEndSentForSprint,
+      sprintId: sprint.id,
+      remainingSprints: runtime.remainingSprints,
+    })) return;
 
-    // Already nudged the agent for this sprint — don't spam on every agent_end.
-    if (runtime.agentEndSentForSprint === sprint.id) return;
-
-    // More sprints ahead? Only then is finding new work meaningful.
-    // remainingSprints === undefined means continuous mode (unlimited).
-    const hasSprintsLeft =
-      runtime.remainingSprints === undefined || runtime.remainingSprints > 0;
-    if (!hasSprintsLeft) return;
-
-    // Ask the agent to judge continuation intent from the original request
-    // (stored from /agile run [count] [description...]) and the project goal.
-    const project = loadProjectConfig(workDir);
-    const meta = extractProjectMeta(project);
-
-    const totalDone = sprint.tasks.filter((t) => t.status === "done").length;
-    const totalBlocked = sprint.tasks.filter((t) => t.status === "blocked").length;
-
-    // Open bd tasks not already in this sprint — they should go into the next sprint.
-    let openTasks: string[] = [];
-    try {
-      const bdOut = await execText(pi, "bd", ["list"], workDir, 10_000);
-      if (!bdOut.includes("[exec error]")) {
-        const inSprint = new Set(sprint.tasks.map((t) => t.bd_id));
-        // Lines like: ○ pi-autoresearch-22i ● P2 Test agent_end E2E
-        for (const line of bdOut.split(/\r?\n/)) {
-          const m = line.match(/^[○◐]\s+([\w.-]+)\s/);
-          if (m && !inSprint.has(m[1])) openTasks.push(m[1]);
-        }
-      }
-    } catch { /* bd may not be initialized — fall back to discovery-only hint */ }
-
-    try {
-      const contextLines = [`Project goal: ${meta.goal}`];
-      if (runtime.originalRequest.trim()) {
-        contextLines.push(`Original user request: ${runtime.originalRequest.trim()}`);
-      }
-      await pi.sendUserMessage(
-        `All ${sprint.tasks.length} sprint tasks are finished (${totalDone} done, ${totalBlocked} blocked).\n` +
-        `Sprints remain — decide whether to continue finding new work.\n` +
-        `${contextLines.join("\n")}\n\n` +
-        (openTasks.length > 0
-          ? `Open tasks in bd (not in this sprint) — start the next sprint with them:\n` +
-            openTasks.map((id) => `- \`${id}\``).join("\n") + `\n\n`
-          : ``) +
-        `If the original request implies continuing (e.g. improving further, fixing more issues, exploring more areas):\n` +
-        `1. If open bd tasks exist above — call \`agile_start_sprint\` with them (plus any new tasks)\n` +
-        `2. Run \`agile_discover\` to scan the codebase for remaining issues (check scripts + scout subagent)\n` +
-        `3. Review results against project constraints (scope, max tasks from .agile/project.yaml)\n` +
-        `4. Create tasks for the next sprint via \`bd create\` with clear acceptance criteria\n` +
-        `5. Call \`agile_start_sprint\` to initialize the next sprint\n\n` +
-        `If the original request is fully satisfied — end here (no new tasks needed).`,
-        { deliverAs: "followUp" }
-      );
-      runtime.agentEndSentForSprint = sprint.id;
-    } catch { /* best effort */ }
+    await maybeSendContinuation(pi, runtime, workDir, sprint);
   });
 
   // -----------------------------------------------------------------------
@@ -1668,9 +1713,9 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       }
       const project = loadProjectConfig(workDir);
       const meta = extractProjectMeta(project);
+      runtime.lastWorkDir = workDir;
 
-      const sprintId = runtime.store.findLastSprintId(workDir) + 1;
-      const sprint = runtime.store.create(workDir, sprintId, meta.goal);
+      const sprintId = runtime.store.findLastSprintId(workDir) + 1;      const sprint = runtime.store.create(workDir, sprintId, meta.goal);
 
       // Add tasks to sprint state (read titles from bd)
       for (const bdId of params.task_ids as string[]) {
@@ -1722,6 +1767,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         const gate = assertAgileActive(runtime);
         if (gate) return gate;
       }
+      runtime.lastWorkDir = workDir;
       const bdIds = params.bd_ids as string[] | undefined;
       const singleBdId = params.bd_id as string | undefined;
 
@@ -1999,6 +2045,7 @@ ${workerSummary.slice(0, 1000)}`;
         const gate = assertAgileActive(runtime);
         if (gate) return gate;
       }
+      runtime.lastWorkDir = workDir;
       const bdId = params.bd_id as string;
       const branch = `feat/${bdId}`;
       const fromWorktreeDir = params.from_worktree_dir as string | undefined;
@@ -2128,6 +2175,7 @@ ${workerSummary.slice(0, 1000)}`;
         const gate = assertAgileActive(runtime);
         if (gate) return gate;
       }
+      runtime.lastWorkDir = workDir;
       const sprint = runtime.store.getCurrent(workDir);
 
       if (!sprint) {
@@ -2164,11 +2212,19 @@ ${workerSummary.slice(0, 1000)}`;
       const v = sprint.velocity;
       const retroText = buildRetrospectiveText(sprint, workDir, v, runtime.knowledge);
 
-      // Decrement remaining sprints (if bounded) and send follow-up
+      // Decrement remaining sprints (if bounded) and send follow-up.
+      // RC1: the retrospective is the natural end of a sprint cycle — in
+      // continuous mode (no sprint count) the bounded followUp below does not
+      // exist, so the discovery nudge must fire here too, otherwise the loop
+      // silently stops after the first sprint.
       if (runtime.remainingSprints !== undefined) {
         runtime.remainingSprints--;
+        // Mark the sprint as covered — agent_end must not send a second nudge.
+        runtime.agentEndSentForSprint = sprint.id;
+        persistSessionState(workDir, runtime);
         if (runtime.remainingSprints <= 0) {
           runtime.sprintLoopActive = false;
+          persistSessionState(workDir, runtime);
           try {
             await pi.sendUserMessage("All sprints completed. Stop criteria met — end the sprint loop with /agile stop.", { deliverAs: "followUp" });
           } catch { /* best effort */ }
@@ -2177,6 +2233,10 @@ ${workerSummary.slice(0, 1000)}`;
             await pi.sendUserMessage(`${runtime.remainingSprints} sprint${runtime.remainingSprints > 1 ? "s" : ""} remaining. Decide: continue to next sprint or stop.`, { deliverAs: "followUp" });
           } catch { /* best effort */ }
         }
+      } else {
+        // Continuous mode: no bounded followUp — send the same continuation
+        // nudge the agent_end hook would send.
+        await maybeSendContinuation(pi, runtime, workDir, sprint);
       }
 
       // Append observer steers to output if any
@@ -2540,6 +2600,7 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
         const runtime = getRuntime(ctx, runtimeStore);
         runtime.sprintLoopActive = false;
         runtime.remainingSprints = undefined;
+        persistSessionState(workDir, runtime);
         ctx.ui.notify("Sprint loop stopped", "info");
         return;
       }
@@ -2580,6 +2641,7 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
           runtime.originalRequest = description.trim();
           // Don't start sprint loop yet — agent must fill goal/constraints first
           runtime.sprintLoopActive = false;
+          persistSessionState(workDir, runtime);
           ctx.ui.notify(`📋 Setting sprint goal: "${description.slice(0, 80)}${description.length > 80 ? "…" : ""}"`, "info");
 
           const setupMsg = `## Sprint Goal Setup Required\n\nThe user specified:\n> ${description}\n\n**You MUST fill the project configuration before starting any sprint.**\n\n1. **Read** current \`.agile/project.yaml\` and \`.agile/constraints.yaml\`\n2. **Extract** the goal from the description above — formalize it into \`goal:\` in \`.agile/project.yaml\`\n3. **Extract** constraints (e.g. \"не вводи новых функций\", \"не используй X\") — add them to \`constraints:\` array\n4. **Leave empty** anything not specified — don't invent extra goals or constraints\n5. **Goal is MANDATORY** — you MUST write a goal before proceeding\n6. After filling, call \`agile_start_sprint\` with tasks from \`bd ready\` (or run \`agile_discover\` first if no tasks exist)\n\nDo NOT start sprint work until goal + constraints are written.`;
@@ -2606,6 +2668,7 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
 
         runtime.sprintLoopActive = true;
         runtime.remainingSprints = maxSprints;
+        persistSessionState(workDir, runtime);
 
         const sprintsInfo = maxSprints
           ? `You have ${maxSprints} sprint${maxSprints > 1 ? "s" : ""} remaining in this session.`
