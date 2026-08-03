@@ -70,8 +70,16 @@ export function buildContinuationMessage(ctx: ContinuationContext): string {
     contextLines.push(`Original user request: ${ctx.originalRequest.trim()}`);
   }
 
+  // Only claim "all finished" when every task reached a terminal state — a
+  // sprint closed by retrospective with backlog/rework tasks must not lie.
+  const terminal = ctx.totalDone + ctx.totalBlocked;
+  const summaryLine =
+    terminal === ctx.totalTasks
+      ? `All ${ctx.totalTasks} sprint tasks are finished (${ctx.totalDone} done, ${ctx.totalBlocked} blocked).`
+      : `Sprint closed with ${ctx.totalTasks} tasks (${ctx.totalDone} done, ${ctx.totalBlocked} blocked, ${ctx.totalTasks - terminal} in progress).`;
+
   return (
-    `All ${ctx.totalTasks} sprint tasks are finished (${ctx.totalDone} done, ${ctx.totalBlocked} blocked).\n` +
+    `${summaryLine}\n` +
     `${mode}\n` +
     `Decide whether to continue finding new work.\n\n` +
     `${contextLines.join("\n")}\n\n` +

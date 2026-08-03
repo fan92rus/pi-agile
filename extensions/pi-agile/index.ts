@@ -939,7 +939,10 @@ async function pollWithProgress(
   onUpdate: (msg: { content: { type: string; text: string }[] }) => void,
   maxWaitSeconds = 0, // 0 = wait indefinitely (subagents run as long as needed)
 ): Promise<boolean> {
-  const pollInterval = 5000;
+  // Poll interval — env-overridable (PI_AGILE_POLL_INTERVAL_MS). Tests set it
+  // to a few ms so the fake-subagent PBT harness can exercise the real
+  // delegate/merge paths without real workers; users can tune it too.
+  const pollInterval = parseInt(process.env.PI_AGILE_POLL_INTERVAL_MS ?? "", 10) || 5000;
   let attempts = 0;
   // maxWaitSeconds <= 0 means unlimited — poll until terminal state
   const maxAttempts = maxWaitSeconds > 0 ? Math.ceil(maxWaitSeconds / (pollInterval / 1000)) : Number.MAX_SAFE_INTEGER;

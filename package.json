@@ -42,7 +42,7 @@
     "package.json"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types tests/smoke.test.mjs && node --experimental-strip-types tests/pbt.test.mjs",
-    "test:pbt": "node --experimental-strip-types tests/pbt.test.mjs"
+    "test": "node --experimental-strip-types --experimental-loader ./tests/typebox-redirect-loader.mjs tests/smoke.test.mjs && node --experimental-strip-types --experimental-loader ./tests/typebox-redirect-loader.mjs tests/pbt.test.mjs",
+    "test:pbt": "node --experimental-strip-types --experimental-loader ./tests/typebox-redirect-loader.mjs tests/pbt.test.mjs"
   }
 }

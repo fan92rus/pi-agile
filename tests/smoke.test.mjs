@@ -1,9 +1,11 @@
 /**
  * Smoke test: verify pi-agile modules load and basic functions work.
- * Run with: node --experimental-strip-types tests/smoke.test.mjs
+ * Run with: node --experimental-strip-types --experimental-loader ./tests/typebox-redirect-loader.mjs tests/smoke.test.mjs
+ * (the loader stubs @sinclair/typebox so the REAL extension index.ts can be imported)
  */
 import assert from "node:assert";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -647,6 +649,15 @@ await test("continuation message: goal + original request + continuous mode", ()
   assert.ok(msg.includes("2 done, 1 blocked"));
 });
 
+await test("continuation message: partial sprint does not claim all finished", () => {
+  const msg = buildContinuationMessage({
+    goal: "g", originalRequest: "",
+    remainingSprints: undefined, totalTasks: 3, totalDone: 1, totalBlocked: 0, openTasks: [],
+  });
+  assert.ok(msg.includes("Sprint closed with 3 tasks (1 done, 0 blocked, 2 in progress)"));
+  assert.ok(!msg.includes("all sprint tasks are finished"));
+});
+
 await test("continuation message: goal only when no original request", () => {
   const msg = buildContinuationMessage({
     goal: "Improve code quality and fix issues", originalRequest: "   ",
@@ -927,6 +938,75 @@ await test("sprint: getCurrent scoped by workDir — stale foreign sprint not re
     });
     return null;
   });
+});
+
+// ── Real extension (import index.ts via the typebox redirect loader) ──
+// Requires: node --experimental-strip-types --experimental-loader ./tests/typebox-redirect-loader.mjs
+console.log("## real extension (fake pi)");
+
+process.env.PI_AGILE_POLL_INTERVAL_MS = "10";
+
+const { default: piAgileExtension } = await import(
+  pathToFileURL(path.join(EXT_DIR, "index.ts")).href
+);
+const { createFakePi, makeCtx, readSession } = await import(
+  pathToFileURL(path.join(import.meta.dirname, "fake-pi.ts")).href
+);
+
+await test("real extension registers 7 tools + 2 hooks + 1 command on fake pi", () => {
+  const { pi, tool, command, hook } = createFakePi({});
+  piAgileExtension(pi);
+  assert.ok(tool("agile_discover"), "missing agile_discover");
+  assert.ok(tool("agile_investigate"), "missing agile_investigate");
+  assert.ok(tool("agile_start_sprint"), "missing agile_start_sprint");
+  assert.ok(tool("agile_delegate_task"), "missing agile_delegate_task");
+  assert.ok(tool("agile_merge_task"), "missing agile_merge_task");
+  assert.ok(tool("agile_retrospective"), "missing agile_retrospective");
+  assert.ok(tool("agile_knowledge"), "missing agile_knowledge");
+  assert.ok(hook("before_agent_start"), "missing before_agent_start hook");
+  assert.ok(hook("agent_end"), "missing agent_end hook");
+  assert.ok(command("agile"), "missing /agile command");
+  return null;
+});
+
+await test("real agent_end: no nudge when agile mode is OFF", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
+  try {
+    const { pi, hook } = createFakePi({});
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-ext-off");
+    await hook("agent_end")({ messages: [] }, ctx); // agileMode false → silent
+    assert.strictEqual(pi.sentMessages.length, 0);
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("real extension e2e: start sprint → retrospective → agent_end nudges once", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
+  try {
+    const bdTasks = new Map([["t1", "Task t1"], ["t2", "Task t2"]]);
+    const { pi, tool, command, hook } = createFakePi({ bdTasks });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-ext-e2e");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1", "t2"] }, null, null, ctx);
+    await tool("agile_retrospective").execute("t", {}, null, null, ctx);
+    const before = pi.sentMessages.length;
+    await hook("agent_end")({ messages: [] }, ctx); // flag set by retrospective → silent
+    const nudges = pi.sentMessages.slice(before).filter((m) => /Decide and act now/.test(m.text));
+    assert.strictEqual(nudges.length, 0, "agent_end must not double-nudge after retrospective");
+    assert.ok(
+      pi.sentMessages.some((m) => /Decide and act now/.test(m.text)),
+      "retrospective in continuous mode must send the continuation nudge",
+    );
+    const sess = readSession(dir);
+    assert.ok(sess.sprintLoopActive === undefined || typeof sess.sprintLoopActive === "boolean");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ── Summary ──────────────────────────────────────────────────────
