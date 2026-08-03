@@ -1753,6 +1753,16 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
             `No sprint was created. Fix the bd database location or task ids, then retry.` }],
         };
       }
+      // Fix (agent_end stability): an empty sprint (task_ids: [] or all bd shows
+      // failing) becomes a zombie — sprint-N.json with tasks: [] makes agent_end
+      // silent forever (taskCount === 0 gate) and pollutes findLastSprintId.
+      // Abort instead of creating it.
+      if (parsedTasks.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: `❌ Sprint aborted: no readable tasks (task_ids empty or bd show failed for all ids). ` +
+            `No sprint was created. Create tasks in bd first, then retry with their ids.` }],
+        };
+      }
 
       const sprintId = runtime.store.findLastSprintId(workDir) + 1;      const sprint = runtime.store.create(workDir, sprintId, meta.goal);
 
@@ -2080,6 +2090,17 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
           try {
             await pi.sendUserMessage(steer.message, { deliverAs: "followUp" });
           } catch { /* best effort */ }
+        }
+        // Fix (agent_end stability, M2 for the single path): when this transition
+        // exhausted the sprint, the all_blocked/all_tasks_exhausted steer IS the
+        // continuation nudge — mark the sprint covered so the next agent_end does
+        // not send a second near-identical message (mirrors executeBatchTasks/P18
+        // and the merge tool). Only terminal sprints count: a stagnation or
+        // constraint_spam steer with pending tasks must NOT suppress the later
+        // agent_end nudge.
+        const terminalNow = sprint.tasks.every((t) => t.status === "done" || t.status === "blocked");
+        if (transitionSteers.length > 0 && terminalNow) {
+          runtime.agentEndSentForSprint = sprint.id;
         }
       }
 
@@ -2451,6 +2472,7 @@ ${observerSteers.map((s: { type: string; message: string; severity: string }) =>
       }
 
       if (command === "setup") {
+        const runtime = getRuntime(ctx, runtimeStore);
         await ctx.ui.input("Press Enter to start the setup wizard...", "");
         const lines: string[] = ["# pi-agile Setup Wizard"];
 
@@ -2603,6 +2625,10 @@ do_not_do:
         // followUp then ordered the agent to call agile_start_sprint, which
         // answered "Agile mode is OFF. Run /agile on first."
         setAgileMode(ctx, true, workDir);
+        // Fix (agent_end stability): setup re-arms the loop — clear a persisted
+        // /agile stop so agent_end nudges again after re-setup.
+        runtime.loopStopped = false;
+        persistSessionState(workDir, runtime);
 
         // Trigger agent to edit scripts and start discovery
         const ecoLang = eco ? eco.language : "unknown";
@@ -2682,7 +2708,12 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
       }
 
       if (command === "on") {
+        const runtime = getRuntime(ctx, runtimeStore);
         setAgileMode(ctx, true, workDir);
+        // Fix (agent_end stability): re-arming must clear a persisted /agile stop —
+        // otherwise loopStopped stays true and agent_end never nudges again.
+        runtime.loopStopped = false;
+        persistSessionState(workDir, runtime);
         const cleaned = cleanupStaleWorktrees(workDir);
         ctx.ui.notify("✅ Agile mode ON — tools and system prompt active" + (cleaned > 0 ? ` Cleaned ${cleaned} stale worktree(s).` : ""), "info");
         return;
@@ -2713,6 +2744,7 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
           `Max workers: ${meta.maxWorkers}`,
           `Last sprint: ${lastSprintId}`,
           `Sprint loop active: ${runtime.sprintLoopActive ? "yes" : "no"}${runtime.remainingSprints !== undefined && runtime.sprintLoopActive ? ` (${runtime.remainingSprints} sprint${runtime.remainingSprints > 1 ? "s" : ""} remaining)` : ""}`,
+          `Loop state: ${runtime.loopStopped ? "🔇 stopped (/agile stop) — agent_end nudges disabled" : "🔊 running — agent_end may nudge"}`,
         ].join("\n"), "info");
         return;
       }

@@ -955,7 +955,7 @@ process.env.PI_AGILE_POLL_INTERVAL_MS = "10";
 const { default: piAgileExtension } = await import(
   pathToFileURL(path.join(EXT_DIR, "index.ts")).href
 );
-const { createFakePi, makeCtx, readSession } = await import(
+const { createFakePi, makeCtx, readSession, createFakeBridge, makeFakeUi } = await import(
   pathToFileURL(path.join(import.meta.dirname, "fake-pi.ts")).href
 );
 
@@ -1014,6 +1014,129 @@ await test("real extension e2e: start sprint → retrospective → agent_end nud
   }
 });
 
+await test("agent_end re-arms after /agile stop → /agile on (loopStopped reset)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
+  try {
+    const bdTasks = new Map([["t1", "Task t1"]]);
+    const bridge = createFakeBridge({ verdictFor: () => "blocked" });
+    const { pi, tool, command, hook } = createFakePi({ bdTasks, bridge });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-ext-rearm");
+    await command("agile").handler("on", ctx);
+    await command("agile").handler("stop", ctx); // loopStopped = true
+    await command("agile").handler("on", ctx); // must re-arm the nudge
+    const sess = readSession(dir);
+    assert.strictEqual(sess.loopStopped, false, "/agile on must clear loopStopped in session.json");
+    // Terminal sprint + fresh session (restart) — agent_end must nudge because
+    // loopStopped=false survived, and the fresh runtime has no dedupe flag.
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
+    const { pi: pi2, hook: hook2 } = createFakePi({ bdTasks, bridge: createFakeBridge({ verdictFor: () => "blocked" }) });
+    piAgileExtension(pi2);
+    const ctx2 = makeCtx(dir, "smoke-ext-rearm2");
+    await hook2("before_agent_start")({ systemPrompt: "" }, ctx2); // auto-enable + load session
+    await hook2("agent_end")({ messages: [] }, ctx2);
+    const nudges = pi2.sentMessages.filter((m) => /Decide and act now/.test(m.text));
+    assert.ok(nudges.length >= 1, "fresh session must nudge (loopStopped=false persisted after /agile on)");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("agent_end re-arms after /agile stop → /agile setup (loopStopped reset)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
+  try {
+    const bdTasks = new Map([["t1", "Task t1"]]);
+    const bridge = createFakeBridge({ verdictFor: () => "blocked" });
+    const { pi, tool, command, hook } = createFakePi({ bdTasks, bridge });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-ext-rearmsetup");
+    await command("agile").handler("on", ctx);
+    await command("agile").handler("stop", ctx); // loopStopped = true
+    const ui = makeFakeUi(["", "Diag", "Goal", "", "", "", "", "continuous", "standard"]);
+    const ctxSetup = makeCtx(dir, "smoke-ext-rearmsetup", ui); // same sessionId → same runtime
+    await command("agile").handler("setup", ctxSetup); // must re-arm the nudge
+    const sess = readSession(dir);
+    assert.strictEqual(sess.loopStopped, false, "/agile setup must clear loopStopped in session.json");
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctxSetup);
+    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctxSetup);
+    const { pi: pi2, hook: hook2 } = createFakePi({ bdTasks, bridge: createFakeBridge({ verdictFor: () => "blocked" }) });
+    piAgileExtension(pi2);
+    const ctx2 = makeCtx(dir, "smoke-ext-rearmsetup2");
+    await hook2("before_agent_start")({ systemPrompt: "" }, ctx2);
+    await hook2("agent_end")({ messages: [] }, ctx2);
+    const nudges = pi2.sentMessages.filter((m) => /Decide and act now/.test(m.text));
+    assert.ok(nudges.length >= 1, "fresh session must nudge (loopStopped=false persisted after /agile setup)");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("agile_start_sprint aborts on empty task_ids (no zombie sprint)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
+  try {
+    const { pi, tool, command } = createFakePi({});
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-ext-empty");
+    await command("agile").handler("on", ctx);
+    const res = await tool("agile_start_sprint").execute("t", { task_ids: [] }, null, null, ctx);
+    const text = res.content?.[0]?.text ?? "";
+    assert.ok(text.includes("Sprint aborted"), `empty task_ids must abort (got: ${text.slice(0, 80)})`);
+    assert.ok(
+      !fs.existsSync(path.join(dir, ".agile", "sprint-1.json")),
+      "no sprint-N.json may be created for an aborted sprint",
+    );
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("single delegate exhausted steers suppress the agent_end duplicate (M2 for single)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
+  try {
+    const bdTasks = new Map([["t1", "Task t1"]]);
+    const bridge = createFakeBridge({ verdictFor: () => "blocked" });
+    const { pi, tool, command, hook } = createFakePi({ bdTasks, bridge });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-ext-singlededupe");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
+    // The delegate's observer already sent terminal steers (all_blocked + exhausted)
+    const exhausted = pi.sentMessages.filter((m) => /All 1 tasks are exhausted/.test(m.text));
+    assert.ok(exhausted.length >= 1, "single delegate must send the exhausted steer");
+    const before = pi.sentMessages.length;
+    await hook("agent_end")({ messages: [] }, ctx);
+    const nudges = pi.sentMessages.slice(before).filter((m) => /Decide and act now/.test(m.text));
+    assert.strictEqual(nudges.length, 0, "agent_end must not duplicate the exhausted steer");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("/agile status shows the loop-stopped state", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
+  try {
+    const notifs = [];
+    const ui = { notify: (t) => notifs.push(String(t)), input: async () => "", select: async () => "" };
+    const { pi, command } = createFakePi({});
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-ext-status", ui);
+    await command("agile").handler("on", ctx);
+    await command("agile").handler("stop", ctx);
+    await command("agile").handler("status", ctx);
+    const statusText = notifs.join("\n");
+    assert.ok(/stopped/i.test(statusText), `status must expose the stopped loop (got: ${statusText.slice(0, 200)})`);
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ── rpc.ts protocol (real RpcClient over the fake EventBus) ──
 console.log("## rpc.ts protocol");
 
@@ -1021,7 +1144,7 @@ const {
   RpcClient, RpcClientError, buildRequest, replyEventFor, parseSpawnReply,
   SUBAGENT_RPC_REQUEST_EVENT, SUBAGENT_RPC_REPLY_EVENT_PREFIX,
 } = await importModule("parallel/rpc.ts");
-const { createEventBus, createFakeBridge, readLatestSprint } = await import(pathToFileURL(path.join(import.meta.dirname, "fake-pi.ts")).href);
+const { createEventBus, readLatestSprint } = await import(pathToFileURL(path.join(import.meta.dirname, "fake-pi.ts")).href);
 
 /** Attach a scripted bridge: map method -> reply data (or null = no reply). */
 function scriptedBridge(events, handler) {
