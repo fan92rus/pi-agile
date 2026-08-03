@@ -903,6 +903,13 @@ async function executeBatchTasks(
     for (const steer of batchSteers) {
       try { await pi.sendUserMessage(steer.message, { deliverAs: "followUp" }); } catch { /* best effort */ }
     }
+    // Fix (P18): the exhausted/blocked steer IS the continuation nudge — mark
+    // this sprint covered so the next agent_end (which fires because the sprint
+    // is terminal) does not send a second, near-identical nudge. The merge tool
+    // already did this; the batch path was missing it (M2 disease).
+    if (batchSteers.length > 0) {
+      runtime.agentEndSentForSprint = sprint.id;
+    }
   }
 
   // Summary line
@@ -976,10 +983,12 @@ async function pollWithProgress(
       status = (await rpc.status(runId, 3000)) as { state?: string; lastActivityAt?: number } | null;
       if (status?.state === "completed" || status?.state === "stopped" || status?.state === "failed") {
         onUpdate?.({ content: [{ type: "text", text: `${role} finished (state: ${status.state})` }] });
-        // Give output file a moment to flush
+        // Give output file a moment to flush — check FIRST, sleep only while
+        // the file is still missing (an existing file returns instantly; a
+        // completed run without a file still gives up after ~12s).
         for (let w = 0; w < 12; w++) {
-          await new Promise((r) => setTimeout(r, 1000));
           if (fs.existsSync(outputFile)) break;
+          await new Promise((r) => setTimeout(r, 1000));
         }
         return true;
       }

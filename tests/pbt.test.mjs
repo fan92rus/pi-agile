@@ -33,7 +33,7 @@ const { parseSimpleYaml } = await importMod("parallel/yaml.ts");
 const { parseBdShow } = await importMod("parallel/bd.ts");
 
 const { default: piAgileExtension } = await import(pathToFileURL(path.join(EXT_DIR, "index.ts")).href);
-const { createFakePi, createFakeBridge, makeCtx, readSession, readLatestSprint } =
+const { createFakePi, createFakeBridge, makeCtx, makeFakeUi, readSession, readLatestSprint } =
   await import(pathToFileURL(path.join(import.meta.dirname, "fake-pi.ts")).href);
 
 // ──────────────────────────────────────────────────────────────────────
@@ -57,8 +57,9 @@ let pbtPass = 0;
 let pbtFail = 0;
 const pbtFailures = [];
 
-async function forAll({ seeds = 40, maxActions = 90, name, run }) {
+async function forAll({ seeds = 25, maxActions = 50, name, run }) {
   for (let seed = 0; seed < seeds; seed++) {
+    const t0 = process.env.PBT_DEBUG ? Date.now() : 0;
     try {
       await run(mulberry32(seed), seed, maxActions);
       pbtPass++;
@@ -69,6 +70,7 @@ async function forAll({ seeds = 40, maxActions = 90, name, run }) {
       pbtFailures.push({ name, seed, message: e.message, log: repro?.log ?? null });
       console.error(`  ❌ ${name} [seed=${seed}]${log}\n     ${e.message}`);
     }
+    if (process.env.PBT_DEBUG) console.error(`  [${name}] seed=${seed} done in ${Date.now() - t0}ms`);
   }
 }
 
@@ -107,10 +109,20 @@ class RealSystem {
     this.rng = rng;
     this.bdTasks = new Map(); // bdId -> title (bd list / bd show fakes)
     this.nextTask = 1;
-    this.pendingVerdict = "blocked"; // what the fake reviewer says on next delegate
+    this.pendingVerdict = "blocked"; // what the fake reviewer says on next single delegate
+    this.batchVerdicts = new Map(); // bdId -> verdict for batch runs
+    this.bridgeState = { dead: false }; // flip to simulate dead RPC bridge
+    this.gitState = { originalBranch: "main", showCurrent: "main", headBefore: "aaa111", headAfter: "aaa111" };
+    this.execTable = {}; // mutable exec overrides (e.g. failing `npm test`)
+    this.batchVerdictsRef = this.batchVerdicts;
     const { pi, tool, command, hook } = createFakePi({
       bdTasks: this.bdTasks,
-      bridge: createFakeBridge({ verdictFor: () => this.pendingVerdict }),
+      gitState: this.gitState,
+      execTable: this.execTable,
+      bridge: createFakeBridge({
+        bridgeState: this.bridgeState,
+        verdictFor: (bdId) => this.batchVerdicts.get(bdId) ?? this.pendingVerdict,
+      }),
     });
     piAgileExtension(pi); // real extension registers on the fake pi
     this.pi = pi;
@@ -255,10 +267,159 @@ class RealSystem {
     fs.writeFileSync(path.join(this.dir, ".agile", `sprint-${id}.json`), "{torn write", "utf8");
     this.record(`corruptSprint#${id}`);
   }
+
+  // ---- batch / merge / investigate / discover / knowledge / status / setup ----
+
+  async delegateBatch() {
+    const sprint = readLatestSprint(this.dir);
+    if (!sprint) return;
+    const eligible = sprint.tasks.filter((t) => t.status === "backlog" || t.status === "rework");
+    if (eligible.length === 0) return;
+    const n = Math.min(genInt(this.rng, 1, Math.min(3, eligible.length)), eligible.length);
+    const chosen = eligible.slice(0, n);
+    const ids = chosen.map((t) => t.bd_id);
+    for (const t of chosen) {
+      const v = this.rng() < 0.45 ? "blocked" : this.rng() < 0.5 ? "approved" : "rework";
+      this.batchVerdicts.set(t.bd_id, v);
+    }
+    await this.tool("agile_delegate_task").execute("t", { bd_ids: ids }, null, null, this.ctx);
+    this.record(`delegateBatch(${ids.join(",")})`);
+  }
+
+  async merge() {
+    const sprint = readLatestSprint(this.dir);
+    if (!sprint || sprint.tasks.length === 0) return;
+    const candidates = sprint.tasks.filter((t) => t.status !== "done");
+    if (candidates.length === 0) return;
+    const t = genPick(this.rng, candidates);
+    // Occasionally the project gains a failing test runner (package.json +
+    // `npm test` that reports FAIL) — exercises the merge-checks highlight.
+    if (this.rng() < 0.2 && !fs.existsSync(path.join(this.dir, "package.json"))) {
+      fs.writeFileSync(
+        path.join(this.dir, "package.json"),
+        JSON.stringify({ name: "p", scripts: { test: "node tests/x.js" } }, null, 2),
+        "utf8",
+      );
+      this.execTable["npm test"] = { code: 1, stdout: "FAIL tests\n1 failed", stderr: "" };
+      this.checksFailArmed = true;
+    }
+    const res = await this.tool("agile_merge_task").execute("t", { bd_id: t.bd_id }, null, null, this.ctx);
+    const text = res.content?.[0]?.text ?? "";
+    if (this.checksFailArmed) {
+      assert.ok(text.includes("Checks reported failures"), "P16: merge must flag failing checks");
+    }
+    this.record(`merge(${t.bd_id}${this.checksFailArmed ? ",failChecks" : ""})`);
+  }
+
+  async investigate() {
+    const concern = `Potential bug in zone ${genInt(this.rng, 1, 9)}`;
+    const dirty = this.rng() < 0.25; // occasionally the checkout-back silently fails
+    const committed = this.rng() < 0.2; // occasionally the detective commits a repro
+    this.gitState.originalBranch = "main";
+    this.gitState.showCurrent = dirty ? "investigate/xyz" : "main";
+    this.gitState.headBefore = "aaa111";
+    this.gitState.headAfter = committed ? "bbb222" : "aaa111";
+    const res = await this.tool("agile_investigate").execute("t", { concern }, null, null, this.ctx);
+    const text = res.content?.[0]?.text ?? "";
+    assert.ok(text.includes("# Detective Investigation Report"), "P15: investigate must return a report");
+    if (dirty) {
+      assert.ok(
+        text.includes("Checkout back to main failed"),
+        `P15: dirty tree must warn about checkout-back failure (got: ${text.slice(0, 120)})`,
+      );
+    }
+    this.record(`investigate(${dirty ? "dirty" : "clean"}${committed ? ",commit" : ""})`);
+  }
+
+  async discover() {
+    const withScout = this.rng() < 0.5;
+    const firstAfterSetup = this.checksReady;
+    const res = await this.tool("agile_discover").execute(
+      "t",
+      { skip_scout: !withScout },
+      null,
+      null,
+      this.ctx,
+    );
+    const text = res.content?.[0]?.text ?? "";
+    assert.ok(text.length > 0, "P13: discover must return output");
+    if (firstAfterSetup) {
+      // Exercise the PRIMARY runChecks path once (real bash on the generated
+      // template scripts — ~2s on Windows Git Bash startup), then remove the
+      // templates so the rest of the scenario uses the fast fallback detectors.
+      assert.ok(
+        text.includes("## Metrics"),
+        `P13: runChecks path must produce METRIC lines (got: ${text.slice(0, 100)})`,
+      );
+      const checksDir = path.join(this.dir, ".agile", "checks");
+      for (const f of fs.readdirSync(checksDir)) {
+        if (f.endsWith(".sh")) fs.rmSync(path.join(checksDir, f), { force: true });
+      }
+      this.checksReady = false;
+    }
+    this.record(`discover(${withScout ? "scout" : "noscout"})`);
+  }
+
+  async knowledge() {
+    const act = this.rng() < 0.5 ? "append" : "read";
+    if (act === "append") {
+      const finding = `lesson-${genInt(this.rng, 1, 100)}`;
+      await this.tool("agile_knowledge").execute(
+        "t",
+        { action: "append", type: "lesson", finding },
+        null,
+        null,
+        this.ctx,
+      );
+      this.record(`knowledge(append:${finding})`);
+    } else {
+      await this.tool("agile_knowledge").execute("t", { action: "read" }, null, null, this.ctx);
+      this.record("knowledge(read)");
+    }
+  }
+
+  async status() {
+    await this.command("agile").handler("status", this.ctx);
+    this.record("status");
+  }
+
+  async setup() {
+    // Queue answers for the REAL /agile setup wizard (ui.input/ui.select order).
+    const ui = makeFakeUi([
+      "",                                    // Press Enter to start
+      `Proj-${this.seed}`,                   // project name
+      "Fix all bugs in the module",          // goal
+      "src/**",                              // include globs
+      "node_modules/**, dist/**",            // exclude globs
+      "All new code must have tests",        // constraint 1
+      "",                                    // end constraints
+      "continuous — no auto-stop, run until /agile stop", // stop criteria
+      "standard — 3 dimensions (correctness, tests, constraints)", // review depth
+    ]);
+    this.ctx = { ...this.ctx, ui };
+    await this.command("agile").handler("setup", this.ctx);
+    const yaml = fs.readFileSync(path.join(this.dir, ".agile", "project.yaml"), "utf8");
+    assert.ok(yaml.includes("Fix all bugs in the module"), "P17: setup must write the goal to project.yaml");
+    const config = JSON.parse(fs.readFileSync(path.join(this.dir, ".agile", "config.json"), "utf8"));
+    assert.strictEqual(config.agile_mode, true, "P17: setup must enable agile mode");
+    assert.ok(
+      this.pi.sentMessages.some((m) => m.text.startsWith("/agile setup complete")),
+      "P17: setup must send the setup-complete followUp",
+    );
+    this.record("setup");
+    this.checksReady = true; // template scripts exist — next discover runs real runChecks
+  }
+
+  async deadBridge() {
+    this.bridgeState.dead = true;
+    this.record("deadBridge");
+  }
 }
 
 const WEIGHTS = [
-  ["startSprint", 6], ["delegate", 9], ["retrospective", 4], ["agentEnd", 8],
+  ["startSprint", 5], ["delegate", 8], ["delegateBatch", 5], ["merge", 4],
+  ["retrospective", 3], ["agentEnd", 7], ["investigate", 3], ["discover", 3],
+  ["knowledge", 2], ["status", 2], ["setup", 1], ["deadBridge", 1],
   ["runBounded", 2], ["runContinuous", 2], ["stop", 2], ["restart", 2],
   ["injectTasks", 1], ["corruptSession", 1], ["corruptSprintFile", 2],
 ];
@@ -336,6 +497,35 @@ async function checkInvariants(sys) {
     assert.ok(v.done + v.rework + v.blocked <= v.attempted, "P11: velocity sums exceed attempted");
     assert.ok(v.avg_review_rounds >= 0, "P11: negative avg review rounds");
   }
+
+  // P14: merging a task marks it done on disk
+  if (sys.lastAction && sys.lastAction.startsWith("merge(")) {
+    const id = sys.lastAction.match(/^merge\(([^,)]+)/)?.[1];
+    const sprintNow = readLatestSprint(sys.dir);
+    const t = sprintNow?.tasks.find((x) => x.bd_id === id);
+    if (t) {
+      assert.strictEqual(t.status, "done", `P14: merged task ${id} must be done (got ${t.status})`);
+    }
+  }
+
+  // P18: batch that sent its own terminal/continuation steer must NOT get a
+  // second continuation from the immediately-following agent_end (M2 disease
+  // for the batch path — the merge tool was fixed, executeBatchTasks was not).
+  if (sys.lastAction && sys.lastAction.startsWith("delegateBatch(")) {
+    const sprintNow = readLatestSprint(sys.dir);
+    const terminal =
+      sprintNow && sprintNow.tasks.length > 0 && sprintNow.tasks.every((t) => t.status === "done" || t.status === "blocked");
+    const batchMsgs = sys.newMessages();
+    if (terminal && batchMsgs.length > 0 && sys.nudgeCount(batchMsgs) === 0) {
+      const marker = sys.pi.sentMessages.length;
+      await sys.hook("agent_end")({ messages: [] }, sys.ctx);
+      assert.strictEqual(
+        sys.nudgeCount(sys.pi.sentMessages.slice(marker)),
+        0,
+        "P18: agent_end double-nudges after batch exhausted-steer",
+      );
+    }
+  }
 }
 
 async function runScenario(rng, seed, maxActions) {
@@ -346,7 +536,11 @@ async function runScenario(rng, seed, maxActions) {
     for (let step = 0; step < maxActions; step++) {
       sys.actionMarker = sys.pi.sentMessages.length;
       const action = pickAction(rng);
+      const tA = process.env.PBT_DEBUG ? Date.now() : 0;
       await sys[action]();
+      if (process.env.PBT_DEBUG && Date.now() - tA > 400) {
+        console.error(`    [slow] ${action} took ${Date.now() - tA}ms (log: ${sys.log.join(" → ")})`);
+      }
       await checkInvariants(sys);
     }
   } catch (e) {

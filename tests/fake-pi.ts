@@ -12,6 +12,11 @@
  * The fake captures tools/commands/hooks, records sendUserMessage/notify calls,
  * routes exec() through a canned-output table (git/bd), and provides a fake
  * subagent RPC bridge that writes worker/reviewer output files on spawn.
+ *
+ * Batch support: `git worktree add -b feat/X <wtDir>` auto-registers the
+ * worktree dir; git answers in that cwd are branch-aware (branch --list shows
+ * feat/X, checkout of an existing branch uses plain `checkout`), so the real
+ * gitCreateBranch/gitMergeFromWorktree paths execute their real branches.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -50,8 +55,7 @@ function bdShowLine(bdId, title) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Fake subagent RPC bridge — answers ping/spawn/status and writes the
-// worker/reviewer output files the orchestrator polls for.
+// Fake subagent RPC bridge
 // ──────────────────────────────────────────────────────────────────────
 
 export function reviewerVerdictText(status, extra = {}) {
@@ -64,10 +68,22 @@ export function reviewerVerdictText(status, extra = {}) {
 }
 
 /**
- * verdictFor: () => "blocked" | "rework" — called once per reviewer spawn.
+ * verdictFor: (bdId, round) => "approved" | "blocked" | "rework" — called per
+ *   reviewer spawn; bdId/round are parsed from the output file path so batch
+ *   runs can give each task its own verdict.
  * workerSummary: text written to the worker's output file.
+ * writeOutput: false = dead-bridge mode (spawn ok, NO output file ever) — lets
+ *   pollWithProgress exercise its RPC-bridge-dead guard instead of the file.
+ * statusImpl: (runId) => { state, lastActivityAt } — override status response;
+ *   throw to simulate a dead bridge after spawn.
  */
-export function createFakeBridge({ verdictFor = () => "blocked", workerSummary = "Worker implemented the change.\n" } = {}) {
+export function createFakeBridge({
+  verdictFor = () => "blocked",
+  workerSummary = "Worker implemented the change.\n",
+  writeOutput = true,
+  statusImpl,
+  bridgeState = {}, // { dead: false } — mutate to simulate a dead RPC bridge
+} = {}) {
   return (events) => (req) => {
     const replyEvent = `${RPC_REPLY_PREFIX}${req.requestId}`;
     const ok = (data) => events.emit(replyEvent, { version: 1, requestId: req.requestId, success: true, data });
@@ -76,17 +92,35 @@ export function createFakeBridge({ verdictFor = () => "blocked", workerSummary =
       const runId = `run-${String(req.requestId).slice(0, 8)}`;
       const params = req.params ?? {};
       const outFile = params.output;
-      if (outFile) {
+      if (outFile && writeOutput && !bridgeState.dead) {
         fs.mkdirSync(path.dirname(outFile), { recursive: true });
-        fs.writeFileSync(
-          outFile,
-          params.agent === "reviewer" ? reviewerVerdictText(verdictFor()) : workerSummary,
-          "utf8",
-        );
+        const base = path.basename(outFile); // e.g. worker-t1-r1.txt, review-t2-r2.txt, scout-output.txt
+        const roleMatch = base.match(/^(worker|review)-([\w.-]+?)(?:-r(\d+))?\.txt$/);
+        const bdId = roleMatch ? roleMatch[2] : "scout";
+        const round = roleMatch && roleMatch[3] ? parseInt(roleMatch[3], 10) : 1;
+        let content;
+        if (/scout|detective/.test(base)) {
+          content = [
+            "SCOUT REPORT",
+            "Scanned the codebase for issues relevant to the goal.",
+            "- src/parser.ts:32 — potential null dereference",
+            "- src/api.ts:88 — unhandled promise rejection",
+            "Recommend creating tasks for both findings.",
+          ].join("\n");
+        } else if (params.agent === "reviewer") {
+          content = reviewerVerdictText(verdictFor(bdId, round));
+        } else {
+          content = workerSummary;
+        }
+        fs.writeFileSync(outFile, content, "utf8");
       }
       return ok({ details: { runId, asyncDir: outFile ? path.dirname(outFile) : os.tmpdir() } });
     }
-    if (req.method === "status") return ok({ state: "completed", lastActivityAt: Date.now() });
+    if (req.method === "status") {
+      if (bridgeState.dead) throw new Error("RPC bridge unreachable (fake dead bridge)");
+      if (statusImpl) return ok(statusImpl(req.runId));
+      return ok({ state: "completed", lastActivityAt: Date.now() });
+    }
     return ok({}); // interrupt / stop / anything else
   };
 }
@@ -97,9 +131,10 @@ export function createFakeBridge({ verdictFor = () => "blocked", workerSummary =
 
 export function createFakePi({
   bdTasks = new Map(),      // bdId -> title (for bd list / bd show fakes)
-  execTable = {},           // "git branch --list" -> { code, stdout, stderr } override
+  execTable = {},           // "cmd args" -> { code, stdout, stderr } override
   bridge,                   // events => handler; if set, registered as RPC bridge
   extraExec,                // (cmd, args, opts) => result | undefined
+  gitState = {},            // mutable knobs: showCurrent, headBefore, headAfter
 } = {}) {
   const tools = [];
   const commands = [];
@@ -110,6 +145,9 @@ export function createFakePi({
   const events = createEventBus();
   if (bridge) events.on(RPC_REQUEST, bridge(events));
 
+  // worktreeDir -> feat branch (registered on `git worktree add -b`)
+  const worktrees = new Map();
+
   const pi = {
     tools,
     commands,
@@ -118,6 +156,7 @@ export function createFakePi({
     notifications,
     execCalls,
     events,
+    worktrees,
 
     on(event, handler) {
       if (!hooks.has(event)) hooks.set(event, []);
@@ -140,6 +179,7 @@ export function createFakePi({
       }
       const key = [cmd, ...(args ?? [])].join(" ");
       if (execTable[key]) return execTable[key];
+
       if (cmd === "bd") {
         if (args[0] === "list") {
           const lines = [...bdTasks.entries()].map(([id, title]) => `○ ${id} ● P2 ${title}`).join("\n");
@@ -150,16 +190,48 @@ export function createFakePi({
           if (title) return { code: 0, stdout: bdShowLine(args[1], title), stderr: "" };
           return { code: 1, stdout: "", stderr: `no task ${args[1]}` };
         }
+        return { code: 0, stdout: "bd v0.0.0\n", stderr: "" };
       }
+
       if (cmd === "git") {
         const joined = args.join(" ");
-        if (joined.startsWith("branch --list")) return { code: 0, stdout: "* main\n", stderr: "" };
-        if (joined.startsWith("checkout -b")) return { code: 0, stdout: "", stderr: "" };
-        if (joined.startsWith("checkout main")) return { code: 0, stdout: "", stderr: "" };
+        // worktree add -b <branch> <wtDir> <base> — auto-register for cwd-aware answers
+        if (joined.startsWith("worktree add") && args.includes("-b")) {
+          const bIdx = args.indexOf("-b");
+          if (bIdx >= 0 && args[bIdx + 2]) {
+            worktrees.set(args[bIdx + 2], args[bIdx + 1]);
+          }
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        if (joined.startsWith("worktree remove")) return { code: 0, stdout: "", stderr: "" };
+        const inWorktree = opts.cwd && worktrees.has(opts.cwd);
+        if (joined.startsWith("branch --list")) {
+          return inWorktree
+            ? { code: 0, stdout: `* ${worktrees.get(opts.cwd)}\n`, stderr: "" }
+            : { code: 0, stdout: "* main\n", stderr: "" };
+        }
+        if (joined.startsWith("checkout")) return { code: 0, stdout: "", stderr: "" };
         if (joined.startsWith("diff")) return { code: 0, stdout: "diff --git a/x b/x\n+work\n", stderr: "" };
         if (joined.startsWith("branch -D")) return { code: 0, stdout: "", stderr: "" };
+        if (joined.startsWith("fetch")) return { code: 0, stdout: "", stderr: "" };
+        if (joined.startsWith("merge --squash")) return { code: 0, stdout: "", stderr: "" };
+        if (joined.startsWith("commit")) return { code: 0, stdout: "[main abc123] feat: merge\n", stderr: "" };
+        if (joined.startsWith("rev-parse --abbrev-ref HEAD")) {
+          return { code: 0, stdout: `${gitState.originalBranch ?? "main"}\n`, stderr: "" };
+        }
+        if (joined.startsWith("rev-parse --git-dir")) return { code: 0, stdout: ".git\n", stderr: "" };
+        if (joined.startsWith("rev-parse HEAD")) {
+          return { code: 0, stdout: `${gitState.headAfter ?? "aaa111"}\n`, stderr: "" };
+        }
+        if (joined.startsWith("log --oneline -1")) {
+          return { code: 0, stdout: `${gitState.headAfter ?? "aaa111"} feat: reproduction\n`, stderr: "" };
+        }
+        if (joined.startsWith("branch --show-current")) {
+          return { code: 0, stdout: `${gitState.showCurrent ?? "main"}\n`, stderr: "" };
+        }
         return { code: 0, stdout: "", stderr: "" };
       }
+
       return { code: 0, stdout: "", stderr: "" };
     },
 
@@ -178,15 +250,30 @@ export function createFakePi({
   return { pi, tool, command, hook, events };
 }
 
+/** Fake ui with a queue of answers for the /agile setup wizard. */
+export function makeFakeUi(answers = []) {
+  const calls = [];
+  let i = 0;
+  const next = (label) => {
+    calls.push(label);
+    const v = answers[i];
+    if (i < answers.length) i++;
+    return Promise.resolve(v ?? "");
+  };
+  return {
+    calls,
+    notify() {},
+    input: (label, _def) => next(label),
+    select: (label, _opts) => next(label),
+  };
+}
+
 /** Fake extension context: { cwd, sessionId, ui }. */
-export function makeCtx(dir, sessionId) {
+export function makeCtx(dir, sessionId, ui) {
   return {
     cwd: dir,
     sessionId,
-    ui: {
-      notify() {},
-      input: async () => "",
-    },
+    ui: ui ?? { notify() {}, input: async () => "" },
   };
 }
 
