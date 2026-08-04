@@ -976,6 +976,55 @@ await test("real extension registers 8 tools + 2 hooks + 1 command on fake pi", 
   return null;
 });
 
+await test("before_agent_start: Tech Lead role is injected BEFORE <project_context>, base prompt intact", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
+  try {
+    const { pi, tool, command, hook } = createFakePi({});
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-prompt-order");
+    await command("agile").handler("on", ctx); // enable agile mode
+    await hook("before_agent_start")({
+      systemPrompt: "You are an expert coding assistant.\n\n<project_context>\n\nProject-specific instructions:\n\n- my AGENTS.md rule\n</project_context>\n\nCurrent working directory: x",
+    }, ctx);
+    const out = pi._lastSystemPrompt;
+    assert.ok(out, "hook must set event.systemPrompt");
+    // Base prompt content is untouched
+    assert.ok(out.includes("You are an expert coding assistant."), "base prompt must remain");
+    assert.ok(out.includes("my AGENTS.md rule"), "project_context must remain");
+    // Role block sits BEFORE the project_context marker
+    const roleIdx = out.indexOf("You are a TECH LEAD");
+    const ctxIdx = out.indexOf("<project_context>");
+    assert.ok(roleIdx !== -1, "Tech Lead role block must be injected");
+    assert.ok(roleIdx < ctxIdx, `role block (${roleIdx}) must come before <project_context> (${ctxIdx})`);
+    // Dynamic context (goal) is still appended at the very end
+    const goalIdx = out.indexOf("## Project Goal");
+    assert.ok(goalIdx > ctxIdx, "Project Goal context must stay after project_context");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("before_agent_start: role block prepended when no <project_context> marker", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
+  try {
+    const { pi, tool, command, hook } = createFakePi({});
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-prompt-fallback");
+    await command("agile").handler("on", ctx); // enable agile mode
+    await hook("before_agent_start")({
+      systemPrompt: "Custom base prompt without context marker",
+    }, ctx);
+    const out = pi._lastSystemPrompt;
+    assert.ok(out.startsWith("\n\n# pi-agile: Autonomous Sprint Engine\n"), "role block must be prepended when marker is absent");
+    assert.ok(out.includes("Custom base prompt without context marker"), "base prompt must remain");
+    assert.ok(out.includes("You are a TECH LEAD"), "role must be present");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 await test("real agent_end: no nudge when agile mode is OFF", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ext-"));
   try {

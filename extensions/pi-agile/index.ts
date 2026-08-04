@@ -1250,8 +1250,21 @@ function assertAgileActive(rt: AgileRuntime): { content: { type: "text"; text: s
 // System prompt — detailed workflow + bd CLI cheatsheet
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT_WORKFLOW = `
+/** Insert the agile role block before <project_context> so the role
+ * statement outranks the generic "expert coding assistant" base prompt but
+ * never overrides the user's own AGENTS.md instructions. Falls back to
+ * prepending when the marker is absent (custom system prompts without
+ * project context). */
+function insertRoleBeforeContext(systemPrompt: string, roleBlock: string): string {
+  const marker = "<project_context>";
+  const idx = systemPrompt.indexOf(marker);
+  if (idx === -1) return roleBlock + systemPrompt;
+  return systemPrompt.slice(0, idx) + roleBlock + "\n\n" + systemPrompt.slice(idx);
+}
 
+// Behavioral contract (role + what the agent must NOT do) — injected at the
+// TOP of the system prompt, before the user's own AGENTS.md instructions.
+const SYSTEM_PROMPT_ROLE = `
 ## Your Role: Tech Lead
 
 You are a TECH LEAD, not a coder. Your job is to PLAN, DELEGATE, and REVIEW — not to write code yourself.
@@ -1273,7 +1286,11 @@ You are a TECH LEAD, not a coder. Your job is to PLAN, DELEGATE, and REVIEW — 
 
 If you find yourself wanting to write code — STOP. Create a bd task and delegate it.
 Every line of code should be written by a worker subagent, reviewed by a reviewer subagent, and merged by you.
+`;
 
+// Reference material (bd CLI, workflow phases, chains, detective, models) —
+// appended at the END of the system prompt, after the project context.
+const SYSTEM_PROMPT_WORKFLOW = `
 ## bd CLI Task Tracker
 
 bd is the task tracker. Tasks ("beads") have IDs like \`abc-9do\`.
@@ -1477,7 +1494,11 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     knowledge.load(workDir);
     const knowledgeText = knowledge.formatAll();
 
-    let extra = "\n\n# pi-agile: Autonomous Sprint Engine\n";
+    // ROLE block goes BEFORE the user's AGENTS.md (so it beats the generic
+    // "expert coding assistant" persona) while dynamic CONTEXT (goal, scope,
+    // constraints, knowledge, workflow reference) stays appended at the end.
+    const roleBlock = "\n\n# pi-agile: Autonomous Sprint Engine\n" + SYSTEM_PROMPT_ROLE;
+    let extra = "";
 
     extra += `\n## Project Goal\n${meta.goal}\n`;
     extra += `\n## Scope\nInclude: ${scope.join(", ")}\n`;
@@ -1490,6 +1511,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
 
     extra += SYSTEM_PROMPT_WORKFLOW;
 
+    event.systemPrompt = insertRoleBeforeContext(event.systemPrompt, roleBlock);
     event.systemPrompt = event.systemPrompt + extra;
   });
 

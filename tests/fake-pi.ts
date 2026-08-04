@@ -171,6 +171,7 @@ export function createFakePi({
   const sentMessages = [];
   const notifications = [];
   const execCalls = [];
+  let lastSystemPrompt = null;
   const events = createEventBus();
   if (bridge) events.on(RPC_REQUEST, bridge(events));
 
@@ -191,10 +192,20 @@ export function createFakePi({
     execCalls,
     events,
     worktrees,
+    get _lastSystemPrompt() {
+      return lastSystemPrompt;
+    },
 
     on(event, handler) {
       if (!hooks.has(event)) hooks.set(event, []);
-      hooks.get(event).push(handler);
+      hooks.get(event).push(
+        event === "before_agent_start"
+          ? async (ev, ctx) => {
+              await handler(ev, ctx);
+              lastSystemPrompt = ev.systemPrompt;
+            }
+          : handler,
+      );
     },
 
     registerTool(def) {
