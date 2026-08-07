@@ -1164,6 +1164,7 @@ await test("agent_end auto-closes terminal sprint + single start-next message", 
     const nudges = msgs.filter((m) => /Decide and act now/.test(m.text));
     assert.strictEqual(nudges.length, 1, "agent_end must auto-close and nudge exactly once");
     assert.ok(/auto-completed/.test(nudges[0].text), "nudge must carry the auto-completed line");
+    assert.strictEqual(nudges[0].opts.deliverAs, "followUp", "agent_end auto-close nudge stays followUp (turn-over delivery)");
     const spr = readLatestSprint(dir);
     assert.strictEqual(spr.status, "done", "auto-close must set status done on disk");
     assert.ok(spr.velocity && spr.velocity.done + spr.velocity.blocked > 0, "velocity must be computed");
@@ -1548,7 +1549,10 @@ await test("agile_run: enables mode, continuous mode, goal-setup followUp", asyn
     const last = pi.sentMessages[pi.sentMessages.length - 1];
     assert.ok(last.text.includes("Sprint Goal Setup Required"), "goal-setup followUp sent");
     assert.ok(last.text.includes("Fix all module boundary bugs"), "description in followUp");
-    assert.strictEqual(last.opts.deliverAs, "followUp");
+    // Mid-turn tool context: the agent must SEE the instruction immediately,
+    // even if it would otherwise continue calling tools — steer, not followUp
+    // (followUp only arrives after the agent stops on its own).
+    assert.strictEqual(last.opts.deliverAs, "steer", "goal-setup from the agile_run tool must be steer");
 
     // 4. tool result confirms
     assert.ok(res.content[0].text.includes("Agile mode ON"), "result confirms mode ON");
@@ -1628,6 +1632,99 @@ await test("agile_run: re-enabling after /agile off restores the gated tools", a
     const afterRun = pi.getActiveTools();
     assert.ok(afterRun.includes("agile_discover"), "re-enable restores agile tools");
     assert.ok(afterRun.includes("agile_delegate_task"), "delegate restored");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── deliverAs: mid-turn tool messages must be steer (agent sees them
+// immediately), agent_end stays followUp ─────────────────────────────
+
+console.log("## deliverAs semantics");
+
+await test("merge: terminal merge must not send exhausted steer nor set dedupe flag (design-A completion)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mrg-"));
+  try {
+    const bdTasks = new Map([["t1", "Task t1"]]);
+    const bridge = createFakeBridge({ verdictFor: () => "approved" });
+    const { pi, tool, command, hook } = createFakePi({ bdTasks, bridge });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-mrg-1");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
+
+    const before = pi.sentMessages.length;
+    const res = await tool("agile_merge_task").execute("t", { bd_id: "t1" }, null, null, ctx);
+    const text = res.content?.[0]?.text ?? "";
+    assert.ok(/merged to main/i.test(text), `merge must succeed (got: ${text.slice(0, 120)})`);
+
+    // Terminal sprint (t1 done): the all_tasks_exhausted steer must NOT be
+    // sent as a followUp from the merge tool, and the dedupe flag must NOT be
+    // set — agent_end owns the terminal message (design A).
+    const msgs = pi.sentMessages.slice(before);
+    const exhausted = msgs.filter((m) => /exhausted|\uD83D\uDEAB/.test(m.text));
+    assert.strictEqual(exhausted.length, 0, "terminal merge must not send exhausted/blocked steers");
+
+    // agent_end must STILL auto-close + nudge (the merge did not set the flag)
+    const m2 = pi.sentMessages.length;
+    await hook("agent_end")({ messages: [] }, ctx);
+    const nudges = pi.sentMessages.slice(m2).filter((m) => /Decide and act now/.test(m.text));
+    assert.strictEqual(nudges.length, 1, "agent_end must auto-close after a terminal merge");
+    assert.strictEqual(readLatestSprint(dir).status, "done", "auto-close sets status done");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("delegate: non-terminal stagnation steer delivered as steer (mid-turn tool context)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-stag-"));
+  try {
+    const bdTasks = new Map([["t1", "Task t1"], ["t2", "Task t2"]]);
+    const bridge = createFakeBridge({ verdictFor: () => "rework" });
+    const { pi, tool, command } = createFakePi({ bdTasks, bridge });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-stag-1");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1", "t2"] }, null, null, ctx);
+    // t2 stays pending so the sprint is NOT terminal → the stagnation steer
+    // (non-terminal) is allowed through and must be delivered as steer.
+    for (let i = 0; i < 3; i++) {
+      await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
+    }
+    const last = pi.sentMessages[pi.sentMessages.length - 1];
+    assert.ok(/stuck in a rework loop/.test(last.text), `stagnation steer must fire after 3 reworks (got: ${last?.text?.slice(0, 80)})`);
+    assert.strictEqual(last.opts.deliverAs, "steer", "stagnation steer from the delegate tool must be steer");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("agile_retrospective: continuation nudge delivered as steer (tool context)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-rtst-"));
+  try {
+    const bdTasks = new Map([["t1", "Task t1"]]);
+    const bridge = createFakeBridge({ verdictFor: () => "blocked" });
+    const { pi, tool, command } = createFakePi({ bdTasks, bridge });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-rtst-1");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
+
+    const before = pi.sentMessages.length;
+    await tool("agile_retrospective").execute("t", {}, null, null, ctx);
+    const msgs = pi.sentMessages.slice(before);
+    const nudges = msgs.filter((m) => /Decide and act now/.test(m.text));
+    assert.strictEqual(nudges.length, 1, "retrospective sends exactly one continuation nudge");
+    assert.strictEqual(nudges[0].opts.deliverAs, "steer", "continuation nudge from the retrospective tool must be steer");
+    // Every message the retrospective tool sends must be steer (mid-turn).
+    for (const m of msgs) {
+      assert.strictEqual(m.opts.deliverAs, "steer", `retrospective tool message must be steer: ${m.text.slice(0, 60)}`);
+    }
     return null;
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

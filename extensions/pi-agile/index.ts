@@ -942,7 +942,7 @@ async function executeBatchTasks(
     const batchTerminal = sprint.tasks.every((t) => t.status === "done" || t.status === "blocked");
     if (!batchTerminal) {
       for (const steer of batchSteers) {
-        try { await pi.sendUserMessage(steer.message, { deliverAs: "followUp" }); } catch { /* best effort */ }
+        try { await pi.sendUserMessage(steer.message, { deliverAs: "steer" }); } catch { /* best effort */ }
       }
     }
   }
@@ -1164,9 +1164,10 @@ async function maybeSendContinuation(
   workDir: string,
   sprint: SprintState,
   prefix?: string,
+  deliverAs: "followUp" | "steer" = "followUp",
 ): Promise<boolean> {
   // Fix #11: after /agile stop the loop is halted — no nudges at all.
-  if (runtime.loopStopped) { if (process.env.PBT_DBG) console.error('[DBG-MSC] blocked by loopStopped'); return false; }
+  if (runtime.loopStopped) return false;
 
   // Open bd tasks not already in this sprint — they should go into the next sprint.
   let openTasks: string[] = [];
@@ -1203,7 +1204,7 @@ async function maybeSendContinuation(
 
   runtime.agentEndSentForSprint = sprint.id; // optimistic dedupe (RC4)
   try {
-    await pi.sendUserMessage(full, { deliverAs: "followUp" });
+    await pi.sendUserMessage(full, { deliverAs });
     return true;
   } catch {
     return false;
@@ -1604,7 +1605,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         : "Continuous mode — no sprint limit. Work until the description's conditions are met.";
 
       const setupMsg = `## Sprint Goal Setup Required (autonomous run)\n\nThe user requested:\n> ${description}\n\n${budgetLine}\n\n**Work autonomously — no human is available to answer questions.** You MUST fill the project configuration before starting any sprint:\n\n1. **Read** current \`.agile/project.yaml\` and \`.agile/constraints.yaml\`\n2. **Extract** the goal from the description above — formalize it into \`goal:\` in \`.agile/project.yaml\`\n3. **Extract** constraints (e.g. \"не вводи новых функций\", \"не используй X\") — add them to \`constraints:\` array\n4. **Leave empty** anything not specified — don't invent extra goals or constraints\n5. **Goal is MANDATORY** — you MUST write a goal before proceeding\n6. After filling, call \`agile_start_sprint\` with tasks from \`bd ready\` (or run \`agile_discover\` first if no tasks exist)\n\nDo NOT start sprint work until goal + constraints are written.`;
-      await pi.sendUserMessage(setupMsg, { deliverAs: "followUp" });
+      await pi.sendUserMessage(setupMsg, { deliverAs: "steer" });
 
       return { content: [{ type: "text" as const, text: `✅ Agile mode ON. Autonomous sprint loop ${maxSprints ? `budgeted for ${maxSprints} sprint${maxSprints > 1 ? "s" : ""}` : "in continuous mode — run until the description's conditions are met"}. Fill goal + constraints in .agile/project.yaml, then start the sprint cycle.${cleaned > 0 ? ` Cleaned ${cleaned} stale worktree(s).` : ""}` }] };
     },
@@ -2202,7 +2203,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         if (!terminalNow) {
           for (const steer of transitionSteers) {
             try {
-              await pi.sendUserMessage(steer.message, { deliverAs: "followUp" });
+              await pi.sendUserMessage(steer.message, { deliverAs: "steer" });
             } catch { /* best effort */ }
           }
         }
@@ -2359,16 +2360,22 @@ ${workerSummary.slice(0, 1000)}`;
         const steers = runSprintObserver(sprint, runtime.observerState, DEFAULT_OBSERVER_CONFIG, workDir);
         if (steers.length > 0) {
           observerBlock = "\n\n## Observer\n" + steers.map(s => `[${s.severity}] ${s.message}`).join("\n");
-          // Send actionable steers as follow-up
-          for (const steer of steers) {
-            try {
-              await pi.sendUserMessage(steer.message, { deliverAs: "followUp" });
-            } catch { /* best effort */ }
+          // Design A: agent_end is the single closer + messenger for terminal
+          // sprints — deliver ONLY non-terminal steers (stagnation/constraint_spam/
+          // velocity_drop) mid-turn as steer (the merge runs inside a tool call,
+          // the agent continues thinking right after). Terminal steers
+          // (all_blocked/all_tasks_exhausted) are replaced by the agent_end
+          // auto-close message, and NO dedupe flag is set here anymore — the old
+          // agentEndSentForSprint=sprint.id silenced the agent_end auto-close
+          // after a terminal merge, killing the loop (design-A incompleteness).
+          const terminalNow = sprint.tasks.every((t) => t.status === "done" || t.status === "blocked");
+          if (!terminalNow) {
+            for (const steer of steers) {
+              try {
+                await pi.sendUserMessage(steer.message, { deliverAs: "steer" });
+              } catch { /* best effort */ }
+            }
           }
-          // Fix (M2): the exhausted-steer IS the continuation nudge — suppress
-          // the agent_end duplicate (it would fire next because the sprint is
-          // terminal and no followUp was attributed to it).
-          runtime.agentEndSentForSprint = sprint.id;
         }
       }
 
@@ -2407,8 +2414,11 @@ ${checksFailed ? "\n⚠️ **Checks reported failures above — verify before co
     runtime: AgileRuntime,
     workDir: string,
     sprint: SprintState,
-    opts?: { autoCompleted?: boolean },
+    opts?: { autoCompleted?: boolean; deliverAs?: "followUp" | "steer" },
   ): Promise<{ retroText: string; steers: { type: string; message: string; severity: string }[] }> {
+    // Mid-turn tool calls (agile_retrospective) deliver steer so the agent
+    // sees the message immediately; agent_end auto-close keeps followUp.
+    const deliverAs = opts?.deliverAs ?? "followUp";
     // Compute velocity
     sprint.velocity = runtime.store.computeVelocity(sprint);
 
@@ -2466,16 +2476,16 @@ ${checksFailed ? "\n⚠️ **Checks reported failures above — verify before co
           runtime.sprintLoopActive = false;
           persistSessionState(workDir, runtime);
           try {
-            await pi.sendUserMessage("All sprints completed. Stop criteria met — end the sprint loop with /agile stop.", { deliverAs: "followUp" });
+            await pi.sendUserMessage("All sprints completed. Stop criteria met — end the sprint loop with /agile stop.", { deliverAs });
           } catch { /* best effort */ }
         } else {
           // Bounded with sprints left: the FULL continuation message (mode line
           // 'N sprint(s) remaining.' + next steps), not the terse one-liner.
-          await maybeSendContinuation(pi, runtime, workDir, sprint, autoPrefix);
+          await maybeSendContinuation(pi, runtime, workDir, sprint, autoPrefix, deliverAs);
         }
       } else {
         // Continuous mode: the same continuation nudge the agent_end hook would send.
-        await maybeSendContinuation(pi, runtime, workDir, sprint, autoPrefix);
+        await maybeSendContinuation(pi, runtime, workDir, sprint, autoPrefix, deliverAs);
       }
     }
 
@@ -2495,7 +2505,7 @@ ${observerSteers.map((s: { type: string; message: string; severity: string }) =>
     for (const steer of observerSteers) {
       if (sentOwnFollowUp && (steer.type === "sprint_completed" || steer.type === "all_tasks_exhausted")) continue;
       try {
-        await pi.sendUserMessage(steer.message, { deliverAs: "followUp" });
+        await pi.sendUserMessage(steer.message, { deliverAs });
       } catch { /* best effort */ }
     }
 
@@ -2526,7 +2536,7 @@ ${observerSteers.map((s: { type: string; message: string; severity: string }) =>
         };
       }
 
-      const { retroText, steers } = await closeSprint(pi, runtime, workDir, sprint);
+      const { retroText, steers } = await closeSprint(pi, runtime, workDir, sprint, { deliverAs: "steer" });
 
       return {
         content: [{ type: "text" as const, text: retroText }],
