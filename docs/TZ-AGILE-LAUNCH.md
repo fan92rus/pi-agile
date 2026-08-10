@@ -1,5 +1,15 @@
 # Запуск реализации ТЗ pi-autoresearch через agile
 
+> **СТАТУС (2026-08-10): ТЗ УЖЕ РЕАЛИЗОВАНО** — bc760c3 (pi-autoresearch,
+> 6 стадий, 59 старых + 51 smoke + 6 PBT-сценариев, 75 seeds, REPORT-pbt.md,
+> packages/pi-extension-testkit). При проверке найдены и исправлены два дефекта:
+> (1) npm test не подключал redirect-loader → smoke падал; (2) PBT-ложная зелень
+> (forAll глотает ошибки, exit 0 при падении всех seeds) — добавлен runPbt.
+> Запуск нового агента НЕ ТРЕБУЕТСЯ. Оставшийся дефект доставки: пакет
+> не публиковался (внутренний packages/), fake-pi остаётся per-repo.
+
+---
+
 > Как запустить: новая pi-сессия с cwd = pi-agile, первое сообщение —
 > «Прочитай docs/TZ-AGILE-LAUNCH.md и вызови agile_run с описанием из него
 > (cwd: D:/Documents/Repositories/pi-autoresearch)». Сессия загрузит СВЕЖИЙ
