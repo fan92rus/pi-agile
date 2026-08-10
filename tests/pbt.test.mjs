@@ -113,11 +113,9 @@ class RealSystem {
     this.bdTasks = new Map(); // bdId -> title (bd list / bd show fakes)
     this.nextTask = 1;
     this.pendingVerdict = "blocked"; // what the fake reviewer says on next single delegate
-    this.batchVerdicts = new Map(); // bdId -> verdict for batch runs
     this.bridgeState = { dead: false, stuck: false }; // flip to simulate failures
     this.gitState = { originalBranch: "main", showCurrent: "main", headBefore: "aaa111", headAfter: "aaa111" };
     this.execTable = {}; // mutable exec overrides (e.g. failing `npm test`)
-    this.batchVerdictsRef = this.batchVerdicts;
     const { pi, tool, command, hook } = createFakePi({
       bdTasks: this.bdTasks,
       gitState: this.gitState,
@@ -125,7 +123,7 @@ class RealSystem {
       realGit: this.realGit,
       bridge: createFakeBridge({
         bridgeState: this.bridgeState,
-        verdictFor: (bdId) => this.batchVerdicts.get(bdId) ?? this.pendingVerdict,
+        verdictFor: () => this.pendingVerdict,
         commitWorkerChange: opts.commitWorkerChange ?? false,
       }),
     });
@@ -278,7 +276,18 @@ class RealSystem {
   async agentEnd() {
     await this.hook("agent_end")({ messages: [] }, this.ctx);
     this.record("agentEnd");
-    this.liveSprint = readLatestSprint(this.dir); // auto-close may have saved (healed)
+    const diskSprint = readLatestSprint(this.dir); // auto-close may have saved (healed)
+    // The real agent_end handler calls runtime.store.getCurrent(workDir) which
+    // keeps the runtime's ADOPTED in-memory sprint (it survives torn files).
+    // The disk view must not REGRESS the mirror to an older sprint while the
+    // runtime still holds a newer one in-memory — otherwise a later delegate
+    // picks tasks from the wrong sprint and the P21 disk re-read fails
+    // ("task t2 missing from sprint N"). Refresh only when adopting fresh
+    // (after restart) or when the disk sprint is at least as new as the mirror.
+    if (!this.runtimeInMemorySprint || (this.liveSprint && (diskSprint?.id ?? 0) >= this.liveSprint.id)) {
+      this.liveSprint = diskSprint;
+      if (diskSprint) this.runtimeInMemorySprint = true;
+    }
   }
 
   async runBounded() {
@@ -379,27 +388,7 @@ class RealSystem {
     this.record(`corruptSprint#${id}`);
   }
 
-  // ---- batch / merge / investigate / discover / knowledge / status / setup ----
-
-  async delegateBatch() {
-    const sprint = this.currentSprint();
-    if (!sprint) return;
-    this.runtimeInMemorySprint = true; // the tool adopts the sprint in-memory
-    this.lastBatchWasDone = sprint.status === "done"; // covered-sprint guard for P18
-    const eligible = sprint.tasks.filter((t) => t.status === "backlog" || t.status === "rework");
-    if (eligible.length === 0) return;
-    const n = Math.min(genInt(this.rng, 1, Math.min(3, eligible.length)), eligible.length);
-    const chosen = eligible.slice(0, n);
-    const ids = chosen.map((t) => t.bd_id);
-    for (const t of chosen) {
-      const v = this.rng() < 0.45 ? "blocked" : this.rng() < 0.5 ? "approved" : "rework";
-      this.batchVerdicts.set(t.bd_id, v);
-    }
-    const res = await this.tool("agile_delegate_task").execute("t", { bd_ids: ids }, null, null, this.ctx);
-    this.lastBatchText = res.content?.[0]?.text ?? "";
-    this.record(`delegateBatch(${ids.join(",")})`);
-    this.liveSprint = readLatestSprint(this.dir); // batch saved the sprint (healed)
-  }
+  // ---- merge / investigate / discover / knowledge / status / setup ----
 
   async merge() {
     const sprint = this.currentSprint();
@@ -560,7 +549,7 @@ class RealSystem {
 }
 
 const WEIGHTS = [
-  ["startSprint", 5], ["delegate", 8], ["delegateBatch", 5], ["merge", 4],
+  ["startSprint", 5], ["delegate", 8], ["merge", 4],
   ["retrospective", 3], ["agentEnd", 7], ["investigate", 3], ["discover", 3],
   ["knowledge", 2], ["status", 2], ["setup", 1], ["deadBridge", 1], ["stuckBridge", 1],
   ["runBounded", 2], ["runContinuous", 2], ["stop", 2], ["restart", 2],
@@ -676,42 +665,6 @@ async function checkInvariants(sys) {
         );
       }
     }
-    if (sys.lastAction.startsWith("delegateBatch(")) {
-      const wtOut = sys.gitExec(["worktree", "list", "--porcelain"]);
-      const wt = (wtOut.match(/^worktree /gm) ?? []).length;
-      assert.ok(wt === 1, `P19: batch must clean up worktrees (found ${wt}) | out: ${wtOut.slice(0, 400).replace(/\n/g, " || ")}`);
-    }
-  }
-
-  // P18 (design A, positive): a terminal delegateBatch leaves the sprint
-  // un-closed (the batch no longer sets the dedupe flag) — the immediately-
-  // following agent_end MUST auto-close it (status done) and send exactly ONE
-  // continuation message. The old negative invariant (agent_end must stay
-  // silent after a batch steer) is obsolete: agent_end is now the single
-  // closer + messenger.
-  if (sys.lastAction && sys.lastAction.startsWith("delegateBatch(")) {
-    const sprintNow = readLatestSprint(sys.dir);
-    const terminal =
-      sprintNow && sprintNow.tasks.length > 0 && sprintNow.tasks.every((t) => t.status === "done" || t.status === "blocked");
-    // After /agile stop agent_end stays silent by design (loopStopped gate) —
-    // the positive auto-close assertion only applies to a running loop. A
-    // sprint already done/covered before the batch (its continuation was
-    // already sent by e.g. a retrospective) is also exempt.
-    if (terminal && !sys.lastBatchWasDone && readSession(sys.dir).loopStopped !== true) {
-      const preStatus = readLatestSprint(sys.dir)?.status;
-      const preSprintJson = JSON.stringify(readLatestSprint(sys.dir));
-      const marker = sys.pi.sentMessages.length;
-      await sys.hook("agent_end")({ messages: [] }, sys.ctx);
-      const probeMsgs = sys.pi.sentMessages.slice(marker);
-      const nudges = sys.nudgeCount(probeMsgs);
-      assert.strictEqual(nudges, 1, `P18: agent_end must auto-close a terminal batch + nudge once (got ${nudges}) | preStatus: ${preStatus} | preSprint: ${preSprintJson?.slice(0, 300)} | ALL-MSGS: ${sys.pi.sentMessages.slice(sys.actionMarker).map((m) => m.text.slice(0, 60)).join(" || ")} | probe: ${probeMsgs.map((m) => m.text.slice(0, 90)).join(" || ")} | batchText: ${(sys.lastBatchText ?? "").slice(0, 120).replace(/\n/g, " ")} | sprStatus: ${readLatestSprint(sys.dir)?.status} | lastDone: ${sys.lastBatchWasDone} | sess: ${JSON.stringify(readSession(sys.dir))}`);
-      const spr = readLatestSprint(sys.dir);
-      assert.strictEqual(spr.status, "done", "P18: auto-close must set status done");
-      // P18 probe MUTATES state (auto-closes the sprint) — mark lastAction so
-      // a following no-op delegateBatch (early-return without record) does not
-      // re-trigger this block against the now-closed sprint.
-      sys.lastAction = "batchClosedByProbe";
-    }
   }
 
   // P22 (design A, positive): an agent_end that nudges a terminal sprint MUST
@@ -796,7 +749,7 @@ function setupRealGit(dir) {
 }
 
 const REALGIT_WEIGHTS = [
-  ["startSprint", 6], ["delegate", 8], ["delegateBatch", 4], ["merge", 4],
+  ["startSprint", 6], ["delegate", 8], ["merge", 4],
   ["retrospective", 3], ["agentEnd", 6], ["investigate", 2], ["knowledge", 2],
   ["status", 2], ["runBounded", 2], ["runContinuous", 2], ["stop", 2],
   ["restart", 2], ["injectTasks", 1], ["agileRun", 2],
@@ -951,7 +904,7 @@ console.log("# pi-agile PBT v2 (REAL extension via fake pi) + pure properties\n"
 console.log("## state machine: real orchestration (invariants after every action)");
 await forAll({ name: "real extension lifecycle", run: runScenario });
 
-console.log("## state machine: REAL git repository (checkout/diff/merge/worktree/branch -D)");
+console.log("## state machine: REAL git repository (checkout/diff/merge/branch -D)");
 await forAll({ seeds: 10, maxActions: 20, name: "real git integration lifecycle", run: runScenarioRealGit });
 
 console.log("## pure: continuation gate implication");

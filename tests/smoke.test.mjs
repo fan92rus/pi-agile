@@ -896,47 +896,8 @@ await test("effectiveGoal: empty when nothing provided", () => {
   assert.strictEqual(effectiveGoal(undefined, ""), "");
 });
 
-// ── index.ts: cleanupStaleWorktrees guards ────────────────────────────
-console.log("\n## index.ts: cleanupStaleWorktrees guards");
-
-// A worktree is stale only when BOTH: it is older than MIN_AGE (24h) AND it has
-// no .agile file modified within the activity window (6h). Fresh worktrees and
-// worktrees with a live worker must never be deleted.
-const WT_MIN_AGE_MS = 24 * 60 * 60 * 1000;
-const WT_ACTIVITY_MS = 6 * 60 * 60 * 1000;
-
-function isStaleWorktree(now, wtMtimeMs, recentAgileMtimeMs) {
-  if (now - wtMtimeMs < WT_MIN_AGE_MS) return false; // guard 1: too fresh
-  if (recentAgileMtimeMs !== null && now - recentAgileMtimeMs < WT_ACTIVITY_MS) return false; // guard 2: live worker
-  return true;
-}
-
-await test("worktree: fresh worktree (<24h) never stale, even without .agile", () => {
-  const now = Date.now();
-  assert.strictEqual(isStaleWorktree(now, now - 2 * 60 * 60 * 1000, null), false);
-});
-
-await test("worktree: old worktree with no .agile is stale (crashed batch left it)", () => {
-  const now = Date.now();
-  assert.strictEqual(isStaleWorktree(now, now - 48 * 60 * 60 * 1000, null), true);
-});
-
-await test("worktree: old worktree with recently touched .agile is live (worker running)", () => {
-  const now = Date.now();
-  const oldWt = now - 48 * 60 * 60 * 1000;
-  const recentAgile = now - 10 * 60 * 1000; // 10 min ago
-  assert.strictEqual(isStaleWorktree(now, oldWt, recentAgile), false);
-});
-
-await test("worktree: old worktree with old .agile is stale", () => {
-  const now = Date.now();
-  const oldWt = now - 48 * 60 * 60 * 1000;
-  const oldAgile = now - 48 * 60 * 60 * 1000;
-  assert.strictEqual(isStaleWorktree(now, oldWt, oldAgile), true);
-});
-
 // ── sprint.ts: SprintStore persistence + workDir scoping ──────────
-// Regression: agile_start_sprint and batch delegation did not call
+// Regression: agile_start_sprint did not call
 // store.save() after adding/updating tasks, so sprint-N.json stayed
 // tasks: [] and agent_end (which loads the last sprint from disk)
 // never fired. Also getCurrent() leaked sprints across projects.
@@ -1411,9 +1372,9 @@ await test("rpc: wrong-requestId reply is ignored; matching one resolves", async
   return null;
 });
 
-await test("batch delegate: Level B interrupts a stuck worker (env timeout)", async () => {
+await test("chain agent: stuck scout degrades gracefully, prepare still returns worker instruction", async () => {
   process.env.PI_AGILE_STUCK_TIMEOUT_MS = "10";
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-stuck-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-chstk-"));
   try {
     const bridgeState = { stuck: true };
     const { pi, tool, command } = createFakePi({
@@ -1421,20 +1382,25 @@ await test("batch delegate: Level B interrupts a stuck worker (env timeout)", as
       bridge: createFakeBridge({ bridgeState }),
     });
     piAgileExtension(pi);
-    const ctx = makeCtx(dir, "smoke-stuck");
+    const ctx = makeCtx(dir, "smoke-chstk-1");
     await command("agile").handler("on", ctx);
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
     const t0 = Date.now();
-    // Batch path still uses the RPC bridge + pollWithProgress (legacy, docs/DELEGATION.md)
-    const res = await tool("agile_delegate_task").execute("t", { bd_ids: ["t1"] }, null, null, ctx);
+    // Chain pre-agents (scout) still run via the bridge + pollWithProgress —
+    // the only remaining bridge consumers (best-effort context agents).
+    const res = await tool("agile_delegate_task").execute(
+      "t",
+      { bd_id: "t1", chain: ["scout", "worker", "reviewer"], title: "Task t1", description: "d" },
+      null, null, ctx,
+    );
     const elapsed = Date.now() - t0;
     const text = res.content?.[0]?.text ?? "";
-    assert.ok(
-      /did not complete|idle for|force-stopped/i.test(text),
-      `stuck worker must fail the batch delegate (got: ${text.slice(0, 120)})`,
-    );
-    assert.ok(elapsed < 2000, `stuck-worker abort took ${elapsed}ms (post-interrupt loop must not sleep 5s)`);
-    assert.strictEqual(bridgeState.stuck, false, "interrupt must clear the stuck flag");
+    assert.ok(/subagent\(/.test(text), `prepare must still return the worker instruction (got: ${text.slice(0, 120)})`);
+    assert.ok(elapsed < 2000, `stuck chain took ${elapsed}ms (post-interrupt loop must not sleep 5s)`);
+    // Truthful failure: the stuck scout is recorded as FAILED in the worker
+    // task file, not silently reported as "(scout completed)".
+    const workerFile = fs.readFileSync(path.join(dir, ".agile", "delegate-t1-r1.md"), "utf8");
+    assert.ok(/\[FAILED\]/.test(workerFile), "stuck scout must be recorded as FAILED in the worker task file");
     return null;
   } finally {
     delete process.env.PI_AGILE_STUCK_TIMEOUT_MS;
@@ -1812,6 +1778,46 @@ await test("merge: terminal merge must not send exhausted steer nor set dedupe f
     const nudges = pi.sentMessages.slice(m2).filter((m) => /Decide and act now/.test(m.text));
     assert.strictEqual(nudges.length, 1, "agent_end must auto-close after a terminal merge");
     assert.strictEqual(readLatestSprint(dir).status, "done", "auto-close sets status done");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("B prepare claims the bd task via bd update --claim (round 1)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-claim-"));
+  try {
+    const { pi, tool, command } = createFakePi({ bdTasks: new Map([["t1", "Task t1"]]) });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-claim-1");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
+    // The prompt promises "bd update <id> --claim done automatically by
+    // agile_delegate_task" — prepare (round 1) must actually claim the task.
+    const claims = pi.execCalls.filter((c) => c.cmd === "bd" && c.args[0] === "update" && c.args.includes("--claim"));
+    assert.strictEqual(claims.length, 1, `prepare must claim the task once (got ${claims.length})`);
+    assert.strictEqual(claims[0].args[1], "t1");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("merge closes the bd task via bd close", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-bdclose-"));
+  try {
+    const { pi, tool, command } = createFakePi({ bdTasks: new Map([["t1", "Task t1"]]) });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-bdclose-1");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    await delegateViaB({ tool, ctx, bdId: "t1", verdictFor: () => "approved" });
+    await tool("agile_merge_task").execute("t", { bd_id: "t1" }, null, null, ctx);
+    // The prompt promises "bd close <id> done automatically by agile_merge_task".
+    const closes = pi.execCalls.filter((c) => c.cmd === "bd" && c.args[0] === "close");
+    assert.strictEqual(closes.length, 1, `merge must close the bd task once (got ${closes.length})`);
+    assert.strictEqual(closes[0].args[1], "t1");
     return null;
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

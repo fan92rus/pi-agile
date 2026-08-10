@@ -62,7 +62,7 @@ function ensureAgileDir(workDir: string): void {
   const dir = path.join(workDir, AGILE_DIR);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   // Fix #17: agile state files (sprint-*.json, session.json, knowledge.jsonl,
-  // worker-*.txt, batch-progress.json) must never be committed by workers —
+  // worker-*.txt) must never be committed by workers —
   // they run `git add -A` and would otherwise pollute feature branches/main
   // on projects that don't already ignore .agile/.
   try {
@@ -167,14 +167,6 @@ function getStuckTimeout(workDir: string): number {
   return 1_800_000;
 }
 
-/** Write progress to .agile/batch-progress.json during parallel execution. */
-function writeBatchProgress(workDir: string, data: { tasks: { bdId: string; round: number; stage: string; status: string }[] }): void {
-  try {
-    ensureAgileDir(workDir);
-    fs.writeFileSync(path.join(workDir, ".agile", "batch-progress.json"), JSON.stringify(data, null, 2), "utf8");
-  } catch { /* non-fatal */ }
-}
-
 /** Resolve model for a given agent role from .agile/config.json or default. */
 function getAgentModel(workDir: string, role: string): string {
   const config = loadAgileConfig(workDir);
@@ -243,8 +235,8 @@ function clearOutputFile(file: string): void {
 }
 
 async function gitCreateBranch(pi: ExtensionAPI, workDir: string, branch: string): Promise<void> {
-  // Fix #2: re-delegating a task whose feat/<bdId> branch already exists (batch
-  // rework path) must plain-checkout it — `checkout -b` fails with exit 128 and
+  // Fix #2: re-delegating a task whose feat/<bdId> branch already exists (a
+  // rework round) must plain-checkout it — `checkout -b` fails with exit 128 and
   // pi.exec does not throw, so the old code silently kept working on the wrong
   // branch (main) and the worker committed past review.
   const branchResult = await pi.exec("git", ["branch", "--list"], { cwd: workDir, timeout: 5_000 });
@@ -287,681 +279,6 @@ async function gitMergeSquash(pi: ExtensionAPI, workDir: string, branch: string,
   return "";
 }
 
-// ---------------------------------------------------------------------------
-/** Parse `bd show <id>` output to extract title, description, acceptance criteria. */
-/** Checkout default branch (main or master) */
-async function gitCheckoutMain(pi: ExtensionAPI, workDir: string): Promise<string> {
-  const branchResult = await pi.exec("git", ["branch", "--list"], { cwd: workDir, timeout: 5_000 });
-  const branchList = (branchResult.stdout ?? "") + (branchResult.stderr ?? "");
-  const defaultBranch = branchList.includes("main") ? "main" : "master";
-  await pi.exec("git", ["checkout", defaultBranch], { cwd: workDir, timeout: 15_000 });
-  return defaultBranch;
-}
-
-/**
- * Squash-merge a worktree's feature branch into the main repo's default branch.
- * Worktrees cannot checkout the default branch (it's already checked out in the
- * main repo), so we git-fetch from the worktree into the main repo and merge there.
- */
-async function gitMergeFromWorktree(
-  pi: ExtensionAPI,
-  mainWorkDir: string,
-  worktreeDir: string,
-  featBranch: string,
-  commitMsg?: string,
-): Promise<string> {
-  const branchResult = await pi.exec("git", ["branch", "--list"], { cwd: mainWorkDir, timeout: 5_000 });
-  const branchList = (branchResult.stdout ?? "") + (branchResult.stderr ?? "");
-  const defaultBranch = branchList.includes("main") ? "main" : "master";
-
-  // Ensure main repo is on default branch
-  const checkout = await pi.exec("git", ["checkout", defaultBranch], { cwd: mainWorkDir, timeout: 15_000 });
-  if (checkout.code !== 0) return `checkout ${defaultBranch} in main repo failed: ${checkout.stderr}`;
-
-  // Fetch from worktree
-  const fetch = await pi.exec("git", ["fetch", worktreeDir, featBranch], { cwd: mainWorkDir, timeout: 30_000 });
-  if (fetch.code !== 0) return `fetch from worktree ${worktreeDir} failed: ${fetch.stderr}`;
-
-  // Squash merge FETCH_HEAD
-  const merge = await pi.exec("git", ["merge", "--squash", "FETCH_HEAD"], { cwd: mainWorkDir, timeout: 30_000 });
-  if (merge.code !== 0) return `squash merge failed: ${merge.stderr}`;
-
-  const msg = commitMsg ?? `feat: merge ${featBranch}`;
-  const commit = await pi.exec("git", ["commit", "-m", msg], { cwd: mainWorkDir, timeout: 15_000 });
-  if (commit.code !== 0) return `commit after squash failed: ${commit.stderr}`;
-
-  return "";
-}
-
-/** Extract list of conflicted files from git merge stderr. */
-function extractConflictedFiles(text: string): string[] {
-  const files: string[] = [];
-  for (const line of text.split("\n")) {
-    const m = line.match(/CONFLICT \([^)]+\): Merge conflict in (.+)$/);
-    if (m) files.push(m[1].trim());
-  }
-  return files;
-}
-
-/**
- * Worktrees younger than this are never considered stale: a parallel batch may
- * still be running (its workers may legitimately not have written anything to
- * .agile yet, e.g. during checkout/build, or they run long PBT tasks). Deleting
- * a live batch's worktree leaves the worker in a folder without a .git file
- * ("not a git repository") and breaks commit/merge machinery.
- */
-const WORKTREE_MIN_AGE_MS = 24 * 60 * 60 * 1000; // 24h
-
-/**
- * A worktree whose .agile directory was touched within this window is treated
- * as live — a running worker writes worker-<bdId>-r<N>.txt / review-*.txt there.
- */
-const WORKTREE_ACTIVITY_WINDOW_MS = 6 * 60 * 60 * 1000; // 6h
-
-function safeMtimeMs(p: string): number {
-  try {
-    return fs.statSync(p).mtimeMs;
-  } catch {
-    return 0;
-  }
-}
-
-/** True when any file in <worktree>/.agile was modified within the activity window. */
-function hasRecentAgileActivity(wtPath: string, now: number): boolean {
-  const agileDir = path.join(wtPath, ".agile");
-  let names: string[];
-  try {
-    names = fs.readdirSync(agileDir);
-  } catch {
-    return false;
-  }
-  for (const name of names) {
-    try {
-      if (now - fs.statSync(path.join(agileDir, name)).mtimeMs < WORKTREE_ACTIVITY_WINDOW_MS) return true;
-    } catch {}
-  }
-  return false;
-}
-
-/**
- * Remove stale git worktrees left from crashed/aborted batch runs. Returns count removed.
- *
- * Guards (a worktree is skipped, never deleted, when):
- *   1. the worktree folder is younger than WORKTREE_MIN_AGE_MS — a fresh worktree
- *      belongs to a batch that may still be running;
- *   2. its .agile directory contains files modified within WORKTREE_ACTIVITY_WINDOW_MS
- *      — a live worker is writing reports there.
- * Both conditions together mean "definitely dead" before anything is removed.
- */
-function cleanupStaleWorktrees(workDir: string): number {
-  let removed = 0;
-  try {
-    const listPath = path.join(workDir, ".git", "worktrees");
-    if (!fs.existsSync(listPath)) return 0;
-    const now = Date.now();
-    const entries = fs.readdirSync(listPath);
-    for (const entry of entries) {
-      const wtGitDir = path.join(listPath, entry);
-      const gitdirFile = path.join(wtGitDir, "gitdir");
-      if (!fs.existsSync(gitdirFile)) continue;
-      const wtPath = fs.readFileSync(gitdirFile, "utf8").trim().replace(/\/\s*$/, "");
-      if (!wtPath || wtPath === workDir || !fs.existsSync(wtPath)) continue;
-
-      // Guard 1: freshly-created worktree — likely a live batch.
-      if (now - safeMtimeMs(wtPath) < WORKTREE_MIN_AGE_MS) continue;
-
-      // Guard 2: recent .agile activity — a worker is (or recently was) running.
-      if (hasRecentAgileActivity(wtPath, now)) continue;
-
-      try {
-        fs.rmSync(wtGitDir, { recursive: true, force: true });
-        fs.rmSync(wtPath, { recursive: true, force: true });
-        removed++;
-      } catch {}
-    }
-  } catch {}
-  return removed;
-}
-
-/**
- * Full task lifecycle in a worktree directory:
- * create branch → spawn worker → poll → spawn reviewer → poll → parse verdict
- * Returns {bdId, status, verdict, diff, branch} or {bdId, status: "error", error}.
- */
-async function delegateTaskInWorktree(
-  pi: ExtensionAPI,
-  rpc_: RpcClient,
-  workDir: string,
-  bdId: string,
-  meta: { title: string; description: string; acceptanceCriteria?: string },
-  constraints: string,
-  deadEnds: string,
-  patterns: string,
-  reviewDepth: "deep" | "standard",
-  spawnTimeout: number,
-  onProgress?: (status: string) => void,
-  chain: string[] = ["worker", "reviewer"],
-): Promise<{
-  bdId: string;
-  verdict: ReturnType<typeof parseReviewVerdict>;
-  diff: string;
-  branch: string;
-  workerSummary?: string;
-  reviews?: { round: number; action_items: string[]; lessons: string[] }[];
-  chainOutputs?: { agent: string; output: string }[];
-  error?: string;
-}> {
-  const branch = `feat/${bdId}`;
-  const MAX_REWORK_ROUNDS = 3;
-  const reviews: { round: number; action_items: string[]; lessons: string[] }[] = [];
-  const chainOutputs: { agent: string; output: string }[] = [];
-  let currentDiff = "";
-  let currentWorkerSummary = "";
-  let overallVerdict: ReturnType<typeof parseReviewVerdict> = { status: "rework", dimensions: {}, action_items: [], lessons: [] };
-
-  // 1. Create feature branch (assumes on main)
-  await gitCreateBranch(pi, workDir, branch);
-
-  // 2. Run chain agents before worker (scout, researcher, planner, etc.)
-  const preWorker = chain.slice(0, chain.indexOf("worker"));
-  for (const agent of preWorker) {
-    try { pi.notify(`[${bdId}] Chain: ${agent} starting...`, "info"); } catch {}
-    onProgress?.(`${bdId}: chain agent ${agent}...`);
-    const agentOutput = path.join(workDir, ".agile", `${agent}-${bdId}.txt`);
-    const agentTaskText = buildChainAgentTask(agent, meta.title, meta.description, meta.acceptanceCriteria, constraints, patterns, chainOutputs);
-    let spawned: SpawnedWorker;
-    try {
-      clearOutputFile(agentOutput);
-      spawned = await rpc_.spawn({
-        agent: agent,
-        model: getAgentModel(workDir, agent),
-        task: agentTaskText,
-        cwd: workDir,
-        context: "fresh",
-        output: agentOutput,
-        outputMode: "file-only",
-      }, spawnTimeout);
-    } catch (e: unknown) {
-      chainOutputs.push({ agent, output: `[FAILED] ${e instanceof Error ? e.message : String(e)}` });
-      continue;
-    }
-    const done = await pollWithProgress(pi, workDir, rpc_, spawned.runId, agentOutput, `${agent}-${bdId}`, (s: string) => onProgress?.(`${bdId}: ${s}`));
-    let output = "";
-    try { if (fs.existsSync(agentOutput)) output = fs.readFileSync(agentOutput, "utf8"); } catch {}
-    chainOutputs.push({ agent, output: output || `(${agent} completed)` });
-    try { pi.notify(`[${bdId}] Chain: ${agent} done`, "info"); } catch {}
-  }
-
-  for (let round = 1; round <= MAX_REWORK_ROUNDS; round++) {
-    try { pi.notify(`[${bdId}] Round ${round}/${MAX_REWORK_ROUNDS}`, "info"); } catch {}
-
-    const workerOutput = path.join(workDir, ".agile", `worker-${bdId}-r${round}.txt`);
-    const reviewerOutput = path.join(workDir, ".agile", `review-${bdId}-r${round}.txt`);
-
-    // Build feedback from previous review (for round > 1)
-    let feedbackText: string | undefined;
-    if (round > 1 && reviews.length > 0) {
-      const prev = reviews[reviews.length - 1];
-      feedbackText = `Round ${round - 1} review found:\n`;
-      if (prev.action_items.length > 0) {
-        feedbackText += "Action items to fix:\n";
-        prev.action_items.forEach((ai: string) => { feedbackText += `  - ${ai}\n`; });
-      }
-      feedbackText += "\nFix these issues, then re-run tests and commit again.";
-      onProgress?.(`${bdId}: rework round ${round}...`);
-    }
-
-    // 3. Spawn worker (with chain context)
-    const workerTaskText = buildWorkerTask(meta.title, meta.description, meta.acceptanceCriteria, constraints, patterns, deadEnds, feedbackText, chainOutputs.length > 0 ? chainOutputs : undefined);
-    onProgress?.(`${bdId} (r${round}): spawning worker...`);
-    try { pi.notify(`[${bdId}] R${round}: worker starting...`, "info"); } catch {}
-
-    let worker: SpawnedWorker;
-    try {
-      clearOutputFile(workerOutput);
-      worker = await rpc_.spawn({
-        agent: "worker",
-        model: getAgentModel(workDir, "worker"),
-        task: workerTaskText,
-        cwd: workDir,
-        context: "fresh",
-        output: workerOutput,
-        outputMode: "file-only",
-      }, spawnTimeout);
-    } catch (e: unknown) {
-      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `⏱ Worker r${round} spawn failed after ${(spawnTimeout / 1000)}s: ${e instanceof Error ? e.message : String(e)}. Try increasing spawn_timeout in .agile/config.json or simplifying the task.` };
-    }
-
-    onProgress?.(`${bdId} (r${round}): worker started...`);
-    try { pi.notify(`[${bdId}] R${round}: worker running...`, "info"); } catch {}
-    const workerDone = await pollWithProgress(pi, workDir, rpc_, worker.runId, workerOutput, `worker-${bdId}-r${round}`, (s: string) => onProgress?.(`${bdId}: ${s}`));
-    if (!workerDone) {
-      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `⏱ Worker r${round} did not complete within ${Math.round(spawnTimeout / 1000)}s. Increase spawn_timeout in .agile/config.json or split into smaller tasks.` };
-    }
-
-    try { if (fs.existsSync(workerOutput)) currentWorkerSummary = fs.readFileSync(workerOutput, "utf8"); } catch {}
-
-    // 3. Get diff
-    try { pi.notify(`[${bdId}] R${round}: worker done, getting diff...`, "info"); } catch {}
-    currentDiff = await gitDiffAgainstDefault(pi, workDir, branch);
-    if (!currentDiff.trim()) {
-      if (round > 1) {
-        overallVerdict = { status: "rework", dimensions: {}, action_items: ["Worker reverted all changes after rework feedback."], lessons: [] };
-        return { bdId, verdict: overallVerdict, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: "no diff after rework" };
-      }
-      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: "", branch, workerSummary: currentWorkerSummary, reviews, error: "no diff produced" };
-    }
-
-    // 4. Spawn reviewer
-    const reviewerTaskText = buildReviewerTask(meta.title, meta.description, currentDiff, constraints, patterns, reviewDepth, meta.acceptanceCriteria);
-    onProgress?.(`${bdId} (r${round}): spawning reviewer...`);
-    try { pi.notify(`[${bdId}] R${round}: reviewer starting...`, "info"); } catch {}
-
-    let reviewer: SpawnedWorker;
-    try {
-      clearOutputFile(reviewerOutput);
-      reviewer = await rpc_.spawn({
-        agent: "reviewer",
-        model: getAgentModel(workDir, "reviewer"),
-        task: reviewerTaskText,
-        cwd: workDir,
-        context: "fresh",
-        output: reviewerOutput,
-        outputMode: "file-only",
-      }, spawnTimeout);
-    } catch (e: unknown) {
-      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `⏱ Reviewer r${round} spawn failed after ${(spawnTimeout / 1000)}s: ${e instanceof Error ? e.message : String(e)}. Try increasing spawn_timeout in .agile/config.json.` };
-    }
-
-    onProgress?.(`${bdId} (r${round}): reviewer started...`);
-    const reviewerDone = await pollWithProgress(pi, workDir, rpc_, reviewer.runId, reviewerOutput, `reviewer-${bdId}-r${round}`, (s: string) => onProgress?.(`${bdId}: ${s}`));
-    if (!reviewerDone) {
-      // Fix (M3): a dead/force-stopped reviewer must abort the task instead of
-      // parsing an empty verdict → default "rework" → 2 more meaningless rounds.
-      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `⏱ Reviewer r${round} did not complete (stuck or failed). Check ${reviewerOutput}.` };
-    }
-
-    let verdictText = "";
-    try { if (fs.existsSync(reviewerOutput)) verdictText = fs.readFileSync(reviewerOutput, "utf8"); } catch {}
-
-    overallVerdict = parseReviewVerdict(verdictText);
-    reviews.push({ round, action_items: overallVerdict.action_items ?? [], lessons: overallVerdict.lessons ?? [] });
-    try { pi.notify(`[${bdId}] R${round}: ${overallVerdict.status}`, "info"); } catch {}
-
-    // 5. Decision: approved→ready; blocked→stop; rework→continue
-    if (overallVerdict.status === "approved" || overallVerdict.status === "blocked") {
-      break;
-    }
-  }
-
-  return { bdId, verdict: overallVerdict, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, chainOutputs };
-}
-
-/**
- * Parallel batch: create worktrees, delegate each task in its own worktree.
- * Each task runs independent worker→reviewer→rework loop.
- * Approved tasks auto-merged. Worktrees cleaned up.
- */
-async function delegateBatchParallel(
-  pi: ExtensionAPI,
-  rpc_: RpcClient,
-  mainWorkDir: string,
-  tasks: { bdId: string; meta: { title: string; description: string; acceptanceCriteria?: string } }[],
-  constraints: string,
-  deadEnds: string,
-  patterns: string,
-  reviewDepth: "deep" | "standard",
-  chain: string[],
-  onProgress?: (status: string) => void,
-): Promise<{
-  results: (Awaited<ReturnType<typeof delegateTaskInWorktree>> & {
-    conflict?: { files: string[]; worktreeDir: string };
-  })[];
-}> {
-  const parentDir = path.dirname(mainWorkDir);
-  const repoName = path.basename(mainWorkDir);
-
-  // Per-task progress tracker (shared across parallel tasks)
-  interface TaskProgress {
-    bdId: string;
-    title: string;
-    round: number;
-    stage: string;
-    status: string; // "active" | "done" | "error"
-  }
-  const progressMap = new Map<string, TaskProgress>();
-  for (const t of tasks) {
-    progressMap.set(t.bdId, { bdId: t.bdId, title: t.meta.title, round: 0, stage: "waiting", status: "active" });
-  }
-
-  function showBatchSummary(): void {
-    const all = Array.from(progressMap.values());
-    const active = all.filter(t => t.status === "active");
-    const done = all.filter(t => t.status !== "active");
-    try {
-      pi.notify(
-        `📋 Batch: ${active.length} active, ${done.length} done\n${
-          active.map(t => `  [${t.bdId}] ${t.title} — ${t.stage} (r${t.round})`).join("\n")
-        }`,
-        "info"
-      );
-    } catch {}
-    writeBatchProgress(mainWorkDir, {
-      tasks: all.map(t => ({ bdId: t.bdId, round: t.round, stage: t.stage, status: t.status })),
-    });
-  }
-
-  // Parse bdId and round from onProgress status strings like "abc: stage..." or "abc (r1): stage..."
-  function parseProgressStatus(status: string): { bdId: string; stage: string; round: number } | null {
-    const m = status.match(/^([a-zA-Z0-9_-]+)\s*(?:\((r\d+)\))?\s*:\s*(.+)$/);
-    if (!m) return null;
-    return {
-      bdId: m[1],
-      round: m[2] ? parseInt(m[2].slice(1), 10) : 1,
-      stage: m[3].trim(),
-    };
-  }
-
-  const wrappedOnProgress = (status: string) => {
-    onProgress?.(status);
-    const parsed = parseProgressStatus(status);
-    if (parsed && progressMap.has(parsed.bdId)) {
-      const p = progressMap.get(parsed.bdId)!;
-      p.stage = parsed.stage;
-      p.round = parsed.round;
-      if (parsed.stage.includes("approved") || parsed.stage.includes("merge") || parsed.stage.startsWith("error")) {
-        // Will be marked done later after merge
-      }
-      showBatchSummary();
-    }
-  };
-
-  // 1. Ensure on main
-  const mainBranch = await gitCheckoutMain(pi, mainWorkDir);
-
-  // 2. Create worktrees for each task
-  const worktrees: string[] = [];
-  try {
-    for (const t of tasks) {
-      const wtDir = path.join(parentDir, `${repoName}-${t.bdId}`);
-      const addRes = await pi.exec("git", ["worktree", "add", "-b", `feat/${t.bdId}`, wtDir, mainBranch], { cwd: mainWorkDir, timeout: 30_000 });
-      if (addRes.code !== 0) {
-        // feat/<bdId> may already exist — e.g. a previous single-path delegate
-        // left the branch on a rework verdict (accumulated diff kept for
-        // re-delegation). Attach the existing branch instead of failing the
-        // whole batch; delegateTaskInWorktree's gitCreateBranch then does a
-        // plain checkout (branch-exists path) and the rework diff continues.
-        const attachRes = await pi.exec("git", ["worktree", "add", wtDir, `feat/${t.bdId}`], { cwd: mainWorkDir, timeout: 30_000 });
-        if (attachRes.code !== 0) {
-          throw new Error(`git worktree add failed for feat/${t.bdId}: ${(attachRes.stderr || addRes.stderr || "").trim()}`);
-        }
-      }
-      worktrees.push(wtDir);
-      wrappedOnProgress(`${t.bdId}: worktree created`);
-    }
-  } catch (e: unknown) {
-    for (const wt of worktrees) {
-      try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
-      try { fs.rmSync(wt, { recursive: true, force: true }); } catch {}
-    }
-    throw e;
-  }
-
-  // 3. Run ALL tasks in parallel — each its own worktree, each has its own loop
-  wrappedOnProgress?.("Running all tasks in parallel...");
-  const spawnTimeout = getSpawnTimeout(mainWorkDir);
-  let results: Awaited<ReturnType<typeof delegateTaskInWorktree>>[] = [];
-  try {
-    const taskPromises = tasks.map((t, i) =>
-      delegateTaskInWorktree(pi, rpc_, worktrees[i], t.bdId, t.meta, constraints, deadEnds, patterns, reviewDepth, spawnTimeout, wrappedOnProgress, chain)
-    );
-    results = await Promise.all(taskPromises);
-
-    // 5. For approved tasks: merge to main
-    for (let i = 0; i < results.length; i++) {
-      const r = results[i];
-      if (r.verdict.status === "approved" && !r.error) {
-        wrappedOnProgress(`${r.bdId}: approved, merging...`);
-        let mergeResult: string;
-        try {
-          mergeResult = await gitMergeFromWorktree(pi, mainWorkDir, worktrees[i], r.branch, `feat: merge ${r.bdId}`);
-        } catch (e: unknown) {
-          mergeResult = `merge error: ${e instanceof Error ? e.message : String(e)}`;
-        }
-        if (mergeResult) {
-          const isConflict = mergeResult.includes("CONFLICT");
-          if (isConflict) {
-            try { await pi.exec("git", ["merge", "--abort"], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
-            (r as any).conflict = {
-              files: extractConflictedFiles(mergeResult),
-              worktreeDir: worktrees[i],
-            };
-          } else {
-            r.error = `merge failed: ${mergeResult}`;
-          }
-        }
-      }
-      // Mark task done in progress tracker
-      const prog = progressMap.get(r.bdId);
-      if (prog) {
-        prog.status = r.error ? "error" : "done";
-        prog.stage = r.error ? "error" : r.verdict.status === "approved" ? "merged" : r.verdict.status;
-      }
-    }
-  } finally {
-    // 6. Clean up worktrees — ALWAYS (even when step 3 aborts mid-flight, e.g.
-    // a phantom worktree slot whose branch exists outside the batch). Skip
-    // conflicted ones — the agent needs them to resolve.
-    onProgress?.("Cleaning up worktrees...");
-    const conflictedDirs = new Set(
-      results.filter((r: any) => r?.conflict).map((r: any) => r.conflict.worktreeDir)
-    );
-    for (let i = 0; i < worktrees.length; i++) {
-      const wt = worktrees[i];
-      if (conflictedDirs.has(wt)) continue;
-      try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
-      try { fs.rmSync(wt, { recursive: true, force: true }); } catch {}
-      // Fix #2 (H1): delete the feat/<bdId> branch AFTER the worktree is gone
-      // (git refuses to delete a branch checked out in a worktree). A leftover
-      // branch made a later re-delegation fail "branch already exists" and the
-      // worker silently committed to main without review.
-      const r = results[i];
-      if (r && !r.error && r.verdict.status === "approved") {
-        try { await pi.exec("git", ["branch", "-D", r.branch], { cwd: mainWorkDir, timeout: 5_000 }); } catch { /* best effort */ }
-      }
-    }
-    showBatchSummary();
-  }
-
-  return { results };
-}
-
-/**
- * Batch mode handler: reads task details from bd, delegates in parallel,
- * merges approved, returns formatted summary to agent.
- */
-async function executeBatchTasks(
-  pi: ExtensionAPI,
-  rpc_: RpcClient,
-  workDir: string,
-  bdIds: string[],
-  runtime: AgileRuntime,
-  onUpdate: (update: { type: string; content?: string }) => void,
-  chain?: string[],
-): Promise<{ content: { type: "text"; text: string }[] }> {
-  const project = loadProjectConfig(workDir);
-  const meta = extractProjectMeta(project);
-  const constraints = loadConstraintsText(workDir);
-  const patterns = runtime.knowledge.formatPatterns();
-  runtime.lastWorkDir = workDir;
-  const deadEnds = runtime.knowledge.formatDeadEnds();
-
-  //
-
-  // Read all task details from bd
-  const tasks: { bdId: string; meta: { title: string; description: string; acceptanceCriteria?: string } }[] = [];
-  const failed: string[] = [];
-  for (const bdId of bdIds) {
-    const bdOutput = await execText(pi, "bd", ["show", bdId], workDir, 10_000);
-    const parsed = parseBdShow(bdOutput);
-    const title = parsed.title && parsed.title !== `(task ${bdId})` ? parsed.title : undefined;
-    if (!title) {
-      failed.push(bdId);
-      continue;
-    }
-    tasks.push({
-      bdId,
-      meta: {
-        title,
-        description: parsed.description ?? "",
-        acceptanceCriteria: parsed.acceptanceCriteria,
-      },
-    });
-  }
-
-  // Level A guard: refuse to spawn workers with empty task details. A worker
-  // with no title/description (e.g. bd database missing in workDir) wastes the
-  // whole run — it has nothing concrete to implement and may hang forever.
-  if (failed.length > 0) {
-    return {
-      content: [{ type: "text" as const, text: `\u274c Batch aborted: could not read task details for ${failed.join(", ")} — ` +
-        `bd show returned no title (missing .beads database in ${workDir}?). ` +
-        `No workers were spawned. Fix the bd database location or task ids, then retry.` }],
-    };
-  }
-
-  //
-
-  const chains = getChainConfig(workDir);
-  const taskChain = (chain as string[] | undefined) ?? chains.default ?? ["worker", "reviewer"];
-  let results: Awaited<ReturnType<typeof delegateBatchParallel>>["results"] = [];
-  try {
-    const batchResult = await delegateBatchParallel(
-    pi, rpc_, workDir, tasks, constraints, deadEnds, patterns,
-    meta.reviewDepth as "deep" | "standard",
-    taskChain,
-    () => {},
-  );
-
-    results = batchResult.results;
-  } catch (e: unknown) {
-    const errMsg = e instanceof Error ? e.message : String(e);
-    return { content: [{ type: "text" as const, text: `\u274c Batch delegation failed: ${errMsg}` }] };
-  }
-
-  // Update sprint state
-  const sprint = runtime.store.getCurrent(workDir);
-  const lines: string[] = ["# Batch Results\n"];
-  const approved: string[] = [];
-  const rework: string[] = [];
-  const blocked: string[] = [];
-  const conflicted: string[] = [];
-  const errored: string[] = [];
-
-  for (const r of results) {
-    const rAny = r as any;
-    // Fix #4: record review rounds for velocity (batch rework loops count
-    // real rounds now, previously review_rounds stayed 0 everywhere).
-    if (sprint && r.reviews?.length) runtime.store.setReviewRounds(sprint, r.bdId, r.reviews.length);
-    if (rAny.conflict) {
-      conflicted.push(r.bdId);
-      lines.push(`## ${r.bdId}: \ud83d\udd00 CONFLICT`);
-      lines.push(`Files: ${rAny.conflict.files.join(", ")}`);
-      lines.push(`Worktree: ${rAny.conflict.worktreeDir} (feat/${r.bdId})`);
-      lines.push("");
-      lines.push("To merge:");
-      lines.push(`1. \`cd ${rAny.conflict.worktreeDir}\``);
-      lines.push(`2. \`git fetch origin main && git rebase origin/main\``);
-      lines.push(`3. If conflict: fix files, \`git add <files> && git rebase --continue\``);
-      lines.push(`4. Call \`agile_merge_task({ bd_id: "${r.bdId}" })\` to finalize`);
-      lines.push("");
-    } else if (r.error) {
-      errored.push(r.bdId);
-      lines.push(`## ${r.bdId}: \u274c ERROR`);
-      lines.push(r.error);
-      lines.push("");
-    } else if (r.verdict.status === "approved") {
-      approved.push(r.bdId);
-      if (sprint) runtime.store.markDone(sprint, r.bdId);
-      lines.push(`## ${r.bdId}: \u2705 APPROVED`);
-      lines.push(`Merged to main.`);
-      if (r.reviews && r.reviews.length > 0) {
-        lines.push(`Rounds: ${r.reviews.length}`);
-        r.reviews.forEach((rev, i) => {
-          if (rev.lessons.length > 0) lines.push(`  Lessons r${i + 1}: ${rev.lessons.join("; ")}`);
-        });
-      }
-      lines.push("");
-    } else if (r.verdict.status === "rework") {
-      rework.push(r.bdId);
-      if (sprint) runtime.store.markRework(sprint, r.bdId, `rework after ${r.reviews?.length ?? 0} rounds`);
-      lines.push(`## ${r.bdId}: \u26a0\ufe0f REWORK`);
-      lines.push(`Action items:`);
-      (r.verdict.action_items ?? []).forEach((ai: string) => lines.push(`  - ${ai}`));
-      lines.push("");
-    } else if (r.verdict.status === "blocked") {
-      blocked.push(r.bdId);
-      if (sprint) runtime.store.markBlocked(sprint, r.bdId, r.verdict.action_items?.join("; "));
-      lines.push(`## ${r.bdId}: \u26d4 BLOCKED`);
-      (r.verdict.action_items ?? []).forEach((ai: string) => lines.push(`  - ${ai}`));
-      lines.push("");
-    }
-  }
-  // Persist batch task-status transitions (markDone/markRework/markBlocked)
-  // to disk — without this save sprint-N.json keeps tasks: [] and agent_end
-  // (which loads the last sprint from disk) never fires after a batch run.
-  if (sprint) {
-    // Fix #7: batch path was missing what the single path does — lessons,
-    // dead-ends, observer transitions and steers. Without this, knowledge
-    // stayed empty and the rework-loop observer never fired after batches.
-    for (const r of results) {
-      if (r.error || r.conflict) continue;
-      trackTaskTransition(runtime.observerState, r.bdId, r.verdict.status === "approved" ? "done" : r.verdict.status);
-      for (const lesson of r.verdict?.lessons ?? []) {
-        runtime.knowledge.append({
-          type: "lesson", task_id: r.bdId, sprint: sprint.id, ts: new Date().toISOString(), finding: lesson,
-        });
-      }
-      if (r.verdict?.do_not_retry) {
-        const taskMeta = tasks.find((t) => t.bdId === r.bdId);
-        runtime.knowledge.append({
-          type: "dead_end", task_id: r.bdId, sprint: sprint.id, ts: new Date().toISOString(),
-          approach: taskMeta?.meta.title ?? r.bdId, do_not_retry: r.verdict.do_not_retry,
-        });
-      }
-    }
-    runtime.knowledge.save(workDir);
-    runtime.store.save(workDir, sprint);
-
-    const batchSteers = runSprintObserver(sprint, runtime.observerState, DEFAULT_OBSERVER_CONFIG, workDir);
-    // Design A: agent_end is the single closer + messenger for terminal sprints —
-    // deliver ONLY non-terminal steers mid-turn; terminal ones (all_blocked /
-    // all_tasks_exhausted) are replaced by the agent_end auto-close message, and
-    // no dedupe flag is set here anymore (P18 old semantics: the exhausted steer
-    // was the continuation — now agent_end owns it).
-    const batchTerminal = sprint.tasks.every((t) => t.status === "done" || t.status === "blocked");
-    if (!batchTerminal) {
-      for (const steer of batchSteers) {
-        try { await pi.sendUserMessage(steer.message, { deliverAs: "steer" }); } catch { /* best effort */ }
-      }
-    }
-  }
-
-  // Summary line
-  lines.push("---");
-  lines.push(`Approved: ${approved.length} | Rework: ${rework.length} | Blocked: ${blocked.length} | Conflicts: ${conflicted.length} | Errors: ${errored.length}`);
-  if (rework.length > 0) {
-    lines.push("");
-    lines.push("\u26a0\ufe0f REWORK tasks need fixes. Read action_items above, then call agile_delegate_task again with bd_id for each.");
-  }
-  if (conflicted.length > 0) {
-    lines.push("");
-    lines.push("\ud83d\udd00 CONFLICT tasks need resolution. Navigate to the worktree, rebase on main, resolve conflicts, then call agile_merge_task.");
-  }
-
-  return { content: [{ type: "text" as const, text: lines.join("\n") }] };
-}
-
 /**
  * Parse `bd show <id>` output — lives in parallel/bd.ts (unit-testable).
  */
@@ -992,7 +309,7 @@ async function pollWithProgress(
   // Level B guard: if the subagent shows no activity (no tool calls / output
   // writes) for worker_stuck_timeout (default 30min), interrupt then force-stop
   // it instead of waiting forever. A healthy worker updates lastActivityAt on
-  // every tool call; an idle one hangs the whole batch.
+  // every tool call; an idle one hangs the whole poll.
   const stuckTimeoutMs = getStuckTimeout(workDir);
   let lastActivityWarningShown = false;
   // Fix #14: if the RPC bridge is dead (rpc.status keeps failing) and the run
@@ -1414,12 +731,7 @@ For each task in the sprint — B-protocol (agent-driven delegation, docs/DELEGA
    - **approved** → call \`agile_merge_task\` to merge to main
    - **rework** → call \`agile_delegate_task({ bd_id, round: N+1 })\` for the next round (action items are picked up automatically); max 3 rounds
    - **blocked** → task is fundamentally flawed, move to next task
-   - **conflict** (batch only) → merge conflict detected. Worktree kept on disk.
-     To resolve:
-       cd <worktree_dir>
-       git fetch origin main && git rebase origin/main
-       Fix conflicts, git add <files> && git rebase --continue
-       Then call agile_merge_task({ bd_id: "<id>" }) — auto-detects worktree
+   - **merge conflict** (from \`agile_merge_task\`) → rebase the feature branch on main (\`git checkout feat/<bdId> && git rebase main\`, fix conflicts, \`git add <files> && git rebase --continue\`) and call \`agile_merge_task\` again
 6. Repeat until all tasks done/blocked
 
 ### Phase 5: Retrospective
@@ -1450,7 +762,7 @@ All agents run with fresh context (no parent session inheritance).
 
 ## Key Rules
 
-1. **ONE task per agile_delegate_task call** — don't batch
+1. **ONE task per agile_delegate_task call** — process tasks one at a time
    (B-protocol: prepare → subagent(worker) → prepare_review → subagent(reviewer) → record_verdict → merge/rework; see Phase 4)
 2. **Worker needs context** — write detailed descriptions in bd, workers only see title + description
 3. **Use chain agents for complex tasks**: scout (explore codebase), researcher (look up APIs), planner (break down)
@@ -1477,7 +789,6 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       const config = loadAgileConfig(ctx.cwd);
       if (config.agile_mode === true) {
         runtime.agileMode = true;
-        cleanupStaleWorktrees(ctx.cwd);
       }
     }
     if (!runtime.agileMode) return;
@@ -1590,7 +901,6 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
 
       // 1. Enable agile mode ourselves — the whole point: no human to type /agile on.
       setAgileMode(ctx, true, workDir);
-      const cleaned = cleanupStaleWorktrees(workDir);
 
       // 2. Session state: bounded (max_sprints) or continuous until conditions met.
       const maxSprints = maxSprintsRaw !== undefined && maxSprintsRaw > 0 ? maxSprintsRaw : undefined;
@@ -1609,7 +919,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       const setupMsg = `## Sprint Goal Setup Required (autonomous run)\n\nThe user requested:\n> ${description}\n\n${budgetLine}\n\n**Work autonomously — no human is available to answer questions.** You MUST fill the project configuration before starting any sprint:\n\n1. **Read** current \`.agile/project.yaml\` and \`.agile/constraints.yaml\`\n2. **Extract** the goal from the description above — formalize it into \`goal:\` in \`.agile/project.yaml\`\n3. **Extract** constraints (e.g. \"не вводи новых функций\", \"не используй X\") — add them to \`constraints:\` array\n4. **Leave empty** anything not specified — don't invent extra goals or constraints\n5. **Goal is MANDATORY** — you MUST write a goal before proceeding\n6. After filling, call \`agile_start_sprint\` with tasks from \`bd ready\` (or run \`agile_discover\` first if no tasks exist)\n\nDo NOT start sprint work until goal + constraints are written.`;
       await pi.sendUserMessage(setupMsg, { deliverAs: "steer" });
 
-      return { content: [{ type: "text" as const, text: `✅ Agile mode ON. Autonomous sprint loop ${maxSprints ? `budgeted for ${maxSprints} sprint${maxSprints > 1 ? "s" : ""}` : "in continuous mode — run until the description's conditions are met"}. Fill goal + constraints in .agile/project.yaml, then start the sprint cycle.${cleaned > 0 ? ` Cleaned ${cleaned} stale worktree(s).` : ""}` }] };
+      return { content: [{ type: "text" as const, text: `✅ Agile mode ON. Autonomous sprint loop ${maxSprints ? `budgeted for ${maxSprints} sprint${maxSprints > 1 ? "s" : ""}` : "in continuous mode — run until the description's conditions are met"}. Fill goal + constraints in .agile/project.yaml, then start the sprint cycle.` }] };
     },
   });
 
@@ -1908,18 +1218,16 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
   // The tool does NOT spawn worker/reviewer subagents anymore: it prepares the
   // worker task file and instructs the AGENT to call its native subagent tool.
   // Verdict bookkeeping lives in agile_record_verdict (docs/DELEGATION.md).
-  // Batch mode (bd_ids[]) stays on the RPC bridge as legacy until B is validated.
   pi.registerTool({
     name: "agile_delegate_task",
     label: "agile_delegate_task",
-    description: "B-protocol prepare for ONE task (bd_id): writes the worker task file (.agile/delegate-<bdId>-r<N>.md) and returns the exact subagent() call the agent must make to spawn the worker. The agent then calls agile_prepare_review (after the worker commits) and agile_record_verdict (after the reviewer finishes). Parallel batch (bd_ids[]) is legacy and stays extension-driven.",
+    description: "B-protocol prepare for ONE task (bd_id): writes the worker task file (.agile/delegate-<bdId>-r<N>.md) and returns the exact subagent() call the agent must make to spawn the worker. The agent then calls agile_prepare_review (after the worker commits) and agile_record_verdict (after the reviewer finishes).",
     parameters: Type.Object({
-      bd_id: Type.Optional(Type.String({ description: "Single task ID (e.g. agile-test-9do). Mutually exclusive with bd_ids." })),
-      bd_ids: Type.Optional(Type.Array(Type.String(), { description: "Multiple task IDs for parallel batch (legacy). Mutually exclusive with bd_id." })),
+      bd_id: Type.String({ description: "Task ID (e.g. agile-test-9do)" }),
       round: Type.Optional(Type.Number({ description: "Rework round (1-3, default 1). Round N>1 picks up action items from the previous review file automatically." })),
       cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })),
-      title: Type.Optional(Type.String({ description: "Override task title (normally read from bd). Single mode only." })),
-      description: Type.Optional(Type.String({ description: "Override task description (normally read from bd). Single mode only." })),
+      title: Type.Optional(Type.String({ description: "Override task title (normally read from bd)." })),
+      description: Type.Optional(Type.String({ description: "Override task description (normally read from bd)." })),
       chain: Type.Optional(Type.Array(Type.String(), { description: "Agent chain: e.g. ['scout','worker','reviewer'] or ['worker','reviewer'] (default). Chain agents before worker run via the extension bridge." })),
     }),
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -1930,19 +1238,10 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         if (gate) return gate;
       }
       runtime.lastWorkDir = workDir;
-      const bdIds = params.bd_ids as string[] | undefined;
       const singleBdId = params.bd_id as string | undefined;
 
-      // BATCH MODE: bd_ids[] provided → parallel worktree delegation (legacy)
-      if (bdIds && bdIds.length > 0) {
-        if (singleBdId) {
-          return { content: [{ type: "text" as const, text: "❌ Cannot use both bd_id and bd_ids. Use one or the other." }] };
-        }
-        return await executeBatchTasks(pi, rpc, workDir, bdIds, runtime, onUpdate, params.chain as string[] | undefined);
-      }
-
       if (!singleBdId) {
-        return { content: [{ type: "text" as const, text: "❌ Provide bd_id (single task) or bd_ids[] (parallel batch)." }] };
+        return { content: [{ type: "text" as const, text: "❌ Provide bd_id (single task)." }] };
       }
 
       const bdId = params.bd_id as string;
@@ -1977,6 +1276,13 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       // 1. Create feature branch (worker commits land here)
       await gitCreateBranch(pi, workDir, branch);
 
+      // 1b. Claim the bd task on round 1 (the prompt promises this is done
+      //     automatically by agile_delegate_task). Best-effort: bd may be
+      //     missing or the task already claimed.
+      if (round === 1) {
+        try { await execText(pi, "bd", ["update", bdId, "--claim"], workDir, 10_000); } catch { /* best effort */ }
+      }
+
       // 2. Load context for worker
       runtime.knowledge.load(workDir);
       const constraints = loadConstraintsText(workDir);
@@ -2000,7 +1306,11 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
             task: agentTaskText, cwd: workDir, context: "fresh",
             output: agentOutput, outputMode: "file-only",
           }, getSpawnTimeout(workDir));
-          await pollWithProgress(pi, workDir, rpc, spawned.runId, agentOutput, `${agent}-${bdId}`, onUpdate);
+          const done = await pollWithProgress(pi, workDir, rpc, spawned.runId, agentOutput, `${agent}-${bdId}`, onUpdate);
+          if (!done) {
+            chainOutputs.push({ agent, output: `[FAILED] ${agent} did not complete (stuck or unreachable)` });
+            continue;
+          }
         } catch (e: unknown) {
           chainOutputs.push({ agent, output: `[FAILED] ${e instanceof Error ? e.message : String(e)}` });
           continue;
@@ -2286,10 +1596,9 @@ ${dimensionLines.join("\n")}${actionItems}${nextStep}`;
   pi.registerTool({
     name: "agile_merge_task",
     label: "agile_merge_task",
-    description: "Merge an approved task's feature branch to main (squash merge). Run main checks (lint + test). When from_worktree_dir is provided, fetches from that worktree instead. Auto-detects worktree at ../<repo>-<bdId> when branch not found in main repo.",
+    description: "Merge an approved task's feature branch to main (squash merge) and close the bd task. Run main checks (lint + test).",
     parameters: Type.Object({
       bd_id: Type.String({ description: "bd task ID to merge" }),
-      from_worktree_dir: Type.Optional(Type.String({ description: "Path to worktree dir (for resolving batch conflicts). When provided, fetches from worktree instead of looking for branch in main repo." })),
       cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -2302,34 +1611,20 @@ ${dimensionLines.join("\n")}${actionItems}${nextStep}`;
       runtime.lastWorkDir = workDir;
       const bdId = params.bd_id as string;
       const branch = `feat/${bdId}`;
-      const fromWorktreeDir = params.from_worktree_dir as string | undefined;
 
-      // Merge: from worktree (conflict resolution) or main repo branch
-      let mergeResult: string;
-      let usedWorktree = "";
-      if (fromWorktreeDir) {
-        mergeResult = await gitMergeFromWorktree(pi, workDir, fromWorktreeDir, branch, `feat: merge ${bdId}`);
-        usedWorktree = fromWorktreeDir;
-      } else {
-        mergeResult = await gitMergeSquash(pi, workDir, branch, `feat: merge ${bdId}`);
-        // Auto-detect: if branch not found, try ../<repo>-<bdId> worktree
-        if (mergeResult && (mergeResult.includes("did not match any file") || mergeResult.includes("not found"))) {
-          const parentDir2 = path.dirname(workDir);
-          const repoName2 = path.basename(workDir);
-          const autoWt = path.join(parentDir2, `${repoName2}-${bdId}`);
-          if (fs.existsSync(autoWt)) {
-            mergeResult = await gitMergeFromWorktree(pi, workDir, autoWt, branch, `feat: merge ${bdId}`);
-            usedWorktree = autoWt;
-          }
-        }
-      }
+      // Squash-merge the feature branch into the default branch (main|master).
+      const mergeResult = await gitMergeSquash(pi, workDir, branch, `feat: merge ${bdId}`);
       if (mergeResult) {
         const isConflict = mergeResult.includes("CONFLICT");
         if (isConflict) {
           try { await pi.exec("git", ["merge", "--abort"], { cwd: workDir, timeout: 10_000 }); } catch {}
-          const wtHint = fromWorktreeDir || usedWorktree || path.join(path.dirname(workDir), `${path.basename(workDir)}-${bdId}`);
+          const bl = await pi.exec("git", ["branch", "--list"], { cwd: workDir, timeout: 5_000 });
+          const defaultBranch = resolveDefaultBranch((bl.stdout ?? "") + (bl.stderr ?? ""));
           return {
-            content: [{ type: "text" as const, text: `🔀 Merge conflict in ${bdId}. Worktree kept at:\n  ${wtHint}\n\nTo resolve:\n1. \`cd ${wtHint}\`\n2. \`git fetch origin main && git rebase origin/main\`\n3. Fix conflicts, \`git add <files> && git rebase --continue\`\n4. Run \`agile_merge_task({ bd_id: "${bdId}", from_worktree_dir: "${wtHint}" })\`` }],
+            content: [{ type: "text" as const, text: `🔀 Merge conflict in ${bdId}. The squash merge was aborted. To resolve:
+1. \`git checkout feat/${bdId}\`
+2. \`git rebase ${defaultBranch}\` — fix conflicts, \`git add <files> && git rebase --continue\`
+3. Call \`agile_merge_task({ bd_id: "${bdId}" })\` again — the merge will now apply cleanly.` }],
           };
         }
         return {
@@ -2337,18 +1632,9 @@ ${dimensionLines.join("\n")}${actionItems}${nextStep}`;
         };
       }
 
-      // Clean up worktree (explicit, auto-detected, or known path)
-      const wtDirs: string[] = [];
-      if (usedWorktree && usedWorktree !== workDir) wtDirs.push(usedWorktree);
-      if (fromWorktreeDir && fromWorktreeDir !== workDir && !wtDirs.includes(fromWorktreeDir)) wtDirs.push(fromWorktreeDir);
-      const knownWt = path.join(path.dirname(workDir), `${path.basename(workDir)}-${bdId}`);
-      if (knownWt !== workDir && !wtDirs.includes(knownWt) && fs.existsSync(knownWt)) {
-        wtDirs.push(knownWt);
-      }
-      for (const wt of wtDirs) {
-        try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: workDir, timeout: 10_000 }); } catch (e) {}
-        try { fs.rmSync(wt, { recursive: true, force: true }); } catch (e) {}
-      }
+      // Close the bd task (the prompt promises agile_merge_task does it).
+      // Best-effort: bd may be missing or the task already closed.
+      try { await execText(pi, "bd", ["close", bdId], workDir, 10_000); } catch { /* best effort */ }
 
       // Run main checks (test, optionally lint)
       let checksOutput = "";
@@ -2901,8 +2187,7 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
         // otherwise loopStopped stays true and agent_end never nudges again.
         runtime.loopStopped = false;
         persistSessionState(workDir, runtime);
-        const cleaned = cleanupStaleWorktrees(workDir);
-        ctx.ui.notify("✅ Agile mode ON — tools and system prompt active" + (cleaned > 0 ? ` Cleaned ${cleaned} stale worktree(s).` : ""), "info");
+        ctx.ui.notify("✅ Agile mode ON — tools and system prompt active", "info");
         return;
       }
 
