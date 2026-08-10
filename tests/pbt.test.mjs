@@ -210,35 +210,16 @@ class RealSystem {
     if (eligible.length === 0) return;
     const t = genPick(this.rng, eligible);
     this.pendingVerdict = this.rng() < 0.6 ? "blocked" : "rework";
-    const wasStuck = this.bridgeState.stuck;
-    const wasDead = this.bridgeState.dead;
-    const res = await this.tool("agile_delegate_task").execute(
-      "t",
-      { bd_id: t.bd_id, title: t.title, description: `desc ${t.bd_id}` },
-      null,
-      null,
-      this.ctx,
-    );
-    const resText = res.content?.[0]?.text ?? "";
-    // The ACTUAL verdict (batchVerdicts from a previous batch action may
-    // override the intended pendingVerdict for this task).
-    const actualStatus = (resText.match(/\*\*Status:\*\* (approved|rework|blocked)/i) ?? [])[1]?.toLowerCase();
-    if (wasStuck) {
-      // P20: a stuck worker must fail the delegate with an explicit error
-      assert.ok(
-        /did not complete|idle for|force-stopped/i.test(resText),
-        `P20: stuck worker must abort delegate (got: ${resText.slice(0, 120)})`,
-      );
-      // The interrupt path clears stuck — unless the bridge is ALSO dead, in
-      // which case the dead-bridge abort wins (nothing to interrupt).
-      if (!wasDead) {
-        assert.ok(!this.bridgeState.stuck, "P20: interrupt must clear stuck state");
-      }
-    }
-    if (!wasStuck && !wasDead && actualStatus === "rework") {
-      // P21: a rework verdict in single mode consumes the FULL internal loop
-      // (MAX_REWORK_ROUNDS = 3) — every round runs, then the task is marked
-      // rework with the real round count recorded for velocity.
+    // B-protocol: the harness simulates the AGENT — prepare → (worker
+    // simulated) → prepare_review → (reviewer simulated: verdict file
+    // written) → record_verdict. The single path no longer touches the RPC
+    // bridge, so stuck/dead bridge states do not affect it (P20 moved to the
+    // batch smoke test, which still runs on the legacy bridge).
+    const actualStatus = await this.runBDelegate(t, this.pendingVerdict);
+    if (actualStatus === "rework") {
+      // P21: a rework verdict consumes the FULL 3-round B protocol — every
+      // round runs, then the task is marked rework with the real round count
+      // recorded for velocity.
       const spr = readLatestSprint(this.dir);
       const st = spr.tasks.find((x) => x.bd_id === t.bd_id);
       assert.ok(st, `P21: task ${t.bd_id} missing from sprint ${spr?.id} after rework (files=[${fs.readdirSync(path.join(this.dir, ".agile")).filter((f) => /^sprint-/.test(f)).join(",")}])`);
@@ -246,7 +227,44 @@ class RealSystem {
       assert.strictEqual(st?.review_rounds, 3, `P21: rework must consume all 3 rounds (got ${st?.review_rounds})`);
     }
     this.record(`delegate(${t.bd_id}→${actualStatus ?? "?"})`);
-    this.liveSprint = readLatestSprint(this.dir); // delegate saved the sprint (healed)
+    this.liveSprint = readLatestSprint(this.dir); // record saved the sprint (healed)
+  }
+
+  /**
+   * Simulate the AGENT executing the B protocol for one task (up to 3 rounds).
+   * Returns the actual verdict status parsed from the last record text.
+   */
+  async runBDelegate(t, verdict) {
+    let lastStatus = "";
+    for (let r = 1; r <= 3; r++) {
+      const prep = await this.tool("agile_delegate_task").execute(
+        "t",
+        { bd_id: t.bd_id, round: r, title: t.title, description: `desc ${t.bd_id}` },
+        null, null, this.ctx,
+      );
+      assert.ok(/subagent/.test(prep.content?.[0]?.text ?? ""), `prepare r${r} must return the worker subagent instruction`);
+      if (this.realGit) {
+        // Simulate the worker's commit so the fresh diff is non-empty.
+        try {
+          fs.writeFileSync(path.join(this.dir, `worker-sim-${t.bd_id}-r${r}.txt`), "simulated worker change\n");
+          this.gitExec(["add", "-A"]);
+          this.gitExec(["commit", "-qm", `feat: simulate worker r${r}`]);
+        } catch { /* non-git cwd — ignore */ }
+      }
+      const rv = await this.tool("agile_prepare_review").execute("t", { bd_id: t.bd_id, round: r }, null, null, this.ctx);
+      assert.ok(rv?.content?.[0]?.text, `prepare_review r${r} must return instructions`);
+      // Simulate the reviewer subagent: write the verdict output file.
+      fs.writeFileSync(
+        path.join(this.dir, ".agile", `review-${t.bd_id}-r${r}.txt`),
+        `## Verdict: ${verdict.toUpperCase()}\n\n\`\`\`json\n${JSON.stringify({ action_items: ["fix " + t.bd_id], lessons: ["lesson " + t.bd_id] })}\n\`\`\`\n`,
+        "utf8",
+      );
+      const rec = await this.tool("agile_record_verdict").execute("t", { bd_id: t.bd_id, round: r }, null, null, this.ctx);
+      const text = rec.content?.[0]?.text ?? "";
+      lastStatus = (text.match(/\*\*Status:\*\* (approved|rework|blocked)/i) ?? [])[1]?.toLowerCase() ?? lastStatus;
+      if (verdict !== "rework") break;
+    }
+    return lastStatus;
   }
 
   async retrospective() {

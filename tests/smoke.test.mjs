@@ -30,6 +30,39 @@ async function test(name, fn) {
   }
 }
 
+// ── B-protocol helpers (agent-driven delegation, docs/DELEGATION.md) ──
+// The harness simulates the AGENT executing the protocol: prepare → subagent
+// (worker) → prepare_review → subagent (reviewer writes verdict file) → record.
+
+/** Write a reviewer verdict file exactly like the real subagent output would. */
+function writeReviewFile(dir, bdId, round, verdict, extra = {}) {
+  const p = path.join(dir, ".agile", `review-${bdId}-r${round}.txt`);
+  fs.writeFileSync(p, reviewerVerdictText(verdict, extra), "utf8");
+  return p;
+}
+
+/**
+ * Drive one full B-protocol delegation (up to MAX_REWORK_ROUNDS=3 rounds):
+ * agile_delegate_task (prepare) → (worker simulated) → agile_prepare_review →
+ * (reviewer simulated: verdict file written) → agile_record_verdict.
+ * Returns the final record text + the round it stopped at.
+ */
+async function delegateViaB({ tool, ctx, bdId, title = `Task ${bdId}`, description = "d", verdictFor, verdictExtra }) {
+  let text = "";
+  let round = 1;
+  for (; round <= 3; round++) {
+    await tool("agile_delegate_task").execute("t", { bd_id: bdId, round, title, description }, null, null, ctx);
+    const rv = await tool("agile_prepare_review").execute("t", { bd_id: bdId, round }, null, null, ctx);
+    assert.ok(rv?.content?.[0]?.text, `prepare_review r${round} must return instructions`);
+    const verdict = verdictFor(bdId, round);
+    writeReviewFile(ctx.cwd, bdId, round, verdict, verdictExtra ? verdictExtra(bdId, round) : {});
+    const rec = await tool("agile_record_verdict").execute("t", { bd_id: bdId, round }, null, null, ctx);
+    text = rec.content?.[0]?.text ?? "";
+    if (verdict !== "rework") break;
+  }
+  return { text, round: Math.min(round, 3) };
+}
+
 console.log("# pi-agile smoke tests\n");
 
 // ── knowledge.ts ──────────────────────────────────────────────────
@@ -955,17 +988,19 @@ process.env.PI_AGILE_POLL_INTERVAL_MS = "10";
 const { default: piAgileExtension } = await import(
   pathToFileURL(path.join(EXT_DIR, "index.ts")).href
 );
-const { createFakePi, makeCtx, readSession, createFakeBridge, makeFakeUi, readLatestSprint } = await import(
+const { createFakePi, makeCtx, readSession, createFakeBridge, makeFakeUi, readLatestSprint, reviewerVerdictText } = await import(
   pathToFileURL(path.join(import.meta.dirname, "fake-pi.ts")).href
 );
 
-await test("real extension registers 8 tools + 2 hooks + 1 command on fake pi", () => {
+await test("real extension registers 10 tools + 2 hooks + 1 command on fake pi", () => {
   const { pi, tool, command, hook } = createFakePi({});
   piAgileExtension(pi);
   assert.ok(tool("agile_discover"), "missing agile_discover");
   assert.ok(tool("agile_investigate"), "missing agile_investigate");
   assert.ok(tool("agile_start_sprint"), "missing agile_start_sprint");
   assert.ok(tool("agile_delegate_task"), "missing agile_delegate_task");
+  assert.ok(tool("agile_prepare_review"), "missing agile_prepare_review (B protocol)");
+  assert.ok(tool("agile_record_verdict"), "missing agile_record_verdict (B protocol)");
   assert.ok(tool("agile_merge_task"), "missing agile_merge_task");
   assert.ok(tool("agile_retrospective"), "missing agile_retrospective");
   assert.ok(tool("agile_knowledge"), "missing agile_knowledge");
@@ -1080,7 +1115,7 @@ await test("agent_end re-arms after /agile stop → /agile on (loopStopped reset
     // Terminal sprint + fresh session (restart) — agent_end must nudge because
     // loopStopped=false survived, and the fresh runtime has no dedupe flag.
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
-    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
+    await delegateViaB({ tool, ctx, bdId: "t1", verdictFor: () => "blocked" });
     const { pi: pi2, hook: hook2 } = createFakePi({ bdTasks, bridge: createFakeBridge({ verdictFor: () => "blocked" }) });
     piAgileExtension(pi2);
     const ctx2 = makeCtx(dir, "smoke-ext-rearm2");
@@ -1110,7 +1145,7 @@ await test("agent_end re-arms after /agile stop → /agile setup (loopStopped re
     const sess = readSession(dir);
     assert.strictEqual(sess.loopStopped, false, "/agile setup must clear loopStopped in session.json");
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctxSetup);
-    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctxSetup);
+    await delegateViaB({ tool, ctx: ctxSetup, bdId: "t1", verdictFor: () => "blocked" });
     const { pi: pi2, hook: hook2 } = createFakePi({ bdTasks, bridge: createFakeBridge({ verdictFor: () => "blocked" }) });
     piAgileExtension(pi2);
     const ctx2 = makeCtx(dir, "smoke-ext-rearmsetup2");
@@ -1154,7 +1189,7 @@ await test("agent_end auto-closes terminal sprint + single start-next message", 
     const ctx = makeCtx(dir, "smoke-ext-autoclose");
     await command("agile").handler("on", ctx);
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
-    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
+    await delegateViaB({ tool, ctx, bdId: "t1", verdictFor: () => "blocked" });
     // Delegate no longer sends terminal steers / sets the flag — the sprint
     // stays planning until agent_end auto-closes it.
     assert.strictEqual(readLatestSprint(dir).status, "planning", "delegate must not close the sprint");
@@ -1187,7 +1222,7 @@ await test("retrospective after auto-close is a no-op (no double summary)", asyn
     const ctx = makeCtx(dir, "smoke-ext-retronoop");
     await command("agile").handler("on", ctx);
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
-    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
+    await delegateViaB({ tool, ctx, bdId: "t1", verdictFor: () => "blocked" });
     await hook("agent_end")({ messages: [] }, ctx); // auto-close + nudge
     const before = pi.sentMessages.length;
     const res = await tool("agile_retrospective").execute("t", {}, null, null, ctx);
@@ -1214,7 +1249,7 @@ await test("bounded agent_end auto-close sends full continuation with remaining 
     await command("agile").handler("on", ctx);
     await command("agile").handler("run 2", ctx);
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
-    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
+    await delegateViaB({ tool, ctx, bdId: "t1", verdictFor: () => "blocked" });
     const before = pi.sentMessages.length;
     await hook("agent_end")({ messages: [] }, ctx);
     const msgs = pi.sentMessages.slice(before);
@@ -1376,7 +1411,7 @@ await test("rpc: wrong-requestId reply is ignored; matching one resolves", async
   return null;
 });
 
-await test("pollWithProgress: Level B interrupts a stuck worker (env timeout)", async () => {
+await test("batch delegate: Level B interrupts a stuck worker (env timeout)", async () => {
   process.env.PI_AGILE_STUCK_TIMEOUT_MS = "10";
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-stuck-"));
   try {
@@ -1390,12 +1425,13 @@ await test("pollWithProgress: Level B interrupts a stuck worker (env timeout)", 
     await command("agile").handler("on", ctx);
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
     const t0 = Date.now();
-    const res = await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "T", description: "d" }, null, null, ctx);
+    // Batch path still uses the RPC bridge + pollWithProgress (legacy, docs/DELEGATION.md)
+    const res = await tool("agile_delegate_task").execute("t", { bd_ids: ["t1"] }, null, null, ctx);
     const elapsed = Date.now() - t0;
     const text = res.content?.[0]?.text ?? "";
     assert.ok(
       /did not complete|idle for|force-stopped/i.test(text),
-      `stuck worker must fail the delegate (got: ${text.slice(0, 120)})`,
+      `stuck worker must fail the batch delegate (got: ${text.slice(0, 120)})`,
     );
     assert.ok(elapsed < 2000, `stuck-worker abort took ${elapsed}ms (post-interrupt loop must not sleep 5s)`);
     assert.strictEqual(bridgeState.stuck, false, "interrupt must clear the stuck flag");
@@ -1406,116 +1442,219 @@ await test("pollWithProgress: Level B interrupts a stuck worker (env timeout)", 
   }
 });
 
-await test("re-delegation does not short-circuit on stale worker files", async () => {
-  process.env.PI_AGILE_STUCK_TIMEOUT_MS = "10";
+await test("B re-delegation cannot short-circuit on a stale review file", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-stale-"));
   try {
-    const bridgeState = { stuck: false };
-    const { pi, tool, command } = createFakePi({
-      bdTasks: new Map([["t1", "Task t1"]]),
-      bridge: createFakeBridge({ bridgeState }),
-    });
+    const { pi, tool, command } = createFakePi({ bdTasks: new Map([["t1", "Task t1"]]) });
     piAgileExtension(pi);
     const ctx = makeCtx(dir, "smoke-stale");
     await command("agile").handler("on", ctx);
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
-    // 1st delegation — writes worker-t1.txt / review-t1.txt
-    const r1 = await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "T", description: "d" }, null, null, ctx);
-    assert.ok(/BLOCKED|Verdict/.test(r1.content?.[0]?.text ?? ""), "first delegation must complete");
-    // 2nd delegation with a SILENT bridge (stuck) — must FAIL, not read the
-    // stale files from the first run (clearOutputFile fix).
-    bridgeState.stuck = true;
-    const r2 = await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "T", description: "d" }, null, null, ctx);
+    // 1st delegation — round 1 records a real verdict file.
+    const r1 = await delegateViaB({ tool, ctx, bdId: "t1", verdictFor: () => "blocked" });
+    assert.ok(/BLOCKED/.test(r1.text), "first delegation must complete");
+    assert.ok(fs.existsSync(path.join(dir, ".agile", "review-t1-r1.txt")), "round-1 verdict file exists");
+    // 2nd delegation of the SAME round — prepare must DELETE the old verdict
+    // file, so record without a fresh reviewer run cannot read the stale one.
+    await tool("agile_delegate_task").execute("t", { bd_id: "t1", round: 1, title: "Task t1", description: "d" }, null, null, ctx);
+    await tool("agile_prepare_review").execute("t", { bd_id: "t1", round: 1 }, null, null, ctx);
+    assert.ok(!fs.existsSync(path.join(dir, ".agile", "review-t1-r1.txt")), "prepare must clear the stale verdict file");
+    const rec = await tool("agile_record_verdict").execute("t", { bd_id: "t1", round: 1 }, null, null, ctx);
     assert.ok(
-    /did not complete|idle for|force-stopped/i.test(r2.content?.[0]?.text ?? ""),
-    `re-delegation must NOT succeed from stale files (got: ${(r2.content?.[0]?.text ?? "").slice(0, 120)})`,
+      /no review|missing|not found/i.test(rec.content?.[0]?.text ?? ""),
+      `record must NOT succeed from a stale verdict file (got: ${(rec.content?.[0]?.text ?? "").slice(0, 120)})`,
     );
     return null;
   } finally {
-    delete process.env.PI_AGILE_STUCK_TIMEOUT_MS;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-await test("single delegate runs the rework loop (3 rounds) with feedback", async () => {
+await test("B delegate runs the rework loop (3 rounds) with feedback", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-rework-"));
   try {
-    const bridge = createFakeBridge({
-      verdictFor: () => "rework",
-      verdictExtra: () => ({ action_items: ["fix the bug"], lessons: ["lesson x"] }),
-    });
-    const { pi, tool, command } = createFakePi({ bdTasks: new Map([["t1", "Task t1"]]), bridge });
+    const { pi, tool, command } = createFakePi({ bdTasks: new Map([["t1", "Task t1"]]) });
     piAgileExtension(pi);
     const ctx = makeCtx(dir, "smoke-rework");
     await command("agile").handler("on", ctx);
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
-    const res = await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "T", description: "d" }, null, null, ctx);
-    const text = res.content?.[0]?.text ?? "";
+    const { text, round } = await delegateViaB({
+      tool, ctx, bdId: "t1", title: "T", description: "d",
+      verdictFor: () => "rework",
+      verdictExtra: () => ({ action_items: ["fix the bug"], lessons: ["lesson x"] }),
+    });
     assert.ok(/REWORK/.test(text), `final verdict must be REWORK (got: ${text.slice(0, 160)})`);
     assert.ok(/Rounds:\*{0,2}\s*3/.test(text), `must report 3 rounds (got: ${text.slice(0, 160)})`);
+    assert.strictEqual(round, 3, "protocol must stop after round 3");
     const sprint = readLatestSprint(dir);
     const task = sprint.tasks.find((t) => t.bd_id === "t1");
     assert.strictEqual(task.status, "rework", "task must be marked rework");
     assert.strictEqual(task.review_rounds, 3, "setReviewRounds must record 3 rounds");
-    assert.strictEqual(bridge.spawnLog.filter((s) => s.agent === "worker").length, 3, "3 worker spawns");
-    const r2 = bridge.spawnLog.find((s) => s.agent === "worker" && /-r2\.txt$/.test(s.output));
-    assert.ok(r2, "round-2 worker must exist");
-    assert.ok(/Round 1 review found/.test(r2.task), "round-2 worker must receive feedback");
-    assert.ok(/- fix the bug/.test(r2.task), "feedback must carry the round-1 action items");
+    // Round-2 worker task file must carry the round-1 review feedback.
+    const r2 = fs.readFileSync(path.join(dir, ".agile", "delegate-t1-r2.md"), "utf8");
+    assert.ok(/Round 1 review found/.test(r2), "round-2 worker task must receive feedback");
+    assert.ok(/- fix the bug/.test(r2), "feedback must carry the round-1 action items");
     return null;
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-await test("single delegate breaks the rework loop on approved", async () => {
+await test("B delegate breaks the rework loop on approved", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-rework2-"));
   try {
-    const bridge = createFakeBridge({ verdictFor: (_bd, round) => (round === 1 ? "rework" : "approved") });
-    const { pi, tool, command } = createFakePi({ bdTasks: new Map([["t1", "Task t1"]]), bridge });
+    const { pi, tool, command } = createFakePi({ bdTasks: new Map([["t1", "Task t1"]]) });
     piAgileExtension(pi);
     const ctx = makeCtx(dir, "smoke-rework2");
     await command("agile").handler("on", ctx);
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
-    const res = await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "T", description: "d" }, null, null, ctx);
-    const text = res.content?.[0]?.text ?? "";
+    const { text, round } = await delegateViaB({
+      tool, ctx, bdId: "t1", title: "T", description: "d",
+      verdictFor: (_bd, r) => (r === 1 ? "rework" : "approved"),
+    });
     assert.ok(/APPROVED/.test(text), `must break to APPROVED (got: ${text.slice(0, 160)})`);
     assert.ok(/Rounds:\*{0,2}\s*2/.test(text), `must report 2 rounds (got: ${text.slice(0, 160)})`);
+    assert.strictEqual(round, 2, "protocol must stop after round 2");
     const sprint = readLatestSprint(dir);
     const task = sprint.tasks.find((t) => t.bd_id === "t1");
     assert.strictEqual(task.review_rounds, 2, "2 rounds recorded");
-    assert.strictEqual(bridge.spawnLog.filter((s) => s.agent === "worker").length, 2, "2 worker spawns only");
+    assert.ok(!fs.existsSync(path.join(dir, ".agile", "delegate-t1-r3.md")), "no round-3 task file after approved");
     return null;
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-await test("reviewer receives acceptance criteria from bd show (integration)", async () => {
+await test("B prepare_review: reviewer task file carries acceptance criteria from bd show", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-ac-"));
   try {
-    const bridge = createFakeBridge({ verdictFor: () => "blocked" });
     const { pi, tool, command } = createFakePi({
       bdTasks: new Map([["t1", "Task t1"]]),
       bdAC: new Map([["t1", "must handle empty input"]]),
-      bridge,
     });
     piAgileExtension(pi);
     const ctx = makeCtx(dir, "smoke-ac");
     await command("agile").handler("on", ctx);
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
-    // No title/description params → the tool reads bd show → parseBdShow → AC
-    await tool("agile_delegate_task").execute("t", { bd_id: "t1" }, null, null, ctx);
-    const reviewerSpawns = bridge.spawnLog.filter((s) => s.agent === "reviewer");
-    assert.ok(reviewerSpawns.length === 1, "one reviewer spawn");
-    assert.ok(
-      /Acceptance Criteria/.test(reviewerSpawns[0].task),
-      "reviewer prompt must contain the Acceptance Criteria section",
-    );
-    assert.ok(
-      /must handle empty input/.test(reviewerSpawns[0].task),
-      "reviewer prompt must carry the bd acceptance criteria",
-    );
+    // No title/description params → the tools read bd show → parseBdShow → AC
+    await tool("agile_delegate_task").execute("t", { bd_id: "t1", round: 1 }, null, null, ctx);
+    const rv = await tool("agile_prepare_review").execute("t", { bd_id: "t1", round: 1 }, null, null, ctx);
+    assert.ok(rv?.content?.[0]?.text, "prepare_review must return instructions");
+    const taskFile = fs.readFileSync(path.join(dir, ".agile", "review-task-t1-r1.md"), "utf8");
+    assert.ok(/Acceptance Criteria/.test(taskFile), "reviewer task must contain the Acceptance Criteria section");
+    assert.ok(/must handle empty input/.test(taskFile), "reviewer task must carry the bd acceptance criteria");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("B prepare returns the worker subagent instruction (file reference, no bridge spawn)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-prep-"));
+  try {
+    const { pi, tool, command } = createFakePi({ bdTasks: new Map([["t1", "Task t1"]]) });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-prep");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    const res = await tool("agile_delegate_task").execute("t", { bd_id: "t1", round: 1, title: "Task t1", description: "d" }, null, null, ctx);
+    const text = res.content?.[0]?.text ?? "";
+    assert.ok(/subagent/.test(text), "prepare must instruct the agent to call subagent");
+    assert.ok(/delegate-t1-r1\.md/.test(text), "instruction must reference the worker task file");
+    assert.ok(/"worker"/.test(text), "instruction must name the worker agent");
+    assert.ok(fs.existsSync(path.join(dir, ".agile", "delegate-t1-r1.md")), "worker task file must be written");
+    const taskFile = fs.readFileSync(path.join(dir, ".agile", "delegate-t1-r1.md"), "utf8");
+    assert.ok(/^# Task: Task t1/m.test(taskFile), "worker task file must carry buildWorkerTask content");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("B prepare_review returns the reviewer subagent instruction with output path", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-prv-"));
+  try {
+    const { pi, tool, command } = createFakePi({ bdTasks: new Map([["t1", "Task t1"]]) });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-prv");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    await tool("agile_delegate_task").execute("t", { bd_id: "t1", round: 1, title: "Task t1", description: "d" }, null, null, ctx);
+    const rv = await tool("agile_prepare_review").execute("t", { bd_id: "t1", round: 1 }, null, null, ctx);
+    const text = rv.content?.[0]?.text ?? "";
+    assert.ok(/subagent/.test(text), "prepare_review must instruct the agent to call subagent");
+    assert.ok(/review-task-t1-r1\.md/.test(text), "instruction must reference the reviewer task file");
+    assert.ok(/review-t1-r1\.txt/.test(text), "instruction must name the verdict output file");
+    assert.ok(/outputMode/.test(text), "instruction must include outputMode for the subagent call");
+    assert.ok(fs.existsSync(path.join(dir, ".agile", "review-task-t1-r1.md")), "reviewer task file must be written");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("B record without a review file errors loudly (no silent state change)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-rec-"));
+  try {
+    const { pi, tool, command } = createFakePi({ bdTasks: new Map([["t1", "Task t1"]]) });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-rec");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    // No review file written (reviewer subagent never ran) → record must refuse.
+    const rec = await tool("agile_record_verdict").execute("t", { bd_id: "t1", round: 1 }, null, null, ctx);
+    const text = rec.content?.[0]?.text ?? "";
+    assert.ok(/no review|missing|not found|reviewer/i.test(text), `record must error without a verdict file (got: ${text.slice(0, 120)})`);
+    const sprint = readLatestSprint(dir);
+    const task = sprint.tasks.find((t) => t.bd_id === "t1");
+    assert.strictEqual(task.status, "backlog", "task status must stay unchanged");
+    assert.strictEqual(task.review_rounds, 0, "review_rounds must stay unchanged");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("B prepare round > 3 errors (max rework rounds)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-maxr-"));
+  try {
+    const { pi, tool, command } = createFakePi({ bdTasks: new Map([["t1", "Task t1"]]) });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-maxr");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    const res = await tool("agile_delegate_task").execute("t", { bd_id: "t1", round: 4, title: "Task t1", description: "d" }, null, null, ctx);
+    const text = res.content?.[0]?.text ?? "";
+    assert.ok(/3 rounds|max.*round|round.*3/i.test(text), `prepare must refuse round 4 (got: ${text.slice(0, 120)})`);
+    assert.ok(!fs.existsSync(path.join(dir, ".agile", "delegate-t1-r4.md")), "no task file may be written for round 4");
+    return null;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("B record applies bookkeeping: blocked marks the task + lessons go to knowledge", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-bk-"));
+  try {
+    const { pi, tool, command } = createFakePi({ bdTasks: new Map([["t1", "Task t1"]]) });
+    piAgileExtension(pi);
+    const ctx = makeCtx(dir, "smoke-bk");
+    await command("agile").handler("on", ctx);
+    await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
+    const { text } = await delegateViaB({
+      tool, ctx, bdId: "t1",
+      verdictFor: () => "blocked",
+      verdictExtra: () => ({ action_items: ["wrong approach"], lessons: ["never use X"], do_not_retry: "X is broken" }),
+    });
+    assert.ok(/BLOCKED/.test(text), `record must report BLOCKED (got: ${text.slice(0, 120)})`);
+    assert.ok(/agile_merge_task/.test(text) === false, "blocked verdict must NOT suggest merging");
+    const sprint = readLatestSprint(dir);
+    const task = sprint.tasks.find((t) => t.bd_id === "t1");
+    assert.strictEqual(task.status, "blocked", "blocked verdict must mark the task blocked");
+    assert.strictEqual(task.review_rounds, 1, "review_rounds must record the round");
+    const kb = fs.readFileSync(path.join(dir, ".agile", "knowledge.jsonl"), "utf8");
+    assert.ok(/never use X/.test(kb), "lessons from the verdict must reach knowledge.jsonl");
+    assert.ok(/X is broken/.test(kb), "do_not_retry must reach knowledge.jsonl as a dead end");
     return null;
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -1653,7 +1792,7 @@ await test("merge: terminal merge must not send exhausted steer nor set dedupe f
     const ctx = makeCtx(dir, "smoke-mrg-1");
     await command("agile").handler("on", ctx);
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
-    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
+    await delegateViaB({ tool, ctx, bdId: "t1", verdictFor: () => "approved" });
 
     const before = pi.sentMessages.length;
     const res = await tool("agile_merge_task").execute("t", { bd_id: "t1" }, null, null, ctx);
@@ -1691,9 +1830,9 @@ await test("delegate: non-terminal stagnation steer delivered as steer (mid-turn
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1", "t2"] }, null, null, ctx);
     // t2 stays pending so the sprint is NOT terminal → the stagnation steer
     // (non-terminal) is allowed through and must be delivered as steer.
-    for (let i = 0; i < 3; i++) {
-      await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
-    }
+    // One B-protocol run with 3 consecutive rework rounds: record_verdict
+    // calls trackTaskTransition per round → consecutiveReworks reaches 3.
+    await delegateViaB({ tool, ctx, bdId: "t1", verdictFor: () => "rework" });
     const last = pi.sentMessages[pi.sentMessages.length - 1];
     assert.ok(/stuck in a rework loop/.test(last.text), `stagnation steer must fire after 3 reworks (got: ${last?.text?.slice(0, 80)})`);
     assert.strictEqual(last.opts.deliverAs, "steer", "stagnation steer from the delegate tool must be steer");
@@ -1713,7 +1852,7 @@ await test("agile_retrospective: continuation nudge delivered as steer (tool con
     const ctx = makeCtx(dir, "smoke-rtst-1");
     await command("agile").handler("on", ctx);
     await tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, ctx);
-    await tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "d" }, null, null, ctx);
+    await delegateViaB({ tool, ctx, bdId: "t1", verdictFor: () => "blocked" });
 
     const before = pi.sentMessages.length;
     await tool("agile_retrospective").execute("t", {}, null, null, ctx);

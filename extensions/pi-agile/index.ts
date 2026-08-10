@@ -1232,7 +1232,7 @@ function setAgileMode(ctx: ExtensionContext, enabled: boolean, workDir?: string)
   } else {
     // Remove gated tools from active set when turning off
     const tools = ctx.getActiveTools?.() ?? [];
-    const gated = ["agile_discover", "agile_start_sprint", "agile_delegate_task", "agile_merge_task", "agile_retrospective", "agile_knowledge", "agile_investigate"];
+    const gated = ["agile_discover", "agile_start_sprint", "agile_delegate_task", "agile_prepare_review", "agile_record_verdict", "agile_merge_task", "agile_retrospective", "agile_knowledge", "agile_investigate"];
     ctx.setActiveTools?.(tools.filter((t) => !gated.includes(t)));
   }
 }
@@ -1405,13 +1405,14 @@ Do NOT use detective when the fix is obvious (skip to worker directly).
 - Complex logic (race conditions, security, algorithms): pass \`model: "zai-glm/glm-5.2"\`
 
 ### Phase 4: Sprint Execution
-For each task in the sprint:
-1. Call \`agile_delegate_task\` with just the bd_id — the tool reads task details from bd
-2. Select the chain (from table above based on task type)
-3. The worker gets context from prior chain steps (scout report, research, plan)
-4. Read the review verdict:
+For each task in the sprint — B-protocol (agent-driven delegation, docs/DELEGATION.md):
+1. Call \`agile_delegate_task({ bd_id }) \` — the tool writes the worker task file and returns the EXACT \`subagent()\` call to spawn the worker. The tool does NOT spawn anything.
+2. Call your \`subagent\` tool exactly as instructed (worker): it blocks until the worker finishes. Select the chain via the \`chain\` param if the task type needs scout/researcher first.
+3. Call \`agile_prepare_review({ bd_id }) \` — writes the reviewer task file with the fresh diff and returns the EXACT \`subagent()\` call for the reviewer (with output/outputMode).
+4. Call your \`subagent\` tool exactly as instructed (reviewer): its verdict lands in \`.agile/review-<bdId>-r<N>.txt\`.
+5. Call \`agile_record_verdict({ bd_id, round }) \` — parses the verdict and applies bookkeeping. Read the returned verdict + next step:
    - **approved** → call \`agile_merge_task\` to merge to main
-   - **rework** → read action_items, call \`agile_delegate_task\` again for rework
+   - **rework** → call \`agile_delegate_task({ bd_id, round: N+1 })\` for the next round (action items are picked up automatically); max 3 rounds
    - **blocked** → task is fundamentally flawed, move to next task
    - **conflict** (batch only) → merge conflict detected. Worktree kept on disk.
      To resolve:
@@ -1419,7 +1420,7 @@ For each task in the sprint:
        git fetch origin main && git rebase origin/main
        Fix conflicts, git add <files> && git rebase --continue
        Then call agile_merge_task({ bd_id: "<id>" }) — auto-detects worktree
-4. Repeat until all tasks done/blocked
+6. Repeat until all tasks done/blocked
 
 ### Phase 5: Retrospective
 1. Call \`agile_retrospective\` — returns velocity metrics + stop-check message
@@ -1450,6 +1451,7 @@ All agents run with fresh context (no parent session inheritance).
 ## Key Rules
 
 1. **ONE task per agile_delegate_task call** — don't batch
+   (B-protocol: prepare → subagent(worker) → prepare_review → subagent(reviewer) → record_verdict → merge/rework; see Phase 4)
 2. **Worker needs context** — write detailed descriptions in bd, workers only see title + description
 3. **Use chain agents for complex tasks**: scout (explore codebase), researcher (look up APIs), planner (break down)
 4. **Constraints are TEXT** — read them above, enforce by reasoning, reject violations
@@ -1902,18 +1904,23 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
     },
   });
 
-  // Tool: agile_delegate_task — delegate worker + reviewer for one task
+  // Tool: agile_delegate_task — B-protocol PREPARE (agent-driven delegation).
+  // The tool does NOT spawn worker/reviewer subagents anymore: it prepares the
+  // worker task file and instructs the AGENT to call its native subagent tool.
+  // Verdict bookkeeping lives in agile_record_verdict (docs/DELEGATION.md).
+  // Batch mode (bd_ids[]) stays on the RPC bridge as legacy until B is validated.
   pi.registerTool({
     name: "agile_delegate_task",
     label: "agile_delegate_task",
-    description: "Delegate task(s) to worker+reviewer subagents. Single: pass bd_id. Parallel batch: pass bd_ids[] — each task gets its own worktree, parallel workers, independent rework loops (up to 3 rounds). Title/description auto-read from bd.",
+    description: "B-protocol prepare for ONE task (bd_id): writes the worker task file (.agile/delegate-<bdId>-r<N>.md) and returns the exact subagent() call the agent must make to spawn the worker. The agent then calls agile_prepare_review (after the worker commits) and agile_record_verdict (after the reviewer finishes). Parallel batch (bd_ids[]) is legacy and stays extension-driven.",
     parameters: Type.Object({
       bd_id: Type.Optional(Type.String({ description: "Single task ID (e.g. agile-test-9do). Mutually exclusive with bd_ids." })),
-      bd_ids: Type.Optional(Type.Array(Type.String(), { description: "Multiple task IDs for parallel batch. Mutually exclusive with bd_id." })),
+      bd_ids: Type.Optional(Type.Array(Type.String(), { description: "Multiple task IDs for parallel batch (legacy). Mutually exclusive with bd_id." })),
+      round: Type.Optional(Type.Number({ description: "Rework round (1-3, default 1). Round N>1 picks up action items from the previous review file automatically." })),
       cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })),
       title: Type.Optional(Type.String({ description: "Override task title (normally read from bd). Single mode only." })),
       description: Type.Optional(Type.String({ description: "Override task description (normally read from bd). Single mode only." })),
-      chain: Type.Optional(Type.Array(Type.String(), { description: "Agent chain: e.g. ['scout','worker','reviewer'] or ['worker','reviewer'] (default). Overrides agent_chains.default from .agile/config.json." })),
+      chain: Type.Optional(Type.Array(Type.String(), { description: "Agent chain: e.g. ['scout','worker','reviewer'] or ['worker','reviewer'] (default). Chain agents before worker run via the extension bridge." })),
     }),
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       const workDir = (params.cwd as string) || ctx.cwd;
@@ -1926,7 +1933,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       const bdIds = params.bd_ids as string[] | undefined;
       const singleBdId = params.bd_id as string | undefined;
 
-      // BATCH MODE: bd_ids[] provided → parallel worktree delegation
+      // BATCH MODE: bd_ids[] provided → parallel worktree delegation (legacy)
       if (bdIds && bdIds.length > 0) {
         if (singleBdId) {
           return { content: [{ type: "text" as const, text: "❌ Cannot use both bd_id and bd_ids. Use one or the other." }] };
@@ -1938,16 +1945,12 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         return { content: [{ type: "text" as const, text: "❌ Provide bd_id (single task) or bd_ids[] (parallel batch)." }] };
       }
 
-      const project = loadProjectConfig(workDir);
-      const meta = extractProjectMeta(project);
-
-      if (!await rpc.ping()) {
-        return {
-          content: [{ type: "text" as const, text: "❌ pi-subagents RPC bridge not ready. Ensure pi-subagents extension is installed and active." }],
-        };
-      }
-
       const bdId = params.bd_id as string;
+      const MAX_REWORK_ROUNDS = 3;
+      const round = typeof params.round === "number" && Number.isFinite(params.round) ? Math.max(1, Math.floor(params.round)) : 1;
+      if (round > MAX_REWORK_ROUNDS) {
+        return { content: [{ type: "text" as const, text: `❌ Rework rounds are capped at ${MAX_REWORK_ROUNDS} rounds (requested round ${round}). Task ${bdId} has already been reworked — decide manually: block it or leave it for later.` }] };
+      }
 
       // Read task details from bd if not provided
       let title = params.title as string | undefined;
@@ -1961,19 +1964,17 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         description = parsed.description ?? description;
         acceptanceCriteria = parsed.acceptanceCriteria;
       }
-      // Level A guard: refuse to spawn a worker with empty task details (missing
-      // .beads database in workDir). A worker with no concrete task hangs or
-      // fabricates work — better to fail fast before spawning.
+      // Level A guard: refuse to prepare a worker with empty task details.
       if (!title) {
         return {
-          content: [{ type: "text" as const, text: `\u274c Delegate aborted: could not read task details for ${bdId} — ` +
+          content: [{ type: "text" as const, text: `❌ Delegate aborted: could not read task details for ${bdId} — ` +
             `bd show returned no title (missing .beads database in ${workDir}?). ` +
             `No worker was spawned. Fix the bd database location or task id, then retry.` }],
         };
       }
       const branch = `feat/${bdId}`;
 
-      // 1. Create feature branch
+      // 1. Create feature branch (worker commits land here)
       await gitCreateBranch(pi, workDir, branch);
 
       // 2. Load context for worker
@@ -1985,6 +1986,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       const patterns = runtime.knowledge.formatPatterns();
 
       // 2b. Run chain agents before worker (scout, researcher, planner, etc.)
+      //     — still extension-driven via the bridge (analysis agents, no verdicts).
       const chainOutputs: { agent: string; output: string }[] = [];
       const preWorker = taskChain.slice(0, taskChain.indexOf("worker"));
         for (const agent of preWorker) {
@@ -2009,148 +2011,184 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         try { pi.notify(`[${bdId}] Chain: ${agent} done`, "info"); } catch {}
       }
 
-      // 3-5. Rework loop — UNIFIED with the batch path (delegateTaskInWorktree):
-      // up to MAX_REWORK_ROUNDS rounds of worker → diff → reviewer. A rework
-      // verdict feeds the review's action items back to the next worker round;
-      // approved/blocked break the loop; errors abort with no state change
-      // (task keeps its previous status, the agent decides what to do next).
-      const MAX_REWORK_ROUNDS = 3;
-      const reviews: { round: number; action_items: string[]; lessons: string[] }[] = [];
-      let verdict: ReturnType<typeof parseReviewVerdict> = { status: "rework", dimensions: {}, action_items: [], lessons: [] };
-      let workerSummary = "";
-
-      for (let round = 1; round <= MAX_REWORK_ROUNDS; round++) {
-        try { pi.notify(`[${bdId}] Round ${round}/${MAX_REWORK_ROUNDS}`, "info"); } catch {}
-
-        const workerOutput = path.join(workDir, ".agile", `worker-${bdId}-r${round}.txt`);
-        const reviewerOutput = path.join(workDir, ".agile", `review-${bdId}-r${round}.txt`);
-
-        // Feedback from the previous review (round > 1)
-        let feedbackText: string | undefined;
-        if (round > 1 && reviews.length > 0) {
-          const prev = reviews[reviews.length - 1];
-          feedbackText = `Round ${round - 1} review found:\n`;
-          if (prev.action_items.length > 0) {
-            feedbackText += "Action items to fix:\n";
-            prev.action_items.forEach((ai: string) => { feedbackText += `  - ${ai}\n`; });
-          }
-          feedbackText += "\nFix these issues, then re-run tests and commit again.";
+      // 3. Rework feedback (round > 1): action items from the previous review file.
+      let feedbackText: string | undefined;
+      if (round > 1) {
+        const prevReviewPath = path.join(workDir, ".agile", `review-${bdId}-r${round - 1}.txt`);
+        let prevText = "";
+        try { if (fs.existsSync(prevReviewPath)) prevText = fs.readFileSync(prevReviewPath, "utf8"); } catch {}
+        const prev = parseReviewVerdict(prevText);
+        feedbackText = `Round ${round - 1} review found:\n`;
+        if (prev.action_items.length > 0) {
+          feedbackText += "Action items to fix:\n";
+          prev.action_items.forEach((ai: string) => { feedbackText += `  - ${ai}\n`; });
         }
-
-        const workerTaskText = buildWorkerTask(title, description, acceptanceCriteria, constraints, patterns, deadEnds, feedbackText, chainOutputs.length > 0 ? chainOutputs : undefined);
-
-        let worker: SpawnedWorker;
-        try {
-          clearOutputFile(workerOutput);
-          worker = await rpc.spawn({
-            agent: "worker",
-            model: getAgentModel(workDir, "worker"),
-            task: workerTaskText,
-            cwd: workDir,
-            context: "fresh",
-            output: workerOutput,
-            outputMode: "file-only",
-          }, getSpawnTimeout(workDir));
-        } catch (e: unknown) {
-          return {
-            content: [{ type: "text" as const, text: `❌ Failed to spawn worker (r${round}): ${e instanceof Error ? e.message : String(e)}` }],
-          };
-        }
-
-        // Poll for worker completion with progress updates
-        const workerDone = await pollWithProgress(pi, workDir, rpc, worker.runId, workerOutput, `worker-${bdId}-r${round}`, onUpdate);
-        if (!workerDone) {
-          return {
-            content: [{ type: "text" as const, text: `❌ Worker task ${bdId} (r${round}) did not complete within timeout. Check worker output: ${workerOutput}` }],
-          };
-        }
-
-        // Read worker output
-        try {
-          if (fs.existsSync(workerOutput)) {
-            workerSummary = fs.readFileSync(workerOutput, "utf8");
-          }
-        } catch { /* best-effort */ }
-
-        // 4. Get diff after this round's work
-        const diff = await gitDiffAgainstDefault(pi, workDir, branch);
-
-        if (!diff.trim()) {
-          if (round > 1) {
-            // Same as batch: a rework round that reverts everything is a dead end.
-            return {
-              content: [{
-                type: "text" as const,
-                text: `⚠️ Worker reverted all changes after rework feedback (r${round}) for task ${bdId}. The worker may have failed or made no changes. Worker summary: ${workerSummary.slice(0, 500)}`,
-              }],
-            };
-          }
-          return {
-            content: [{
-              type: "text" as const,
-              text: `⚠️ Worker produced no diff for task ${bdId}. The worker may have failed or made no changes. Worker summary: ${workerSummary.slice(0, 500)}`,
-            }],
-          };
-        }
-
-        // 5. Delegate reviewer via RPC
-        const reviewerTaskText = buildReviewerTask(title, description, diff, constraints, patterns, meta.reviewDepth as "deep" | "standard", acceptanceCriteria);
-
-        let reviewer: SpawnedWorker;
-        try {
-          clearOutputFile(reviewerOutput);
-          reviewer = await rpc.spawn({
-            agent: "reviewer",
-            model: getAgentModel(workDir, "reviewer"),
-            task: reviewerTaskText,
-            cwd: workDir,
-            context: "fresh",
-            output: reviewerOutput,
-            outputMode: "file-only",
-          }, getSpawnTimeout(workDir));
-        } catch (e: unknown) {
-          return {
-            content: [{ type: "text" as const, text: `❌ Failed to spawn reviewer (r${round}): ${e instanceof Error ? e.message : String(e)}` }],
-          };
-        }
-
-        // Poll for reviewer completion with progress updates
-        const reviewerDone = await pollWithProgress(pi, workDir, rpc, reviewer.runId, reviewerOutput, `reviewer-${bdId}-r${round}`, onUpdate);
-        if (!reviewerDone) {
-          return {
-            content: [{ type: "text" as const, text: `❌ Reviewer for ${bdId} (r${round}) did not complete within timeout. Check output: ${reviewerOutput}.` }],
-          };
-        }
-
-        // Read reviewer output and parse verdict
-        let verdictText = "";
-        try {
-          if (fs.existsSync(reviewerOutput)) {
-            verdictText = fs.readFileSync(reviewerOutput, "utf8");
-          }
-        } catch { /* best-effort */ }
-
-        verdict = parseReviewVerdict(verdictText);
-        reviews.push({ round, action_items: verdict.action_items ?? [], lessons: verdict.lessons ?? [] });
-        try { pi.notify(`[${bdId}] R${round}: ${verdict.status}`, "info"); } catch {}
-
-        // Decision: approved→ready (merge tool marks done); blocked→stop; rework→next round
-        if (verdict.status === "approved" || verdict.status === "blocked") {
-          break;
-        }
+        feedbackText += "\nFix these issues, then re-run tests and commit again.";
       }
 
-      // 6. Update sprint state
-      // Fix #1: pass workDir — getCurrent() without it bypasses the cross-project
-      // guard AND cannot restore the sprint from disk after a pi restart, so
-      // markRework/markBlocked would silently vanish.
+      const workerTaskText = buildWorkerTask(title, description, acceptanceCriteria, constraints, patterns, deadEnds, feedbackText, chainOutputs.length > 0 ? chainOutputs : undefined);
+
+      // 4. Write the worker task file + clear the round's stale verdict file.
+      const workerTaskFile = path.join(workDir, ".agile", `delegate-${bdId}-r${round}.md`);
+      const verdictFile = path.join(workDir, ".agile", `review-${bdId}-r${round}.txt`);
+      fs.mkdirSync(path.join(workDir, ".agile"), { recursive: true });
+      fs.writeFileSync(workerTaskFile, workerTaskText, "utf8");
+      clearOutputFile(verdictFile); // B stale-file guard: record must not read an old verdict
+
+      const workerModel = getAgentModel(workDir, "worker");
+      const workerTaskRef = `.agile/delegate-${bdId}-r${round}.md`;
+      const text = `# Delegate prepared: ${bdId} (round ${round}${feedbackText ? ", rework" : ""})
+
+Worker task file: ${workerTaskRef}
+
+1. Call your subagent tool (it blocks until the worker finishes):
+   subagent({
+     agent: "worker",
+     model: "${workerModel}",
+     task: "Follow the instructions in the file ${workerTaskRef} exactly. Implement the change and commit it to the current branch (feat/${bdId}). Return a summary of the changes you made.",
+     context: "fresh",
+     cwd: "${workDir}"
+   })
+2. When the worker finishes, call agile_prepare_review({ bd_id: "${bdId}", round: ${round} }) to prepare the reviewer.`;
+
+      return { content: [{ type: "text" as const, text }], details: { bdId, round, phase: "prepare" } };
+    },
+  });
+
+  // Tool: agile_prepare_review — B-protocol: write the reviewer task file with
+  // the FRESH diff main...feat/<bdId> and return the subagent() call the agent
+  // makes to spawn the reviewer (its verdict goes to .agile/review-<bdId>-r<N>.txt).
+  pi.registerTool({
+    name: "agile_prepare_review",
+    label: "agile_prepare_review",
+    description: "B-protocol step 2: after the worker commits, prepare the reviewer — writes .agile/review-task-<bdId>-r<N>.md with the fresh diff and returns the exact subagent() call (reviewer spawns with output: .agile/review-<bdId>-r<N>.txt, outputMode: file-only). Then call agile_record_verdict.",
+    parameters: Type.Object({
+      bd_id: Type.String({ description: "bd task ID" }),
+      round: Type.Optional(Type.Number({ description: "Rework round (default 1)" })),
+      cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const workDir = (params.cwd as string) || ctx.cwd;
+      const runtime = getRuntime(ctx, runtimeStore);
+      {
+        const gate = assertAgileActive(runtime);
+        if (gate) return gate;
+      }
+      runtime.lastWorkDir = workDir;
+      const bdId = params.bd_id as string;
+      const round = typeof params.round === "number" && Number.isFinite(params.round) ? Math.max(1, Math.floor(params.round)) : 1;
+      const branch = `feat/${bdId}`;
+
+      // Read task details from bd
+      const bdOutput = await execText(pi, "bd", ["show", bdId], workDir, 10_000);
+      const parsed = parseBdShow(bdOutput);
+      const title = parsed.title && parsed.title !== `(task ${bdId})` ? parsed.title : bdId;
+      const description = parsed.description ?? "";
+      const acceptanceCriteria = parsed.acceptanceCriteria;
+
+      // Fresh diff after this round's worker work
+      const diff = await gitDiffAgainstDefault(pi, workDir, branch);
+      if (!diff.trim()) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `⚠️ No diff on feat/${bdId} (round ${round}). The worker produced no changes — re-run the worker subagent or check that it committed to the branch.`,
+          }],
+        };
+      }
+
+      const project = loadProjectConfig(workDir);
+      const meta = extractProjectMeta(project);
+      const constraints = loadConstraintsText(workDir);
+      runtime.knowledge.load(workDir);
+      const patterns = runtime.knowledge.formatPatterns();
+      const reviewerTaskText = buildReviewerTask(title, description, diff, constraints, patterns, meta.reviewDepth as "deep" | "standard", acceptanceCriteria);
+
+      const reviewerTaskFile = path.join(workDir, ".agile", `review-task-${bdId}-r${round}.md`);
+      const verdictFile = path.join(workDir, ".agile", `review-${bdId}-r${round}.txt`);
+      fs.mkdirSync(path.join(workDir, ".agile"), { recursive: true });
+      fs.writeFileSync(reviewerTaskFile, reviewerTaskText, "utf8");
+      clearOutputFile(verdictFile); // stale-verdict guard (agent may re-prepare a round)
+
+      const reviewerModel = getAgentModel(workDir, "reviewer");
+      const reviewerTaskRef = `.agile/review-task-${bdId}-r${round}.md`;
+      const verdictRef = `.agile/review-${bdId}-r${round}.txt`;
+      const text = `# Review prepared: ${bdId} (round ${round})
+
+Reviewer task file: ${reviewerTaskRef}
+Verdict output file: ${verdictRef}
+
+1. Call your subagent tool (it blocks until the reviewer finishes):
+   subagent({
+     agent: "reviewer",
+     model: "${reviewerModel}",
+     task: "Follow the instructions in the file ${reviewerTaskRef} exactly. Your final response MUST contain the verdict JSON block exactly as specified — it is saved to the output file.",
+     context: "fresh",
+     cwd: "${workDir}",
+     output: "${workDir}/${verdictRef}",
+     outputMode: "file-only"
+   })
+2. Then call agile_record_verdict({ bd_id: "${bdId}", round: ${round} }).`;
+
+      return { content: [{ type: "text" as const, text }], details: { bdId, round, phase: "prepare_review" } };
+    },
+  });
+
+  // Tool: agile_record_verdict — B-protocol step 3: read the reviewer verdict
+  // file, parse it, and apply ALL bookkeeping deterministically. No subagent is
+  // spawned here — the AGENT ran the reviewer via its own subagent tool.
+  pi.registerTool({
+    name: "agile_record_verdict",
+    label: "agile_record_verdict",
+    description: "B-protocol step 3: after the reviewer subagent finishes, read .agile/review-<bdId>-r<N>.txt, parse the verdict and apply the bookkeeping (status, review_rounds, lessons, dead-ends, observer). Returns the verdict + the next step (merge / rework round / blocked).",
+    parameters: Type.Object({
+      bd_id: Type.String({ description: "bd task ID" }),
+      round: Type.Optional(Type.Number({ description: "Rework round (default 1)" })),
+      cwd: Type.Optional(Type.String({ description: "Working directory (defaults to session cwd)" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const workDir = (params.cwd as string) || ctx.cwd;
+      const runtime = getRuntime(ctx, runtimeStore);
+      {
+        const gate = assertAgileActive(runtime);
+        if (gate) return gate;
+      }
+      runtime.lastWorkDir = workDir;
+      const bdId = params.bd_id as string;
+      const round = typeof params.round === "number" && Number.isFinite(params.round) ? Math.max(1, Math.floor(params.round)) : 1;
+
+      const verdictFile = path.join(workDir, ".agile", `review-${bdId}-r${round}.txt`);
+      let verdictText = "";
+      try {
+        if (fs.existsSync(verdictFile)) verdictText = fs.readFileSync(verdictFile, "utf8");
+      } catch { /* handled below */ }
+      if (!verdictText.trim()) {
+        const rel = verdictFile.replace(workDir + path.sep, "");
+        return {
+          content: [{
+            type: "text" as const,
+            text: `❌ No review verdict file (${rel}) for ${bdId} (round ${round}). ` +
+              `The reviewer subagent did not produce output. Re-run the reviewer subagent with output: "${rel}", outputMode: "file-only", then call agile_record_verdict again. No state was changed.`,
+          }],
+        };
+      }
+
+      const verdict = parseReviewVerdict(verdictText);
+
+      // Read task title for knowledge bookkeeping (approach field of dead_ends)
+      let title = bdId;
+      try {
+        const bdOutput = await execText(pi, "bd", ["show", bdId], workDir, 10_000);
+        const parsed = parseBdShow(bdOutput);
+        title = parsed.title && parsed.title !== `(task ${bdId})` ? parsed.title : bdId;
+      } catch { /* best-effort */ }
+
+      // Bookkeeping (identical to the former inline delegate path, docs/DELEGATION.md)
       const sprint = runtime.store.getCurrent(workDir);
       if (sprint) {
-        // Fix #4: record the REAL number of review rounds that happened here so
-        // velocity's avg_review_rounds is honest (markInReview was never called).
-        runtime.store.setReviewRounds(sprint, bdId, reviews.length);
+        runtime.store.setReviewRounds(sprint, bdId, round);
         if (verdict.status === "approved") {
-          // markInReview + markDone will be called by merge tool
+          // markInReview + markDone will be called by the merge tool
         } else if (verdict.status === "rework") {
           runtime.store.markRework(sprint, bdId);
           trackTaskTransition(runtime.observerState, bdId, "rework");
@@ -2191,14 +2229,9 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         runtime.knowledge.save(workDir);
         runtime.store.save(workDir, sprint);
 
-        // Run observer after task transition
+        // Observer after the task transition — non-terminal steers only
+        // (design A: agent_end is the single closer + terminal messenger).
         const transitionSteers = runSprintObserver(sprint, runtime.observerState, DEFAULT_OBSERVER_CONFIG, workDir);
-        // Design A: agent_end is the single closer + messenger for terminal
-        // sprints — deliver ONLY non-terminal steers (stagnation/constraint_spam/
-        // velocity_drop) mid-turn; terminal steers (all_blocked/all_tasks_exhausted)
-        // are replaced by the agent_end auto-close message, and no dedupe flag is
-        // set here anymore (the exhausted steer was previously the continuation
-        // nudge — now agent_end owns it).
         const terminalNow = sprint.tasks.every((t) => t.status === "done" || t.status === "blocked");
         if (!terminalNow) {
           for (const steer of transitionSteers) {
@@ -2209,7 +2242,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         }
       }
 
-      // 7. Format verdict for agent
+      // Format the verdict for the agent
       const dimensionLines: string[] = [];
       for (const [dim, data] of Object.entries(verdict.dimensions)) {
         if ("score" in (data as object)) {
@@ -2224,24 +2257,31 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
         ? `\n## Action Items\n${verdict.action_items.map((a, i) => `${i + 1}. ${a}`).join("\n")}`
         : "";
 
+      let nextStep = "";
+      if (verdict.status === "approved") {
+        nextStep = `\n## Next\n✅ **APPROVED** — call agile_merge_task({ bd_id: "${bdId}" }) to merge to main.`;
+      } else if (verdict.status === "blocked") {
+        nextStep = `\n## Next\n⛔ **BLOCKED** — task ${bdId} marked blocked. Do not re-delegate it.`;
+      } else if (round < 3) {
+        nextStep = `\n## Next\n🔄 **REWORK** — call agile_delegate_task({ bd_id: "${bdId}", round: ${round + 1} }) to start the next round (action items above are picked up automatically).`;
+      } else {
+        nextStep = `\n## Next\n⛔ **REWORK after 3 rounds** — task ${bdId} left in rework status. Decide manually: block it (no re-delegation) or leave it for later.`;
+      }
+
       const verdictText2 = `# Review Verdict: ${bdId}
 
 **Status:** ${verdict.status.toUpperCase()}
-**Rounds:** ${reviews.length}
+**Rounds:** ${round}
 
 ## Dimensions
-${dimensionLines.join("\n")}${actionItems}
-
-## Worker Summary
-${workerSummary.slice(0, 1000)}`;
+${dimensionLines.join("\n")}${actionItems}${nextStep}`;
 
       return {
         content: [{ type: "text" as const, text: verdictText2 }],
-        details: { verdict: verdict.status, bdId },
+        details: { verdict: verdict.status, bdId, round },
       };
     },
   });
-
   // Tool: agile_merge_task — merge approved task branch to main
   pi.registerTool({
     name: "agile_merge_task",
