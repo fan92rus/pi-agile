@@ -424,6 +424,212 @@ function cleanupStaleWorktrees(workDir: string): number {
 }
 
 /**
+ * Shared rework loop: chain agents → per round (worker → diff → reviewer →
+ * verdict), up to MAX_REWORK_ROUNDS rounds. THE single implementation used by
+ * both the batch path (delegateTaskInWorktree) and the inline single-task
+ * path (agile_delegate_task) — previously the loop was copy-pasted in both
+ * and every fix (M3 reviewer abort, Fix #14, P20 stuck) had to be applied
+ * twice.
+ *
+ * Call sites differ only in how they OBSERVE the loop (emit) and how they
+ * render its RESULT:
+ *  - batch: prefixed progress strings (parseProgressStatus depends on them),
+ *    extra "worker done, getting diff..." notify, chain-poll errors fatal,
+ *    aborts → result-object `error` field (⏱ messages)
+ *  - inline: raw tool onUpdate, no extra strings, chain-poll errors recorded
+ *    as [FAILED] and skipped, aborts → ❌/⚠️ content text
+ */
+type ReworkLoopVerdict = ReturnType<typeof parseReviewVerdict>;
+type ReworkLoopReview = { round: number; action_items: string[]; lessons: string[] };
+type ReworkLoopAbort =
+  | { code: "worker-spawn-failed"; round: number; message: string; diff: string; workerSummary: string; reviews: ReworkLoopReview[] }
+  | { code: "worker-timeout"; round: number; diff: string; workerSummary: string; reviews: ReworkLoopReview[] }
+  | { code: "no-diff"; round: number; noDiffVerdict: ReworkLoopVerdict; diff: string; workerSummary: string; reviews: ReworkLoopReview[] }
+  | { code: "reviewer-spawn-failed"; round: number; message: string; diff: string; workerSummary: string; reviews: ReworkLoopReview[] }
+  | { code: "reviewer-timeout"; round: number; diff: string; workerSummary: string; reviews: ReworkLoopReview[] };
+
+type ReworkLoopResult =
+  | { aborted: false; verdict: ReworkLoopVerdict; diff: string; workerSummary: string; reviews: ReworkLoopReview[] }
+  | { aborted: true; abort: ReworkLoopAbort };
+
+interface ReworkLoopEmit {
+  /** Prefixed progress strings for the batch progress tracker (inline: none). */
+  onProgress?: (status: string) => void;
+  /** Raw tool onUpdate — batch wraps it to prefix the bdId, inline passes it as-is. */
+  onUpdate: (msg: { content: { type: string; text: string }[] }) => void;
+  /** Batch only: extra "worker done, getting diff..." notify per round. */
+  verbose: boolean;
+  /** Inline: chain-agent poll failure → [FAILED] + continue; batch: fatal. */
+  catchChainPoll: boolean;
+}
+
+async function runWorkerReviewLoop(
+  pi: ExtensionAPI,
+  rpc: RpcClient,
+  workDir: string,
+  bdId: string,
+  meta: { title: string; description: string; acceptanceCriteria?: string },
+  constraints: string,
+  deadEnds: string,
+  patterns: string,
+  reviewDepth: "deep" | "standard",
+  spawnTimeout: number,
+  chain: string[],
+  chainOutputs: { agent: string; output: string }[],
+  emit: ReworkLoopEmit,
+): Promise<ReworkLoopResult> {
+  const branch = `feat/${bdId}`;
+  const MAX_REWORK_ROUNDS = 3;
+  const reviews: ReworkLoopReview[] = [];
+  let currentDiff = "";
+  let currentWorkerSummary = "";
+  let overallVerdict: ReworkLoopVerdict = { status: "rework", dimensions: {}, action_items: [], lessons: [] };
+
+  // 2. Run chain agents before worker (scout, researcher, planner, etc.)
+  const preWorker = chain.slice(0, chain.indexOf("worker"));
+  for (const agent of preWorker) {
+    try { pi.notify(`[${bdId}] Chain: ${agent} starting...`, "info"); } catch {}
+    emit.onProgress?.(`${bdId}: chain agent ${agent}...`);
+    const agentOutput = path.join(workDir, ".agile", `${agent}-${bdId}.txt`);
+    const agentTaskText = buildChainAgentTask(agent, meta.title, meta.description, meta.acceptanceCriteria, constraints, patterns, chainOutputs);
+    let spawned: SpawnedWorker;
+    try {
+      clearOutputFile(agentOutput);
+      spawned = await rpc.spawn({
+        agent: agent,
+        model: getAgentModel(workDir, agent),
+        task: agentTaskText,
+        cwd: workDir,
+        context: "fresh",
+        output: agentOutput,
+        outputMode: "file-only",
+      }, spawnTimeout);
+    } catch (e: unknown) {
+      chainOutputs.push({ agent, output: `[FAILED] ${e instanceof Error ? e.message : String(e)}` });
+      continue;
+    }
+    try {
+      await pollWithProgress(pi, workDir, rpc, spawned.runId, agentOutput, `${agent}-${bdId}`, emit.onUpdate);
+    } catch (e: unknown) {
+      // Inline records a chain-agent poll failure as a failed step and keeps
+      // going; the batch path lets it propagate (fatal for the task).
+      if (!emit.catchChainPoll) throw e;
+      chainOutputs.push({ agent, output: `[FAILED] ${e instanceof Error ? e.message : String(e)}` });
+      continue;
+    }
+    let output = "";
+    try { if (fs.existsSync(agentOutput)) output = fs.readFileSync(agentOutput, "utf8"); } catch {}
+    chainOutputs.push({ agent, output: output || `(${agent} completed)` });
+    try { pi.notify(`[${bdId}] Chain: ${agent} done`, "info"); } catch {}
+  }
+
+  for (let round = 1; round <= MAX_REWORK_ROUNDS; round++) {
+    try { pi.notify(`[${bdId}] Round ${round}/${MAX_REWORK_ROUNDS}`, "info"); } catch {}
+
+    const workerOutput = path.join(workDir, ".agile", `worker-${bdId}-r${round}.txt`);
+    const reviewerOutput = path.join(workDir, ".agile", `review-${bdId}-r${round}.txt`);
+
+    // Build feedback from previous review (for round > 1)
+    let feedbackText: string | undefined;
+    if (round > 1 && reviews.length > 0) {
+      const prev = reviews[reviews.length - 1];
+      feedbackText = `Round ${round - 1} review found:\n`;
+      if (prev.action_items.length > 0) {
+        feedbackText += "Action items to fix:\n";
+        prev.action_items.forEach((ai: string) => { feedbackText += `  - ${ai}\n`; });
+      }
+      feedbackText += "\nFix these issues, then re-run tests and commit again.";
+      emit.onProgress?.(`${bdId}: rework round ${round}...`);
+    }
+
+    // 3. Spawn worker (with chain context)
+    const workerTaskText = buildWorkerTask(meta.title, meta.description, meta.acceptanceCriteria, constraints, patterns, deadEnds, feedbackText, chainOutputs.length > 0 ? chainOutputs : undefined);
+    emit.onProgress?.(`${bdId} (r${round}): spawning worker...`);
+    try { pi.notify(`[${bdId}] R${round}: worker starting...`, "info"); } catch {}
+
+    let worker: SpawnedWorker;
+    try {
+      clearOutputFile(workerOutput);
+      worker = await rpc.spawn({
+        agent: "worker",
+        model: getAgentModel(workDir, "worker"),
+        task: workerTaskText,
+        cwd: workDir,
+        context: "fresh",
+        output: workerOutput,
+        outputMode: "file-only",
+      }, spawnTimeout);
+    } catch (e: unknown) {
+      return { aborted: true, abort: { code: "worker-spawn-failed", round, message: e instanceof Error ? e.message : String(e), diff: currentDiff, workerSummary: currentWorkerSummary, reviews } };
+    }
+
+    emit.onProgress?.(`${bdId} (r${round}): worker started...`);
+    try { pi.notify(`[${bdId}] R${round}: worker running...`, "info"); } catch {}
+    const workerDone = await pollWithProgress(pi, workDir, rpc, worker.runId, workerOutput, `worker-${bdId}-r${round}`, emit.onUpdate);
+    if (!workerDone) {
+      return { aborted: true, abort: { code: "worker-timeout", round, diff: currentDiff, workerSummary: currentWorkerSummary, reviews } };
+    }
+
+    try { if (fs.existsSync(workerOutput)) currentWorkerSummary = fs.readFileSync(workerOutput, "utf8"); } catch {}
+
+    // 3. Get diff
+    if (emit.verbose) { try { pi.notify(`[${bdId}] R${round}: worker done, getting diff...`, "info"); } catch {} }
+    currentDiff = await gitDiffAgainstDefault(pi, workDir, branch);
+    if (!currentDiff.trim()) {
+      // A rework round that reverts everything is a dead end (batch carries
+      // an explicit action item in the verdict; round 1 just means "no work").
+      const noDiffVerdict: ReworkLoopVerdict = round > 1
+        ? { status: "rework", dimensions: {}, action_items: ["Worker reverted all changes after rework feedback."], lessons: [] }
+        : { status: "rework", dimensions: {}, action_items: [], lessons: [] };
+      return { aborted: true, abort: { code: "no-diff", round, noDiffVerdict, diff: round > 1 ? currentDiff : "", workerSummary: currentWorkerSummary, reviews } };
+    }
+
+    // 4. Spawn reviewer
+    const reviewerTaskText = buildReviewerTask(meta.title, meta.description, currentDiff, constraints, patterns, reviewDepth, meta.acceptanceCriteria);
+    emit.onProgress?.(`${bdId} (r${round}): spawning reviewer...`);
+    try { pi.notify(`[${bdId}] R${round}: reviewer starting...`, "info"); } catch {}
+
+    let reviewer: SpawnedWorker;
+    try {
+      clearOutputFile(reviewerOutput);
+      reviewer = await rpc.spawn({
+        agent: "reviewer",
+        model: getAgentModel(workDir, "reviewer"),
+        task: reviewerTaskText,
+        cwd: workDir,
+        context: "fresh",
+        output: reviewerOutput,
+        outputMode: "file-only",
+      }, spawnTimeout);
+    } catch (e: unknown) {
+      return { aborted: true, abort: { code: "reviewer-spawn-failed", round, message: e instanceof Error ? e.message : String(e), diff: currentDiff, workerSummary: currentWorkerSummary, reviews } };
+    }
+
+    emit.onProgress?.(`${bdId} (r${round}): reviewer started...`);
+    const reviewerDone = await pollWithProgress(pi, workDir, rpc, reviewer.runId, reviewerOutput, `reviewer-${bdId}-r${round}`, emit.onUpdate);
+    if (!reviewerDone) {
+      // Fix (M3): a dead/force-stopped reviewer must abort the task instead of
+      // parsing an empty verdict → default "rework" → 2 more meaningless rounds.
+      return { aborted: true, abort: { code: "reviewer-timeout", round, diff: currentDiff, workerSummary: currentWorkerSummary, reviews } };
+    }
+
+    let verdictText = "";
+    try { if (fs.existsSync(reviewerOutput)) verdictText = fs.readFileSync(reviewerOutput, "utf8"); } catch {}
+
+    overallVerdict = parseReviewVerdict(verdictText);
+    reviews.push({ round, action_items: overallVerdict.action_items ?? [], lessons: overallVerdict.lessons ?? [] });
+    try { pi.notify(`[${bdId}] R${round}: ${overallVerdict.status}`, "info"); } catch {}
+
+    // 5. Decision: approved→ready; blocked→stop; rework→continue
+    if (overallVerdict.status === "approved" || overallVerdict.status === "blocked") {
+      break;
+    }
+  }
+
+  return { aborted: false, verdict: overallVerdict, diff: currentDiff, workerSummary: currentWorkerSummary, reviews };
+}
+
+/**
  * Full task lifecycle in a worktree directory:
  * create branch → spawn worker → poll → spawn reviewer → poll → parse verdict
  * Returns {bdId, status, verdict, diff, branch} or {bdId, status: "error", error}.
@@ -452,149 +658,45 @@ async function delegateTaskInWorktree(
   error?: string;
 }> {
   const branch = `feat/${bdId}`;
-  const MAX_REWORK_ROUNDS = 3;
-  const reviews: { round: number; action_items: string[]; lessons: string[] }[] = [];
   const chainOutputs: { agent: string; output: string }[] = [];
-  let currentDiff = "";
-  let currentWorkerSummary = "";
-  let overallVerdict: ReturnType<typeof parseReviewVerdict> = { status: "rework", dimensions: {}, action_items: [], lessons: [] };
 
   // 1. Create feature branch (assumes on main)
   await gitCreateBranch(pi, workDir, branch);
 
-  // 2. Run chain agents before worker (scout, researcher, planner, etc.)
-  const preWorker = chain.slice(0, chain.indexOf("worker"));
-  for (const agent of preWorker) {
-    try { pi.notify(`[${bdId}] Chain: ${agent} starting...`, "info"); } catch {}
-    onProgress?.(`${bdId}: chain agent ${agent}...`);
-    const agentOutput = path.join(workDir, ".agile", `${agent}-${bdId}.txt`);
-    const agentTaskText = buildChainAgentTask(agent, meta.title, meta.description, meta.acceptanceCriteria, constraints, patterns, chainOutputs);
-    let spawned: SpawnedWorker;
-    try {
-      clearOutputFile(agentOutput);
-      spawned = await rpc_.spawn({
-        agent: agent,
-        model: getAgentModel(workDir, agent),
-        task: agentTaskText,
-        cwd: workDir,
-        context: "fresh",
-        output: agentOutput,
-        outputMode: "file-only",
-      }, spawnTimeout);
-    } catch (e: unknown) {
-      chainOutputs.push({ agent, output: `[FAILED] ${e instanceof Error ? e.message : String(e)}` });
-      continue;
-    }
-    const done = await pollWithProgress(pi, workDir, rpc_, spawned.runId, agentOutput, `${agent}-${bdId}`, (s: string) => onProgress?.(`${bdId}: ${s}`));
-    let output = "";
-    try { if (fs.existsSync(agentOutput)) output = fs.readFileSync(agentOutput, "utf8"); } catch {}
-    chainOutputs.push({ agent, output: output || `(${agent} completed)` });
-    try { pi.notify(`[${bdId}] Chain: ${agent} done`, "info"); } catch {}
-  }
+  // 2-5. Chain agents + rework loop — the shared runWorkerReviewLoop (the
+  // single implementation, also used by the inline single-task path).
+  // Progress strings are prefixed with the bdId — parseProgressStatus in
+  // delegateBatchParallel depends on their exact shape.
+  const outcome = await runWorkerReviewLoop(
+    pi, rpc_, workDir, bdId, meta, constraints, deadEnds, patterns, reviewDepth, spawnTimeout, chain, chainOutputs,
+    {
+      onProgress,
+      onUpdate: (s: string) => onProgress?.(`${bdId}: ${s}`),
+      verbose: true,
+      catchChainPoll: false,
+    },
+  );
 
-  for (let round = 1; round <= MAX_REWORK_ROUNDS; round++) {
-    try { pi.notify(`[${bdId}] Round ${round}/${MAX_REWORK_ROUNDS}`, "info"); } catch {}
-
-    const workerOutput = path.join(workDir, ".agile", `worker-${bdId}-r${round}.txt`);
-    const reviewerOutput = path.join(workDir, ".agile", `review-${bdId}-r${round}.txt`);
-
-    // Build feedback from previous review (for round > 1)
-    let feedbackText: string | undefined;
-    if (round > 1 && reviews.length > 0) {
-      const prev = reviews[reviews.length - 1];
-      feedbackText = `Round ${round - 1} review found:\n`;
-      if (prev.action_items.length > 0) {
-        feedbackText += "Action items to fix:\n";
-        prev.action_items.forEach((ai: string) => { feedbackText += `  - ${ai}\n`; });
+  if (outcome.aborted) {
+    const a = outcome.abort;
+    const emptyVerdict: ReworkLoopVerdict = { status: "rework", dimensions: {}, action_items: [], lessons: [] };
+    switch (a.code) {
+      case "worker-spawn-failed":
+        return { bdId, verdict: emptyVerdict, diff: a.diff, branch, workerSummary: a.workerSummary, reviews: a.reviews, error: `⏱ Worker r${a.round} spawn failed after ${(spawnTimeout / 1000)}s: ${a.message}. Try increasing spawn_timeout in .agile/config.json or simplifying the task.` };
+      case "worker-timeout":
+        return { bdId, verdict: emptyVerdict, diff: a.diff, branch, workerSummary: a.workerSummary, reviews: a.reviews, error: `⏱ Worker r${a.round} did not complete within ${Math.round(spawnTimeout / 1000)}s. Increase spawn_timeout in .agile/config.json or split into smaller tasks.` };
+      case "no-diff":
+        return { bdId, verdict: a.noDiffVerdict, diff: a.diff, branch, workerSummary: a.workerSummary, reviews: a.reviews, error: a.round > 1 ? "no diff after rework" : "no diff produced" };
+      case "reviewer-spawn-failed":
+        return { bdId, verdict: emptyVerdict, diff: a.diff, branch, workerSummary: a.workerSummary, reviews: a.reviews, error: `⏱ Reviewer r${a.round} spawn failed after ${(spawnTimeout / 1000)}s: ${a.message}. Try increasing spawn_timeout in .agile/config.json.` };
+      case "reviewer-timeout": {
+        const reviewerOutput = path.join(workDir, ".agile", `review-${bdId}-r${a.round}.txt`);
+        return { bdId, verdict: emptyVerdict, diff: a.diff, branch, workerSummary: a.workerSummary, reviews: a.reviews, error: `⏱ Reviewer r${a.round} did not complete (stuck or failed). Check ${reviewerOutput}.` };
       }
-      feedbackText += "\nFix these issues, then re-run tests and commit again.";
-      onProgress?.(`${bdId}: rework round ${round}...`);
-    }
-
-    // 3. Spawn worker (with chain context)
-    const workerTaskText = buildWorkerTask(meta.title, meta.description, meta.acceptanceCriteria, constraints, patterns, deadEnds, feedbackText, chainOutputs.length > 0 ? chainOutputs : undefined);
-    onProgress?.(`${bdId} (r${round}): spawning worker...`);
-    try { pi.notify(`[${bdId}] R${round}: worker starting...`, "info"); } catch {}
-
-    let worker: SpawnedWorker;
-    try {
-      clearOutputFile(workerOutput);
-      worker = await rpc_.spawn({
-        agent: "worker",
-        model: getAgentModel(workDir, "worker"),
-        task: workerTaskText,
-        cwd: workDir,
-        context: "fresh",
-        output: workerOutput,
-        outputMode: "file-only",
-      }, spawnTimeout);
-    } catch (e: unknown) {
-      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `⏱ Worker r${round} spawn failed after ${(spawnTimeout / 1000)}s: ${e instanceof Error ? e.message : String(e)}. Try increasing spawn_timeout in .agile/config.json or simplifying the task.` };
-    }
-
-    onProgress?.(`${bdId} (r${round}): worker started...`);
-    try { pi.notify(`[${bdId}] R${round}: worker running...`, "info"); } catch {}
-    const workerDone = await pollWithProgress(pi, workDir, rpc_, worker.runId, workerOutput, `worker-${bdId}-r${round}`, (s: string) => onProgress?.(`${bdId}: ${s}`));
-    if (!workerDone) {
-      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `⏱ Worker r${round} did not complete within ${Math.round(spawnTimeout / 1000)}s. Increase spawn_timeout in .agile/config.json or split into smaller tasks.` };
-    }
-
-    try { if (fs.existsSync(workerOutput)) currentWorkerSummary = fs.readFileSync(workerOutput, "utf8"); } catch {}
-
-    // 3. Get diff
-    try { pi.notify(`[${bdId}] R${round}: worker done, getting diff...`, "info"); } catch {}
-    currentDiff = await gitDiffAgainstDefault(pi, workDir, branch);
-    if (!currentDiff.trim()) {
-      if (round > 1) {
-        overallVerdict = { status: "rework", dimensions: {}, action_items: ["Worker reverted all changes after rework feedback."], lessons: [] };
-        return { bdId, verdict: overallVerdict, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: "no diff after rework" };
-      }
-      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: "", branch, workerSummary: currentWorkerSummary, reviews, error: "no diff produced" };
-    }
-
-    // 4. Spawn reviewer
-    const reviewerTaskText = buildReviewerTask(meta.title, meta.description, currentDiff, constraints, patterns, reviewDepth, meta.acceptanceCriteria);
-    onProgress?.(`${bdId} (r${round}): spawning reviewer...`);
-    try { pi.notify(`[${bdId}] R${round}: reviewer starting...`, "info"); } catch {}
-
-    let reviewer: SpawnedWorker;
-    try {
-      clearOutputFile(reviewerOutput);
-      reviewer = await rpc_.spawn({
-        agent: "reviewer",
-        model: getAgentModel(workDir, "reviewer"),
-        task: reviewerTaskText,
-        cwd: workDir,
-        context: "fresh",
-        output: reviewerOutput,
-        outputMode: "file-only",
-      }, spawnTimeout);
-    } catch (e: unknown) {
-      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `⏱ Reviewer r${round} spawn failed after ${(spawnTimeout / 1000)}s: ${e instanceof Error ? e.message : String(e)}. Try increasing spawn_timeout in .agile/config.json.` };
-    }
-
-    onProgress?.(`${bdId} (r${round}): reviewer started...`);
-    const reviewerDone = await pollWithProgress(pi, workDir, rpc_, reviewer.runId, reviewerOutput, `reviewer-${bdId}-r${round}`, (s: string) => onProgress?.(`${bdId}: ${s}`));
-    if (!reviewerDone) {
-      // Fix (M3): a dead/force-stopped reviewer must abort the task instead of
-      // parsing an empty verdict → default "rework" → 2 more meaningless rounds.
-      return { bdId, verdict: { status: "rework", dimensions: {}, action_items: [], lessons: [] }, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, error: `⏱ Reviewer r${round} did not complete (stuck or failed). Check ${reviewerOutput}.` };
-    }
-
-    let verdictText = "";
-    try { if (fs.existsSync(reviewerOutput)) verdictText = fs.readFileSync(reviewerOutput, "utf8"); } catch {}
-
-    overallVerdict = parseReviewVerdict(verdictText);
-    reviews.push({ round, action_items: overallVerdict.action_items ?? [], lessons: overallVerdict.lessons ?? [] });
-    try { pi.notify(`[${bdId}] R${round}: ${overallVerdict.status}`, "info"); } catch {}
-
-    // 5. Decision: approved→ready; blocked→stop; rework→continue
-    if (overallVerdict.status === "approved" || overallVerdict.status === "blocked") {
-      break;
     }
   }
 
-  return { bdId, verdict: overallVerdict, diff: currentDiff, branch, workerSummary: currentWorkerSummary, reviews, chainOutputs };
+  return { bdId, verdict: outcome.verdict, diff: outcome.diff, branch, workerSummary: outcome.workerSummary, reviews: outcome.reviews, chainOutputs };
 }
 
 /**
@@ -1984,161 +2086,60 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       const taskChain = (params.chain as string[] | undefined) ?? chains.default ?? ["worker", "reviewer"];
       const patterns = runtime.knowledge.formatPatterns();
 
-      // 2b. Run chain agents before worker (scout, researcher, planner, etc.)
+      // 2b-5. Chain agents + rework loop — the shared runWorkerReviewLoop
+      // (single implementation, same loop as the batch path in
+      // delegateTaskInWorktree): up to 3 rounds of worker → diff → reviewer.
+      // A rework verdict feeds the review's action items back to the next
+      // worker round; approved/blocked break the loop; aborts return before
+      // the sprint-state update below (task keeps its previous status, the
+      // agent decides what to do next).
       const chainOutputs: { agent: string; output: string }[] = [];
-      const preWorker = taskChain.slice(0, taskChain.indexOf("worker"));
-        for (const agent of preWorker) {
-        try { pi.notify(`[${bdId}] Chain: ${agent} starting...`, "info"); } catch {}
-        const agentOutput = path.join(workDir, ".agile", `${agent}-${bdId}.txt`);
-        const agentTaskText = buildChainAgentTask(agent, title, description, acceptanceCriteria, constraints, patterns, chainOutputs);
-        try {
-          clearOutputFile(agentOutput);
-          const spawned = await rpc.spawn({
-            agent, model: getAgentModel(workDir, agent),
-            task: agentTaskText, cwd: workDir, context: "fresh",
-            output: agentOutput, outputMode: "file-only",
-          }, getSpawnTimeout(workDir));
-          await pollWithProgress(pi, workDir, rpc, spawned.runId, agentOutput, `${agent}-${bdId}`, onUpdate);
-        } catch (e: unknown) {
-          chainOutputs.push({ agent, output: `[FAILED] ${e instanceof Error ? e.message : String(e)}` });
-          continue;
-        }
-        let output = "";
-        try { if (fs.existsSync(agentOutput)) output = fs.readFileSync(agentOutput, "utf8"); } catch {}
-        chainOutputs.push({ agent, output: output || `(${agent} completed)` });
-        try { pi.notify(`[${bdId}] Chain: ${agent} done`, "info"); } catch {}
-      }
+      const outcome = await runWorkerReviewLoop(
+        pi, rpc, workDir, bdId,
+        { title, description, acceptanceCriteria },
+        constraints, deadEnds, patterns,
+        meta.reviewDepth as "deep" | "standard",
+        getSpawnTimeout(workDir),
+        taskChain, chainOutputs,
+        { onUpdate, verbose: false, catchChainPoll: true },
+      );
 
-      // 3-5. Rework loop — UNIFIED with the batch path (delegateTaskInWorktree):
-      // up to MAX_REWORK_ROUNDS rounds of worker → diff → reviewer. A rework
-      // verdict feeds the review's action items back to the next worker round;
-      // approved/blocked break the loop; errors abort with no state change
-      // (task keeps its previous status, the agent decides what to do next).
-      const MAX_REWORK_ROUNDS = 3;
-      const reviews: { round: number; action_items: string[]; lessons: string[] }[] = [];
-      let verdict: ReturnType<typeof parseReviewVerdict> = { status: "rework", dimensions: {}, action_items: [], lessons: [] };
-      let workerSummary = "";
-
-      for (let round = 1; round <= MAX_REWORK_ROUNDS; round++) {
-        try { pi.notify(`[${bdId}] Round ${round}/${MAX_REWORK_ROUNDS}`, "info"); } catch {}
-
-        const workerOutput = path.join(workDir, ".agile", `worker-${bdId}-r${round}.txt`);
-        const reviewerOutput = path.join(workDir, ".agile", `review-${bdId}-r${round}.txt`);
-
-        // Feedback from the previous review (round > 1)
-        let feedbackText: string | undefined;
-        if (round > 1 && reviews.length > 0) {
-          const prev = reviews[reviews.length - 1];
-          feedbackText = `Round ${round - 1} review found:\n`;
-          if (prev.action_items.length > 0) {
-            feedbackText += "Action items to fix:\n";
-            prev.action_items.forEach((ai: string) => { feedbackText += `  - ${ai}\n`; });
-          }
-          feedbackText += "\nFix these issues, then re-run tests and commit again.";
-        }
-
-        const workerTaskText = buildWorkerTask(title, description, acceptanceCriteria, constraints, patterns, deadEnds, feedbackText, chainOutputs.length > 0 ? chainOutputs : undefined);
-
-        let worker: SpawnedWorker;
-        try {
-          clearOutputFile(workerOutput);
-          worker = await rpc.spawn({
-            agent: "worker",
-            model: getAgentModel(workDir, "worker"),
-            task: workerTaskText,
-            cwd: workDir,
-            context: "fresh",
-            output: workerOutput,
-            outputMode: "file-only",
-          }, getSpawnTimeout(workDir));
-        } catch (e: unknown) {
-          return {
-            content: [{ type: "text" as const, text: `❌ Failed to spawn worker (r${round}): ${e instanceof Error ? e.message : String(e)}` }],
-          };
-        }
-
-        // Poll for worker completion with progress updates
-        const workerDone = await pollWithProgress(pi, workDir, rpc, worker.runId, workerOutput, `worker-${bdId}-r${round}`, onUpdate);
-        if (!workerDone) {
-          return {
-            content: [{ type: "text" as const, text: `❌ Worker task ${bdId} (r${round}) did not complete within timeout. Check worker output: ${workerOutput}` }],
-          };
-        }
-
-        // Read worker output
-        try {
-          if (fs.existsSync(workerOutput)) {
-            workerSummary = fs.readFileSync(workerOutput, "utf8");
-          }
-        } catch { /* best-effort */ }
-
-        // 4. Get diff after this round's work
-        const diff = await gitDiffAgainstDefault(pi, workDir, branch);
-
-        if (!diff.trim()) {
-          if (round > 1) {
-            // Same as batch: a rework round that reverts everything is a dead end.
+      if (outcome.aborted) {
+        const a = outcome.abort;
+        const workerOutput = path.join(workDir, ".agile", `worker-${bdId}-r${a.round}.txt`);
+        const reviewerOutput = path.join(workDir, ".agile", `review-${bdId}-r${a.round}.txt`);
+        switch (a.code) {
+          case "worker-spawn-failed":
+            return {
+              content: [{ type: "text" as const, text: `❌ Failed to spawn worker (r${a.round}): ${a.message}` }],
+            };
+          case "worker-timeout":
+            return {
+              content: [{ type: "text" as const, text: `❌ Worker task ${bdId} (r${a.round}) did not complete within timeout. Check worker output: ${workerOutput}` }],
+            };
+          case "no-diff":
             return {
               content: [{
                 type: "text" as const,
-                text: `⚠️ Worker reverted all changes after rework feedback (r${round}) for task ${bdId}. The worker may have failed or made no changes. Worker summary: ${workerSummary.slice(0, 500)}`,
+                text: a.round > 1
+                  ? `⚠️ Worker reverted all changes after rework feedback (r${a.round}) for task ${bdId}. The worker may have failed or made no changes. Worker summary: ${a.workerSummary.slice(0, 500)}`
+                  : `⚠️ Worker produced no diff for task ${bdId}. The worker may have failed or made no changes. Worker summary: ${a.workerSummary.slice(0, 500)}`,
               }],
             };
-          }
-          return {
-            content: [{
-              type: "text" as const,
-              text: `⚠️ Worker produced no diff for task ${bdId}. The worker may have failed or made no changes. Worker summary: ${workerSummary.slice(0, 500)}`,
-            }],
-          };
-        }
-
-        // 5. Delegate reviewer via RPC
-        const reviewerTaskText = buildReviewerTask(title, description, diff, constraints, patterns, meta.reviewDepth as "deep" | "standard", acceptanceCriteria);
-
-        let reviewer: SpawnedWorker;
-        try {
-          clearOutputFile(reviewerOutput);
-          reviewer = await rpc.spawn({
-            agent: "reviewer",
-            model: getAgentModel(workDir, "reviewer"),
-            task: reviewerTaskText,
-            cwd: workDir,
-            context: "fresh",
-            output: reviewerOutput,
-            outputMode: "file-only",
-          }, getSpawnTimeout(workDir));
-        } catch (e: unknown) {
-          return {
-            content: [{ type: "text" as const, text: `❌ Failed to spawn reviewer (r${round}): ${e instanceof Error ? e.message : String(e)}` }],
-          };
-        }
-
-        // Poll for reviewer completion with progress updates
-        const reviewerDone = await pollWithProgress(pi, workDir, rpc, reviewer.runId, reviewerOutput, `reviewer-${bdId}-r${round}`, onUpdate);
-        if (!reviewerDone) {
-          return {
-            content: [{ type: "text" as const, text: `❌ Reviewer for ${bdId} (r${round}) did not complete within timeout. Check output: ${reviewerOutput}.` }],
-          };
-        }
-
-        // Read reviewer output and parse verdict
-        let verdictText = "";
-        try {
-          if (fs.existsSync(reviewerOutput)) {
-            verdictText = fs.readFileSync(reviewerOutput, "utf8");
-          }
-        } catch { /* best-effort */ }
-
-        verdict = parseReviewVerdict(verdictText);
-        reviews.push({ round, action_items: verdict.action_items ?? [], lessons: verdict.lessons ?? [] });
-        try { pi.notify(`[${bdId}] R${round}: ${verdict.status}`, "info"); } catch {}
-
-        // Decision: approved→ready (merge tool marks done); blocked→stop; rework→next round
-        if (verdict.status === "approved" || verdict.status === "blocked") {
-          break;
+          case "reviewer-spawn-failed":
+            return {
+              content: [{ type: "text" as const, text: `❌ Failed to spawn reviewer (r${a.round}): ${a.message}` }],
+            };
+          case "reviewer-timeout":
+            return {
+              content: [{ type: "text" as const, text: `❌ Reviewer for ${bdId} (r${a.round}) did not complete within timeout. Check output: ${reviewerOutput}.` }],
+            };
         }
       }
+
+      const verdict = outcome.verdict;
+      const reviews = outcome.reviews;
+      const workerSummary = outcome.workerSummary;
 
       // 6. Update sprint state
       // Fix #1: pass workDir — getCurrent() without it bypasses the cross-project
