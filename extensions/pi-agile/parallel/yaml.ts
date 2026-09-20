@@ -38,10 +38,10 @@ export function parseSimpleYaml(text: string): Record<string, unknown> {
       if (indent < minIndent) break;
       if (content.startsWith("- ")) break; // list inside a block without a key — malformed; stop
 
-      const colonIdx = content.indexOf(":");
-      if (colonIdx === -1) { pos++; continue; }
-      const key = content.slice(0, colonIdx).trim();
-      const valueStr = content.slice(colonIdx + 1).trim();
+      const split = splitKeyContent(content);
+      if (split === null) { pos++; continue; }
+      const key = split.key;
+      const valueStr = split.value;
       pos++;
 
       if (valueStr === "") {
@@ -79,11 +79,20 @@ export function parseSimpleYaml(text: string): Record<string, unknown> {
           continue;
         }
 
-        const colonIdx = itemText.indexOf(":");
-        if (colonIdx !== -1) {
+        // Fully-quoted scalar: strip quotes and be done — a colon inside the
+        // quotes ("- \"a: b\"") must not start a map item.
+        if (itemText.length >= 2 &&
+            ((itemText.startsWith('"') && itemText.endsWith('"')) ||
+             (itemText.startsWith("'") && itemText.endsWith("'")))) {
+          list.push(parseYamlValue(itemText));
+          continue;
+        }
+
+        const split = splitKeyContent(itemText);
+        if (split) {
           // map item: "- key: value" (continuation keys on deeper lines)
-          const key = itemText.slice(0, colonIdx).trim();
-          const vStr = itemText.slice(colonIdx + 1).trim();
+          const key = split.key;
+          const vStr = split.value;
           const item: Record<string, unknown> = {};
           if (vStr === "") {
             if (pos < lines.length && lines[pos].indent > indent) {
@@ -127,6 +136,31 @@ export function parseSimpleYaml(text: string): Record<string, unknown> {
   return parseBlock(-1);
 }
 
+/**
+ * Split a "key: value" line into { key, value }, or null when there is no key.
+ *
+ * Quoted key: when the first character is a quote, find the matching closing
+ * quote and take the first ':' AFTER it; the key is then parsed (quotes
+ * stripped) — so `"a: b": v` → key `a: b`, value `v`. A quoted key with no
+ * colon after the closing quote is not a key line (null).
+ * Unquoted: plain first-colon behavior, as before.
+ */
+function splitKeyContent(content: string): { key: string; value: string } | null {
+  if (content.startsWith('"') || content.startsWith("'")) {
+    const quote = content[0];
+    const close = content.indexOf(quote, 1);
+    if (close !== -1) {
+      const colonIdx = content.indexOf(":", close + 1);
+      if (colonIdx === -1) return null;
+      const key = String(parseYamlValue(content.slice(0, close + 1).trim()));
+      return { key, value: content.slice(colonIdx + 1).trim() };
+    }
+  }
+  const colonIdx = content.indexOf(":");
+  if (colonIdx === -1) return null;
+  return { key: content.slice(0, colonIdx).trim(), value: content.slice(colonIdx + 1).trim() };
+}
+
 export function parseYamlValue(s: string): unknown {
   const t = s.trim();
   if (t.startsWith('"') && t.endsWith('"')) return t.slice(1, -1);
@@ -136,5 +170,40 @@ export function parseYamlValue(s: string): unknown {
   if (t === "null" || t === "~") return null;
   if (/^-?\d+$/.test(t)) return parseInt(t, 10);
   if (/^-?\d+\.\d+$/.test(t)) return parseFloat(t);
+  if (t.length >= 2 && t.startsWith("[") && t.endsWith("]")) {
+    // Flow sequence: "[a, b]" → ["a", "b"]. Split on top-level commas while
+    // tracking quote state and bracket depth, so a comma inside quotes
+    // ("a, b") or inside a nested sequence does not split; each part is
+    // trimmed and parsed recursively (quotes/booleans/numbers re-applied).
+    const inner = t.slice(1, -1).trim();
+    if (inner === "") return [];
+    const parts: string[] = [];
+    let depth = 0;
+    let quote: string | null = null;
+    let cur = "";
+    for (let i = 0; i < inner.length; i++) {
+      const ch = inner[i];
+      if (quote) {
+        cur += ch;
+        if (ch === quote) quote = null;
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+        cur += ch;
+      } else if (ch === "[") {
+        depth++;
+        cur += ch;
+      } else if (ch === "]") {
+        depth = Math.max(0, depth - 1);
+        cur += ch;
+      } else if (ch === "," && depth === 0) {
+        parts.push(cur);
+        cur = "";
+      } else {
+        cur += ch;
+      }
+    }
+    parts.push(cur);
+    return parts.map((p) => parseYamlValue(p.trim()));
+  }
   return t;
 }

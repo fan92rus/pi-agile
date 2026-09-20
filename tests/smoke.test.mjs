@@ -337,6 +337,36 @@ await test("YAML: array of maps (stop_when.conditions)", () => {
   assert.strictEqual(r.stop_when.mode, "any_of");
 });
 
+// Bug: quoted list item with a colon inside quotes must stay a scalar, not a map.
+await test("YAML: quoted list item with colon inside quotes stays a string", () => {
+  const r = parseSimpleYaml("items:\n  - \"a: b\"\n  - plain");
+  assert.deepStrictEqual(r, { items: ["a: b", "plain"] });
+});
+
+// Bug: inline flow sequence [x, y] must parse to an array, not a string.
+await test("YAML: inline flow sequence [x, y] parses to array", () => {
+  const r = parseSimpleYaml("pair: [x, y]");
+  assert.deepStrictEqual(r, { pair: ["x", "y"] });
+});
+
+// Edge: quoted map key with a colon inside quotes.
+await test("YAML: quoted map key with colon keeps full key", () => {
+  const r = parseSimpleYaml("\"a: b\": v");
+  assert.deepStrictEqual(r, { "a: b": "v" });
+});
+
+// Edge: empty flow sequence.
+await test("YAML: empty flow sequence []", () => {
+  const r = parseSimpleYaml("empty: []");
+  assert.deepStrictEqual(r, { empty: [] });
+});
+
+// Edge: comma inside a quoted element of a flow sequence.
+await test("YAML: comma inside quoted flow-sequence element", () => {
+  const r = parseSimpleYaml("seq: [a, \"b c\"]");
+  assert.deepStrictEqual(r, { seq: ["a", "b c"] });
+});
+
 // ── git.ts: default branch + branch checkout helpers ────────────
 console.log("\n## parallel/git.ts");
 
