@@ -123,7 +123,8 @@ class RealSystem {
       gitState: this.gitState,
       execTable: this.execTable,
       realGit: this.realGit,
-      bridge: createFakeBridge({
+      extraExec: opts.extraExec,
+      bridge: opts.bridge ?? createFakeBridge({
         bridgeState: this.bridgeState,
         verdictFor: (bdId) => this.batchVerdicts.get(bdId) ?? this.pendingVerdict,
         commitWorkerChange: opts.commitWorkerChange ?? false,
@@ -814,6 +815,163 @@ async function runScenarioRealGit(rng, seed, maxActions) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// P24: failure observability — core git/RPC cleanup failures must surface as
+// actionable warnings (operation + reason + worktree), never silently
+// swallowed. Best-effort semantics preserved: no new throws, flow unchanged.
+// ──────────────────────────────────────────────────────────────────────
+
+async function runFailureObservability(_rng, seed, _maxActions) {
+  const newDir = (tag) => fs.mkdtempSync(path.join(os.tmpdir(), `pbt-p24-${tag}-${seed}-`));
+  const dirs = [];
+  const rmDir = (d) => { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} };
+  try {
+    // (a) batch: `git worktree remove` fails in the ALWAYS-run cleanup → one
+    // actionable warning per worktree; the batch itself still succeeds.
+    {
+      const dir = newDir("a");
+      dirs.push(dir);
+      const sys = new RealSystem(dir, seed, mulberry32(seed), {
+        extraExec: (cmd, args) => {
+          // pi.exec resolves with a result on non-zero exit; only a THROW
+          // reaches the extension's try/catch — simulate that.
+          if (cmd === "git" && args[0] === "worktree" && args[1] === "remove") {
+            throw new Error("simulated: worktree remove denied");
+          }
+          return undefined;
+        },
+      });
+      await sys.agileOn();
+      sys.bdTasks.set("t1", "Task t1");
+      sys.bdTasks.set("t2", "Task t2");
+      await sys.tool("agile_start_sprint").execute("t", { task_ids: ["t1", "t2"] }, null, null, sys.ctx);
+      sys.batchVerdicts.set("t1", "blocked");
+      sys.batchVerdicts.set("t2", "blocked");
+      const res = await sys.tool("agile_delegate_task").execute("t", { bd_ids: ["t1", "t2"] }, null, null, sys.ctx);
+      const text = res.content?.[0]?.text ?? "";
+      assert.ok(
+        !text.startsWith("❌ Batch delegation failed"),
+        `P24: worktree-remove failure must not fail the batch (got: ${text.slice(0, 120)})`,
+      );
+      const notes = sys.pi.notifications.map((n) => n.text);
+      for (const id of ["t1", "t2"]) {
+        assert.ok(
+          notes.some((t) => new RegExp(`worktree remove failed for .*${id}\\b`).test(t) && t.includes("simulated: worktree remove denied")),
+          `P24: missing actionable 'worktree remove failed' warning for ${id} | notes: ${notes.join(" || ").slice(0, 400)}`,
+        );
+      }
+    }
+
+    // (b) batch: `git worktree add` fails mid-creation → original error surfaces
+    // AND the already-created worktree gets a cleanup warning.
+    {
+      const dir = newDir("b");
+      dirs.push(dir);
+      let addCount = 0;
+      const sys = new RealSystem(dir, seed, mulberry32(seed + 1), {
+        extraExec: (cmd, args) => {
+          if (cmd !== "git" || args[0] !== "worktree") return undefined;
+          if (args[1] === "add") {
+            addCount++;
+            return addCount >= 2
+              ? { code: 1, stdout: "", stderr: "simulated: worktree add denied" }
+              : { code: 0, stdout: "", stderr: "" };
+          }
+          if (args[1] === "remove") throw new Error("simulated: worktree remove denied");
+          return undefined;
+        },
+      });
+      await sys.agileOn();
+      sys.bdTasks.set("t1", "Task t1");
+      sys.bdTasks.set("t2", "Task t2");
+      await sys.tool("agile_start_sprint").execute("t", { task_ids: ["t1", "t2"] }, null, null, sys.ctx);
+      const res = await sys.tool("agile_delegate_task").execute("t", { bd_ids: ["t1", "t2"] }, null, null, sys.ctx);
+      const text = res.content?.[0]?.text ?? "";
+      assert.ok(
+        text.includes("Batch delegation failed") && text.includes("worktree add failed for feat/t2") && text.includes("simulated: worktree add denied"),
+        `P24: worktree-add failure must surface with the reason (got: ${text.slice(0, 160)})`,
+      );
+      const notes = sys.pi.notifications.map((n) => n.text);
+      assert.ok(
+        notes.some((t) => new RegExp("worktree remove failed for .*t1\\b").test(t) && t.includes("simulated: worktree remove denied")),
+        `P24: missing 'worktree remove failed' warning on creation-failure cleanup | notes: ${notes.join(" || ").slice(0, 400)}`,
+      );
+    }
+
+    // (c) single-task merge: conflict + `git merge --abort` fails → actionable
+    // warning, and the standard conflict guidance is returned (flow unchanged).
+    {
+      const dir = newDir("c");
+      dirs.push(dir);
+      const sys = new RealSystem(dir, seed, mulberry32(seed + 2), {
+        extraExec: (cmd, args) => {
+          if (cmd === "git" && args[0] === "merge" && args[1] === "--abort") {
+            throw new Error("simulated: merge --abort denied");
+          }
+          return undefined;
+        },
+      });
+      await sys.agileOn();
+      sys.bdTasks.set("t1", "Task t1");
+      sys.execTable["git merge --squash FETCH_HEAD"] = {
+        code: 1,
+        stdout: "",
+        stderr: "CONFLICT (content): Merge conflict in src/app.ts\n",
+      };
+      const wtDir = path.join(path.dirname(dir), `${path.basename(dir)}-t1`);
+      const res = await sys.tool("agile_merge_task").execute("t", { bd_id: "t1", from_worktree_dir: wtDir }, null, null, sys.ctx);
+      const text = res.content?.[0]?.text ?? "";
+      assert.ok(
+        text.includes("Merge conflict in t1") && text.includes("To resolve"),
+        `P24: conflict guidance must be unchanged (got: ${text.slice(0, 160)})`,
+      );
+      const notes = sys.pi.notifications.map((n) => n.text);
+      assert.ok(
+        notes.some((t) => /merge --abort failed for t1\b/.test(t) && t.includes("simulated: merge --abort denied")),
+        `P24: missing actionable 'merge --abort failed' warning | notes: ${notes.join(" || ").slice(0, 400)}`,
+      );
+    }
+
+    // (d) stuck worker: rpc.interrupt / rpc.stop fail → actionable warnings, and
+    // the delegate still fails explicitly (P20 semantics preserved).
+    {
+      const dir = newDir("d");
+      dirs.push(dir);
+      const bridgeState = { dead: false, stuck: false };
+      const inner = createFakeBridge({ bridgeState, verdictFor: () => "blocked" });
+      const bridge = (events) => (req) => {
+        if (req.method === "interrupt" || req.method === "stop") {
+          bridgeState.stuck = false; // interrupt leaves the run terminal (like the real fake)
+          throw new Error("simulated: rpc bridge down");
+        }
+        return inner(events)(req);
+      };
+      const sys = new RealSystem(dir, seed, mulberry32(seed + 3), { bridge });
+      await sys.agileOn();
+      sys.bdTasks.set("t1", "Task t1");
+      await sys.tool("agile_start_sprint").execute("t", { task_ids: ["t1"] }, null, null, sys.ctx);
+      bridgeState.stuck = true;
+      const res = await sys.tool("agile_delegate_task").execute("t", { bd_id: "t1", title: "Task t1", description: "desc t1" }, null, null, sys.ctx);
+      const text = res.content?.[0]?.text ?? "";
+      assert.ok(
+        /did not complete|force-stopped/i.test(text),
+        `P24: stuck worker must fail the delegate explicitly (got: ${text.slice(0, 120)})`,
+      );
+      const notes = sys.pi.notifications.map((n) => n.text);
+      assert.ok(
+        notes.some((t) => /rpc\.interrupt failed/.test(t) && t.includes("simulated: rpc bridge down")),
+        `P24: missing actionable 'rpc.interrupt failed' warning | notes: ${notes.join(" || ").slice(0, 400)}`,
+      );
+      assert.ok(
+        notes.some((t) => /rpc\.stop failed/.test(t) && t.includes("simulated: rpc bridge down")),
+        `P24: missing actionable 'rpc.stop failed' warning | notes: ${notes.join(" || ").slice(0, 400)}`,
+      );
+    }
+  } finally {
+    for (const d of dirs) rmDir(d);
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Pure properties (unchanged — real modules, random inputs)
 // ──────────────────────────────────────────────────────────────────────
 
@@ -935,6 +1093,9 @@ await forAll({ name: "real extension lifecycle", run: runScenario });
 
 console.log("## state machine: REAL git repository (checkout/diff/merge/worktree/branch -D)");
 await forAll({ seeds: 10, maxActions: 20, name: "real git integration lifecycle", run: runScenarioRealGit });
+
+console.log("## failure observability: swallowed git/RPC cleanup failures surface as actionable warnings");
+await forAll({ seeds: 1, maxActions: 1, name: "git/RPC cleanup failures surface warnings (P24)", run: runFailureObservability });
 
 console.log("## pure: continuation gate implication");
 await forAll({ seeds: 20, maxActions: 1, name: "gate fires only when all guards clear", run: (rng) => pureContinuationGate(rng) });

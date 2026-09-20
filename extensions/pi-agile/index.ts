@@ -393,7 +393,7 @@ function hasRecentAgileActivity(wtPath: string, now: number): boolean {
  *      — a live worker is writing reports there.
  * Both conditions together mean "definitely dead" before anything is removed.
  */
-function cleanupStaleWorktrees(workDir: string): number {
+function cleanupStaleWorktrees(pi: ExtensionAPI, workDir: string): number {
   let removed = 0;
   try {
     const listPath = path.join(workDir, ".git", "worktrees");
@@ -417,7 +417,11 @@ function cleanupStaleWorktrees(workDir: string): number {
         fs.rmSync(wtGitDir, { recursive: true, force: true });
         fs.rmSync(wtPath, { recursive: true, force: true });
         removed++;
-      } catch {}
+      } catch (e) {
+        try {
+          pi.notify(`⚠️ Stale worktree cleanup failed for ${wtPath}: ${e instanceof Error ? e.message : String(e)}. Remove it manually: git worktree remove --force "${wtPath}" && rm -rf "${wtPath}"`, "info");
+        } catch {}
+      }
     }
   } catch {}
   return removed;
@@ -803,8 +807,12 @@ async function delegateBatchParallel(
     }
   } catch (e: unknown) {
     for (const wt of worktrees) {
-      try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
-      try { fs.rmSync(wt, { recursive: true, force: true }); } catch {}
+      try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: mainWorkDir, timeout: 10_000 }); } catch (ce) {
+        try { pi.notify(`⚠️ worktree remove failed for ${wt}: ${ce instanceof Error ? ce.message : String(ce)}. Remove it manually: git worktree remove --force "${wt}"`, "info"); } catch {}
+      }
+      try { fs.rmSync(wt, { recursive: true, force: true }); } catch (ce) {
+        try { pi.notify(`⚠️ worktree dir ${wt} not deleted: ${ce instanceof Error ? ce.message : String(ce)}. Remove it manually: rm -rf "${wt}"`, "info"); } catch {}
+      }
     }
     throw e;
   }
@@ -833,7 +841,9 @@ async function delegateBatchParallel(
         if (mergeResult) {
           const isConflict = mergeResult.includes("CONFLICT");
           if (isConflict) {
-            try { await pi.exec("git", ["merge", "--abort"], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
+            try { await pi.exec("git", ["merge", "--abort"], { cwd: mainWorkDir, timeout: 10_000 }); } catch (ce) {
+              try { pi.notify(`⚠️ merge --abort failed for ${r.bdId} (worktree ${worktrees[i]}): ${ce instanceof Error ? ce.message : String(ce)}. Resolve the conflicted merge manually.`, "info"); } catch {}
+            }
             (r as any).conflict = {
               files: extractConflictedFiles(mergeResult),
               worktreeDir: worktrees[i],
@@ -861,8 +871,12 @@ async function delegateBatchParallel(
     for (let i = 0; i < worktrees.length; i++) {
       const wt = worktrees[i];
       if (conflictedDirs.has(wt)) continue;
-      try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: mainWorkDir, timeout: 10_000 }); } catch {}
-      try { fs.rmSync(wt, { recursive: true, force: true }); } catch {}
+      try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: mainWorkDir, timeout: 10_000 }); } catch (ce) {
+        try { pi.notify(`⚠️ worktree remove failed for ${wt}: ${ce instanceof Error ? ce.message : String(ce)}. Remove it manually: git worktree remove --force "${wt}"`, "info"); } catch {}
+      }
+      try { fs.rmSync(wt, { recursive: true, force: true }); } catch (ce) {
+        try { pi.notify(`⚠️ worktree dir ${wt} not deleted: ${ce instanceof Error ? ce.message : String(ce)}. Remove it manually: rm -rf "${wt}"`, "info"); } catch {}
+      }
       // Fix #2 (H1): delete the feat/<bdId> branch AFTER the worktree is gone
       // (git refuses to delete a branch checked out in a worktree). A leftover
       // branch made a later re-delegation fail "branch already exists" and the
@@ -1146,7 +1160,9 @@ async function pollWithProgress(
       const idleMs = Date.now() - status.lastActivityAt;
       if (idleMs > stuckTimeoutMs) {
         onUpdate?.({ content: [{ type: "text", text: `⏱ ${role} idle for ${Math.round(idleMs / 60000)}m (> ${Math.round(stuckTimeoutMs / 60000)}m) — interrupting stuck worker` }] });
-        try { await rpc.interrupt(runId, 5000); } catch {}
+        try { await rpc.interrupt(runId, 5000); } catch (e) {
+          try { pi.notify(`⚠️ rpc.interrupt failed for stuck ${role} run ${runId}: ${e instanceof Error ? e.message : String(e)}`, "info"); } catch {}
+        }
         // Give it a moment to finish the current turn after interrupt — check
         // status FIRST, sleep only while the run is still not terminal (an
         // immediate stop returns instantly instead of wasting 5s).
@@ -1156,7 +1172,9 @@ async function pollWithProgress(
           if (fs.existsSync(outputFile)) break;
           await new Promise((r) => setTimeout(r, 5000));
         }
-        try { await rpc.stop(runId, 5000); } catch {}
+        try { await rpc.stop(runId, 5000); } catch (e) {
+          try { pi.notify(`⚠️ rpc.stop failed for stuck ${role} run ${runId}: ${e instanceof Error ? e.message : String(e)}`, "info"); } catch {}
+        }
         onUpdate?.({ content: [{ type: "text", text: `⏱ ${role} force-stopped after ${Math.round(idleMs / 60000)}m of inactivity. Check task description / bd database.` }] });
         return false;
       }
@@ -1577,7 +1595,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
       const config = loadAgileConfig(ctx.cwd);
       if (config.agile_mode === true) {
         runtime.agileMode = true;
-        cleanupStaleWorktrees(ctx.cwd);
+        cleanupStaleWorktrees(pi, ctx.cwd);
       }
     }
     if (!runtime.agileMode) return;
@@ -1690,7 +1708,7 @@ export default function piAgileExtension(pi: ExtensionAPI): void {
 
       // 1. Enable agile mode ourselves — the whole point: no human to type /agile on.
       setAgileMode(ctx, true, workDir);
-      const cleaned = cleanupStaleWorktrees(workDir);
+      const cleaned = cleanupStaleWorktrees(pi, workDir);
 
       // 2. Session state: bounded (max_sprints) or continuous until conditions met.
       const maxSprints = maxSprintsRaw !== undefined && maxSprintsRaw > 0 ? maxSprintsRaw : undefined;
@@ -2287,7 +2305,9 @@ ${workerSummary.slice(0, 1000)}`;
       if (mergeResult) {
         const isConflict = mergeResult.includes("CONFLICT");
         if (isConflict) {
-          try { await pi.exec("git", ["merge", "--abort"], { cwd: workDir, timeout: 10_000 }); } catch {}
+          try { await pi.exec("git", ["merge", "--abort"], { cwd: workDir, timeout: 10_000 }); } catch (ce) {
+            try { pi.notify(`⚠️ merge --abort failed for ${bdId} (workdir ${workDir}): ${ce instanceof Error ? ce.message : String(ce)}. Resolve the conflicted merge manually.`, "info"); } catch {}
+          }
           const wtHint = fromWorktreeDir || usedWorktree || path.join(path.dirname(workDir), `${path.basename(workDir)}-${bdId}`);
           return {
             content: [{ type: "text" as const, text: `🔀 Merge conflict in ${bdId}. Worktree kept at:\n  ${wtHint}\n\nTo resolve:\n1. \`cd ${wtHint}\`\n2. \`git fetch origin main && git rebase origin/main\`\n3. Fix conflicts, \`git add <files> && git rebase --continue\`\n4. Run \`agile_merge_task({ bd_id: "${bdId}", from_worktree_dir: "${wtHint}" })\`` }],
@@ -2307,8 +2327,12 @@ ${workerSummary.slice(0, 1000)}`;
         wtDirs.push(knownWt);
       }
       for (const wt of wtDirs) {
-        try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: workDir, timeout: 10_000 }); } catch (e) {}
-        try { fs.rmSync(wt, { recursive: true, force: true }); } catch (e) {}
+        try { await pi.exec("git", ["worktree", "remove", "--force", wt], { cwd: workDir, timeout: 10_000 }); } catch (e) {
+          try { pi.notify(`⚠️ worktree remove failed for ${wt}: ${e instanceof Error ? e.message : String(e)}. Remove it manually: git worktree remove --force "${wt}"`, "info"); } catch {}
+        }
+        try { fs.rmSync(wt, { recursive: true, force: true }); } catch (e) {
+          try { pi.notify(`⚠️ worktree dir ${wt} not deleted: ${e instanceof Error ? e.message : String(e)}. Remove it manually: rm -rf "${wt}"`, "info"); } catch {}
+        }
       }
 
       // Run main checks (test, optionally lint)
@@ -2862,7 +2886,7 @@ Do NOT proceed to task creation until agile_discover returns meaningful results.
         // otherwise loopStopped stays true and agent_end never nudges again.
         runtime.loopStopped = false;
         persistSessionState(workDir, runtime);
-        const cleaned = cleanupStaleWorktrees(workDir);
+        const cleaned = cleanupStaleWorktrees(pi, workDir);
         ctx.ui.notify("✅ Agile mode ON — tools and system prompt active" + (cleaned > 0 ? ` Cleaned ${cleaned} stale worktree(s).` : ""), "info");
         return;
       }
