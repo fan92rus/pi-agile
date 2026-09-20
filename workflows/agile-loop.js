@@ -19,6 +19,9 @@
 //   mergePolicy    ('confirm'|'auto', default 'confirm') caller confirms merges
 //   branchPrefix   (string, default 'agile/') feature-branch prefix
 //   journalDir     (string, default '.agile-js') on-disk sprint journal
+//   agentWork      (string, default 'worker') agent for work/rework children;
+//                  set to a relay agent (e.g. 'ledger-worker' with subagent tool)
+//                  to run each task through the ledger-solve ceremony engine
 //   model          (op string) override for every child
 const description = String(args.description || "");
 const testCommand = String(args.testCommand || "");
@@ -31,6 +34,9 @@ const mergePolicy = String(args.mergePolicy || "confirm").toLowerCase() === "aut
 const branchPrefix = String(args.branchPrefix || "agile/");
 const journalDir = String(args.journalDir || ".agile-js");
 const model = args.model || undefined;
+// Hybrid mode: when agentWork is a relay agent (e.g. "ledger-worker"), work/rework
+// children launch the ledger-solve ceremony as their implementation engine.
+const agentWork = String(args.agentWork || "worker");
 // Infra-retry budget: whole-campaign wall clock; children killed by transport
 // failures retry with exponential backoff until this deadline, then fail honestly.
 const budgetMs = Math.min(Math.max(Number(args.budgetMs) || 14400000, 600000), 86400000);
@@ -62,10 +68,14 @@ function slugify(t) {
 }
 function withGate(extra) {
   const o = childOpts(extra);
+  if (agentWork !== "worker") o.agent = agentWork; // relay engine for work/rework children
   if (testCommand) o.gate = testCommand; // conditional: never pass undefined
   // Host-side gate verification inherits the per-tool deadline (default 5m); a 2m+ test
   // suite under load (GPU stand restart, CPU contention) blows past it. Give headroom.
   o.toolTimeoutMs = 600000;
+  // Relay mode: the worker blocks on a nested ledger ceremony (up to ~2h) + its own
+  // verification and commit. The default run budget is too tight for that.
+  if (agentWork !== "worker") o.timeoutMs = 14400000;
   return o;
 }
 
@@ -264,25 +274,43 @@ while (sprint < maxSprints && continueCampaign) {
     const rec = { sprint: sprint, title: t.title, branch: slug, iterations: 0, verdict: "unknown" };
 
     // 3a. worker (gate-attached, branch discipline) --------------------------------
+    const relayMode = agentWork !== "worker";
+    const ledgerDirName = "ledger-ag-" + slug.replace(/^agile\//, "");
     const workLines = [
       "You are the TASK WORKER. Execute EXACTLY ONE task end-to-end.",
+      relayMode ? "You are operating in RELAY MODE (see IMPLEMENTATION ENGINE below): a ceremony engine implements, you verify/commit/report." : "",
+      "TASK-BEGIN",
       "Task: " + t.title,
       "Rationale: " + (t.rationale || ""),
       "Acceptance criteria: " + (t.acceptance || ""),
       "Expected files (hint, not a straitjacket): " + (t.files_hint || "as the code dictates"),
+      "Global constraints: " + constraints,
+      "TASK-END",
       "",
       "Branch discipline: first check `git status` - if the working copy is dirty, STOP and report completed=false with the reason. Then `git checkout main && git checkout -b " + slug + "`.",
       "Verification command (must pass before you finish): " + testCommand,
       "",
-      "Global constraints: " + constraints,
+      "Global constraints (repeated for direct workers): " + constraints,
       GIT_RULES, CMDS,
       "MINIMALITY CONTRACT: the acceptance criteria and the verification command are the source of truth; delete anything no criterion needs before finishing.",
       "TDD preference: for aspects the verification command does not cover, write a failing test first and keep it in the deliverable.",
       "Before finishing: commit all your changes to your branch (git add -A && git commit), leave the working copy clean, report your branch name.",
+      relayMode ? "COMMIT NOTE (relay): never `git add -A` - add ONLY the files the ceremony changed (see engine protocol)." : "",
       FACTS, ACC_REPORT,
       "Report format: what_done (2-4 sentences), files_changed, verification (commands + results), branch, completed (true when done and verified).",
-      "If you need a decision beyond your scope (spec ambiguity, widening scope, destructive action), ask the calling side via contact_supervisor instead of guessing."
-    ].join("\n");
+      "If you need a decision beyond your scope (spec ambiguity, widening scope, destructive action), ask the calling side via contact_supervisor instead of guessing.",
+      relayMode ? [
+        "",
+        "IMPLEMENTATION ENGINE (mandatory relay protocol):",
+        "1) Branch discipline FIRST (as specified above).",
+        "2) Launch the ledger ceremony EXACTLY like this (fill the placeholders):",
+        "   subagent({ workflowScriptPath: \"C:/Users/user/.agents/skills/ledger-solve/workflows/ledger-loop-mem.js\", args: { task: <THE PAYLOAD between TASK-BEGIN/TASK-END above, verbatim>, testCommand: " + JSON.stringify(testCommand) + ", ledgerDir: " + JSON.stringify(ledgerDirName) + ", cwd: <the repository root you are in>, maxIters: 10" + (model ? ", model: " + JSON.stringify(model) : "") + " }, async: false, timeoutMs: 14400000 })",
+        "   async:false is MANDATORY - block until the ceremony receipt. Do not poll.",
+        "3) done:true -> run the gate yourself and inspect git diff; red gate or empty diff -> completed=false with details. done:false -> completed=false with the stopReason and what landed.",
+        "4) Commit per COMMIT NOTE above; then verify `git show --stat HEAD` lists only your files; if a hook staged .beads/issues.jsonl: git checkout <pre-commit HEAD> -- .beads/issues.jsonl && git add .beads/issues.jsonl && git commit --amend --no-edit.",
+        "5) Report: what_done includes the ceremony receipt summary (rounds, stopReason); verification = YOUR OWN gate run with numbers."
+      ].join("\n") : ""
+    ].filter(Boolean).join("\n");
     let wOut = {};
     let workOk = false;
     try {
@@ -333,6 +361,7 @@ while (sprint < maxSprints && continueCampaign) {
         "Verification command: " + testCommand,
         "", "Global constraints: " + constraints, GIT_RULES, CMDS,
         "Commit your fixes to the same branch; leave the working copy clean.",
+        relayMode ? "Rework fixes are SMALL and focused: implement them DIRECTLY yourself - do NOT launch a new ledger ceremony." : "",
         FACTS, ACC_REPORT,
         "Report format: what_done, files_changed, verification, branch, completed."
       ].join("\n");
