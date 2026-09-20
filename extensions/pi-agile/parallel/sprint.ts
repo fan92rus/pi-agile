@@ -7,6 +7,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { atomicWriteFileSync } from "./atomic-write.ts";
 
 export type SprintStatus = "planning" | "active" | "retrospective" | "done";
 export type TaskStatus = "backlog" | "in_progress" | "in_review" | "done" | "rework" | "blocked";
@@ -67,9 +68,7 @@ export class SprintStore {
 
   save(workDir: string, state: SprintState): void {
     const filePath = sprintFilePath(workDir, state.id);
-    const dir = path.dirname(filePath);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(filePath, JSON.stringify(state, null, 2), "utf8");
+    atomicWriteFileSync(filePath, JSON.stringify(state, null, 2), "utf8");
     this.current = state;
     this.currentWorkDir = workDir;
   }

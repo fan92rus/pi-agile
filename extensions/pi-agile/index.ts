@@ -21,6 +21,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { KnowledgeBase } from "./parallel/knowledge.ts";
+import { atomicWriteFileSync } from "./parallel/atomic-write.ts";
 import { SprintStore, type SprintState, type SprintTask, type SprintVelocity } from "./parallel/sprint.ts";
 import {
   shouldSendContinuation,
@@ -97,7 +98,7 @@ function loadProjectConfig(workDir: string): Record<string, unknown> | null {
     if (!fs.existsSync(path.join(workDir, AGILE_DIR))) {
       fs.mkdirSync(path.join(workDir, AGILE_DIR), { recursive: true });
     }
-    fs.writeFileSync(filePath, defaultYaml, "utf8");
+    atomicWriteFileSync(filePath, defaultYaml, "utf8");
   }
   const text = fs.readFileSync(filePath, "utf8");
   return parseSimpleYaml(text);
@@ -121,7 +122,7 @@ function loadAgileConfig(workDir: string): Record<string, unknown> {
 
 function saveAgileConfig(workDir: string, config: Record<string, unknown>): void {
   ensureAgileDir(workDir);
-  fs.writeFileSync(path.join(workDir, CONFIG_FILE), JSON.stringify(config, null, 2), "utf8");
+  atomicWriteFileSync(path.join(workDir, CONFIG_FILE), JSON.stringify(config, null, 2), "utf8");
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +172,7 @@ function getStuckTimeout(workDir: string): number {
 function writeBatchProgress(workDir: string, data: { tasks: { bdId: string; round: number; stage: string; status: string }[] }): void {
   try {
     ensureAgileDir(workDir);
-    fs.writeFileSync(path.join(workDir, ".agile", "batch-progress.json"), JSON.stringify(data, null, 2), "utf8");
+    atomicWriteFileSync(path.join(workDir, ".agile", "batch-progress.json"), JSON.stringify(data, null, 2), "utf8");
   } catch { /* non-fatal */ }
 }
 
@@ -2738,7 +2739,7 @@ ${isGoal ? `  stop_when:
   review_depth: ${reviewDepth}
   max_workers: 5
 `;
-        fs.writeFileSync(path.join(agileDir, "project.yaml"), projectYaml, "utf8");
+        atomicWriteFileSync(path.join(agileDir, "project.yaml"), projectYaml, "utf8");
 
         const constraintsYaml = `rules:
 ${constraints.map((r, i) => `  - id: rule-${i + 1}
@@ -2755,7 +2756,7 @@ do_not_do:
   - Do not modify files outside project scope
   - Do not add new dependencies without constraint override
 `;
-        fs.writeFileSync(path.join(agileDir, "constraints.yaml"), constraintsYaml, "utf8");
+        atomicWriteFileSync(path.join(agileDir, "constraints.yaml"), constraintsYaml, "utf8");
 
         // 7. Init bd if needed
         ctx.ui.notify("Checking prerequisites...", "info");

@@ -14,6 +14,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { atomicWriteFileSync } from "./atomic-write.ts";
 
 export interface ContinuationOptions {
   /** Number of tasks that are not done/blocked (still pending). */
@@ -119,8 +120,7 @@ export function sessionStateFilePath(workDir: string): string {
 export function saveSessionState(workDir: string, state: SessionState): void {
   try {
     const filePath = sessionStateFilePath(workDir);
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, JSON.stringify(state, null, 2), "utf8");
+    atomicWriteFileSync(filePath, JSON.stringify(state, null, 2), "utf8");
   } catch {
     /* non-fatal — persistence is best effort */
   }

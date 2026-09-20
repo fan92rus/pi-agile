@@ -8,8 +8,19 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { register } from "node:module";
 
 const EXT_DIR = path.join(import.meta.dirname, "..", "extensions", "pi-agile");
+
+// fs spy for the "critical state goes through atomic-write" tests:
+// fs-spy-loader.mjs rewrites `node:fs` imports of the dynamically imported
+// extension modules to tests/fs-spy-wrapper.mjs, which logs
+// writeFileSync/renameSync/unlinkSync into globalThis.__fsSpy while enabled.
+// The global must exist BEFORE the first importModule below, because the
+// wrapper binds it at its own evaluation time. The test file's own
+// (statically imported) fs is unaffected.
+register("./fs-spy-loader.mjs", pathToFileURL(path.join(import.meta.dirname, "fs-spy-loader.mjs")).href);
+globalThis.__fsSpy = { enabled: false, calls: [] };
 
 async function importModule(relPath) {
   const fullPath = path.join(EXT_DIR, relPath);
@@ -1728,6 +1739,204 @@ await test("agile_retrospective: continuation nudge delivered as steer (tool con
     return null;
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── parallel/atomic-write.ts: temp+rename atomic state writes ───
+console.log("\n## parallel/atomic-write.ts");
+
+const atomicMod = await importModule(path.join("parallel", "atomic-write.ts"));
+const { atomicWriteFileSync } = atomicMod;
+
+await test("atomic-write: creates nested target dir (recursive) and writes exact content", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "atomic-"));
+  try {
+    const target = path.join(tmpDir, "nested", "deeper", "config.json");
+    const content = JSON.stringify({ a: 1 }, null, 2);
+    atomicWriteFileSync(target, content, "utf8");
+    assert.strictEqual(fs.readFileSync(target, "utf8"), content);
+    assert.deepStrictEqual(
+      fs.readdirSync(path.dirname(target)).filter((n) => n.includes(".tmp-")),
+      [],
+      "no *.tmp-* file left in the target dir",
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+await test("atomic-write: replaces an existing target via rename; no temp left", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "atomic2-"));
+  try {
+    const target = path.join(tmpDir, "sprint-1.json");
+    fs.writeFileSync(target, "OLD", "utf8");
+    atomicWriteFileSync(target, "NEW CONTENT", "utf8");
+    assert.strictEqual(fs.readFileSync(target, "utf8"), "NEW CONTENT");
+    assert.deepStrictEqual(
+      fs.readdirSync(tmpDir).filter((n) => n.includes(".tmp-")),
+      [],
+      "no *.tmp-* file left behind",
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+await test("atomic-write: output is byte-identical to a direct writeFileSync", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "atomic3-"));
+  try {
+    const content = "привет\nworld\r\n\u0000"; // non-ascii + CRLF + NUL
+    const viaHelper = path.join(tmpDir, "a.json");
+    const viaDirect = path.join(tmpDir, "b.json");
+    atomicWriteFileSync(viaHelper, content, "utf8");
+    fs.writeFileSync(viaDirect, content, "utf8");
+    assert.ok(
+      fs.readFileSync(viaHelper).equals(fs.readFileSync(viaDirect)),
+      "helper output must be byte-identical to writeFileSync",
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+await test("atomic-write: renameSync throws → target untouched, temp removed, error rethrown", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "atomic4-"));
+  try {
+    // Natural, non-mocked rename failure: the target path is an existing
+    // DIRECTORY. rename(file → dir) throws on both Windows (EPERM) and POSIX
+    // (EISDIR/ENOTDIR), so the helper's cleanup path runs for real.
+    const target = path.join(tmpDir, "sprint-1.json");
+    fs.mkdirSync(target);
+    const inner = path.join(target, "inner.txt");
+    fs.writeFileSync(inner, "keepme", "utf8");
+    let threw = null;
+    try {
+      atomicWriteFileSync(target, "SHOULD NOT LAND", "utf8");
+    } catch (e) {
+      threw = e;
+    }
+    assert.ok(threw, "the rename error must be rethrown, not swallowed");
+    assert.ok(threw.code, `must be a real fs error (got: ${threw.message})`);
+    assert.strictEqual(
+      fs.readFileSync(inner, "utf8"),
+      "keepme",
+      "target content must stay untouched",
+    );
+    assert.deepStrictEqual(
+      fs.readdirSync(target).filter((n) => n.includes(".tmp-")),
+      [],
+      "the temp must be unlinked after a failed rename — none left in the target dir",
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+await test("atomic-write: two consecutive writes to the same target never collide", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "atomic5-"));
+  try {
+    const target = path.join(tmpDir, "sprint-1.json");
+    for (let i = 0; i < 5; i++) {
+      atomicWriteFileSync(target, `write-${i}`, "utf8");
+      assert.strictEqual(fs.readFileSync(target, "utf8"), `write-${i}`);
+      assert.deepStrictEqual(
+        fs.readdirSync(tmpDir).filter((n) => n.includes(".tmp-")),
+        [],
+        "unique temp names — no leftovers after any write",
+      );
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+// ── sprint.ts / continuation.ts: critical state goes via atomic-write ──
+console.log("\n## sprint.ts / continuation.ts → atomic-write helper");
+
+const fsSpy = globalThis.__fsSpy;
+
+async function captureFsCalls(fn) {
+  fsSpy.calls.length = 0;
+  fsSpy.enabled = true;
+  try {
+    await fn();
+  } finally {
+    fsSpy.enabled = false;
+  }
+  return fsSpy.calls;
+}
+
+await test("SprintStore.save writes via temp+rename (never direct to the target)", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sprint-atomic-"));
+  try {
+    const workDir = tmpDir;
+    const state = { id: 1, goal: "g", status: "planning", tasks: [], started_at: new Date().toISOString() };
+    const target = path.join(workDir, ".agile", "sprint-1.json");
+    const store = new SprintStore();
+    const calls = await captureFsCalls(() => store.save(workDir, state));
+
+    const dir = path.dirname(target);
+    const writes = calls.filter((c) => c[0] === "writeFileSync" && path.dirname(String(c[1])) === dir);
+    assert.strictEqual(writes.length, 1, `exactly one file written in the target dir (got ${writes.length})`);
+    const tempPath = writes[0][1];
+    assert.match(
+      path.basename(tempPath),
+      /^sprint-1\.json\.tmp-\d+-[0-9a-f]{8}$/,
+      "the only write goes to a <name>.tmp-<pid>-<rand> temp in the target dir",
+    );
+
+    const renames = calls.filter((c) => c[0] === "renameSync" && c[2] === target);
+    assert.strictEqual(renames.length, 1, "exactly one rename onto the final target");
+    assert.strictEqual(renames[0][1], tempPath, "rename source is exactly the temp that was written");
+
+    assert.strictEqual(
+      fs.readFileSync(target, "utf8"),
+      JSON.stringify(state, null, 2),
+      "target bytes are the JSON, identical to the pre-helper format",
+    );
+    assert.deepStrictEqual(
+      fs.readdirSync(dir).filter((n) => n.includes(".tmp-")),
+      [],
+      "no temp left behind",
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+await test("saveSessionState writes via temp+rename (never direct to the target)", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "session-atomic-"));
+  try {
+    const state = { remainingSprints: 2, originalRequest: "req", sprintLoopActive: true, loopStopped: false };
+    const target = path.join(tmpDir, ".agile", "session.json");
+    const calls = await captureFsCalls(() => saveSessionState(tmpDir, state));
+
+    const dir = path.dirname(target);
+    const writes = calls.filter((c) => c[0] === "writeFileSync" && path.dirname(String(c[1])) === dir);
+    assert.strictEqual(writes.length, 1, `exactly one file written in the target dir (got ${writes.length})`);
+    const tempPath = writes[0][1];
+    assert.match(
+      path.basename(tempPath),
+      /^session\.json\.tmp-\d+-[0-9a-f]{8}$/,
+      "the only write goes to a <name>.tmp-<pid>-<rand> temp in the target dir",
+    );
+
+    const renames = calls.filter((c) => c[0] === "renameSync" && c[2] === target);
+    assert.strictEqual(renames.length, 1, "exactly one rename onto the final target");
+    assert.strictEqual(renames[0][1], tempPath, "rename source is exactly the temp that was written");
+
+    assert.strictEqual(
+      fs.readFileSync(target, "utf8"),
+      JSON.stringify(state, null, 2),
+      "target bytes are the JSON, identical to the pre-helper format",
+    );
+    assert.deepStrictEqual(
+      fs.readdirSync(dir).filter((n) => n.includes(".tmp-")),
+      [],
+      "no temp left behind",
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
 
