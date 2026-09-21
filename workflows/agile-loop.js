@@ -191,8 +191,9 @@ const CUR_SCHEMA = {
       acceptance: { type: "string" },
       files_hint: { type: "string" },
       wave: { type: "integer" },
-      engine: { type: "string", enum: ["bare", "ledger"] }
-    }, required: ["title", "rationale", "acceptance", "files_hint", "wave", "engine"], additionalProperties: false } }
+      engine: { type: "string", enum: ["bare", "ledger"] },
+      engine_reason: { type: "string" }
+    }, required: ["title", "rationale", "acceptance", "files_hint", "wave", "engine", "engine_reason"], additionalProperties: false } }
   },
   required: ["sprint_brief", "approved_by_caller", "tasks"],
   additionalProperties: false
@@ -546,10 +547,10 @@ while (sprint < maxSprints && continueCampaign) {
     "FORMULA DISCIPLINE: before writing any numeric claim about the codebase (counts, coverage, timings), verify it with a short script; label unverified claims as hypothesis.",
     "Propose at most " + sprintTasks + " tasks for THIS sprint. Each task must be: independently deliverable in one worker session, verifiable by this gate: " + testCommand + ", and small enough to finish within ~30 minutes of work.",
     "PARALLEL PLANNING (preferred): assign EVERY task a `wave` integer (1.." + maxParallel + "). Tasks sharing a wave run CONCURRENTLY, each isolated in its own git worktree. Bias toward parallel: same wave is the DEFAULT for any tasks that are semantically independent (neither needs the other's change) - PARTIAL FILE OVERLAP is acceptable, the merger resolves textual conflicts at squash time and the gate catches semantic breakage. Use distinct ascending waves ONLY for real dependencies (a task builds on or consumes another task's change). A wave-N task may rely on waves < N being merged. Present the wave structure in your approval request, e.g. 'wave 1: T1+T2 parallel (both touch config.ts, different areas); wave 2: T3 (uses T1's change)'.",
-    "EXECUTOR SELECTION: assign EVERY task an `engine` field. " + (ledgerAvailable ? "Two engines are available: 'bare' (direct worker, cheap, reviewer-verified - the DEFAULT) and 'ledger' (a full ledger-solve ceremony: plan -> do -> gate-loop; ~3-4x cost of bare). " : "Only the 'bare' engine is available in this run; set engine=\"bare\" for EVERY task. ") + "Choose 'ledger' ONLY when the task is nontrivial (multi-site change, algorithmic core, spec adaptation, integration) AND the gate objectively verifies the result; choose 'bare' for simple/mechanical tasks and for tasks WITHOUT a crisp gate (docs, research, UI polish - the gate would degenerate to trivially-green and the ceremony overhead buys nothing). Justify every non-default engine in your approval request, e.g. 'T2 engine=ledger (algorithmic core, gate catches regressions)'.",
-    "Then MANDATORY: send the proposed task list (titles + 1-line rationale + wave + engine each) to the calling side via contact_supervisor (reason: \"sprint-plan approval\") and WAIT for the reply. Incorporate the reply: adjust, drop or add tasks per the caller's corrections; set approved_by_caller accordingly. If contact_supervisor is unavailable after 2 attempts, proceed with approved_by_caller=false.",
+    "EXECUTOR SELECTION (mandatory per-task CLASSIFICATION, never a default): for EVERY task set `engine` AND `engine_reason` - the reason must name the criterion that decided, not 'default'. Classify by criteria: engine='ledger' requires BOTH (a) the gate objectively verifies the deliverable AND (b) at least one of: multi-site change, algorithmic/invariant-sensitive core, spec adaptation, integration with an existing subsystem, subtle edge cases where plan-before-code discipline pays. engine='bare' when: a simple mechanical change (1-2 files, obvious diff) OR no crisp gate exists (docs, research, UI polish - a trivially-green gate makes ceremony overhead pointless; the reviewer is the verifier there). " + (ledgerAvailable ? "Both engines are available ('ledger' = plan->do->gate-loop ceremony, ~3-4x bare cost). A sprint mixing engines is NORMAL and expected - an all-bare sprint containing gate-verifiable nontrivial tasks is a classification defect. " : "Only 'bare' is available in this run (no relay agent); set engine='bare' with reason 'ledger unavailable (no relay)'. ") + "In the approval request list each task as 'title [engine] criterion'.",
+    "Then MANDATORY: send the proposed task list (titles + 1-line rationale + wave + engine + criterion each) to the calling side via contact_supervisor (reason: \"sprint-plan approval\") and WAIT for the reply. Incorporate the reply: adjust, drop or add tasks per the caller's corrections; set approved_by_caller accordingly. If contact_supervisor is unavailable after 2 attempts, proceed with approved_by_caller=false.",
     FINAL_MSG,
-    "Schema keys: sprint_brief, approved_by_caller, tasks[{title, rationale, acceptance, files_hint, wave, engine}]."
+    "Schema keys: sprint_brief, approved_by_caller, tasks[{title, rationale, acceptance, files_hint, wave, engine, engine_reason}]."
   ].filter(Boolean).join("\n");
   let cOut = {};
   try {
