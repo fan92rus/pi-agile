@@ -4,6 +4,10 @@ node_modules/
 # Pi extension build artifacts
 *.tsbuildinfo
 
+# Agent-local dirs (skills checkout / pi state)
+.agents/
+.pi/
+
 # OS
 .DS_Store
 Thumbs.db
