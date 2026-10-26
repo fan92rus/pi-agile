@@ -839,7 +839,7 @@ T("blocked status: approval-required -> status blocked, counters reported", asyn
   const { res } = out;
   assert.equal(res.status, "blocked");
   assert.equal(res.done, false);
-  assert.deepEqual(res.counts, { planned: 2, merged: 0, verified: 0, dropped: 0, failed: 0 });
+  assert.deepEqual(res.counts, { planned: 2, merged: 0, dropped: 0, failed: 0 });
   const cp = st.store.get("agile-cp");
   assert.equal(cp.phase, "waiting", "blocked campaign parks in waiting phase");
 });
@@ -1636,33 +1636,8 @@ T("toy-falcon bd-close: exactly-once across a multi-merge campaign - each merger
   assert.ok(out.res.log.some((l) => /merge bd-close closed fal-a/.test(l)) && out.res.log.some((l) => /merge bd-close closed fal-b/.test(l)), "both closes recorded in the log");
 });
 
-T("toy-falcon bd-close: verified verdict-only leaf has no merger - the post-loop child closes it; a 0-merge sprint launches NO boundary child at all anymore", async () => {
-  // verified path: a verify-only sprint has prevMerged=0 and no janitor leftovers - bd-close
-  // no longer forces a boundary child, so sprint 2 launches NOTHING and the close happens
-  // post-loop (the only closer a verdict-only leaf can ever have).
-  const routesV = makeRuns([
-    { match: K.work, handle: ok(workOut({ head: "" })) }, // verify leaf: no commit -> head ""
-    { match: K.boundary, handle: boom("boundary must never launch for a bd close") },
-    { match: K.finalClose, handle: ok({ cleaned: [], closed: [{ id: "fal-v", closed: true, note: "closed" }], leaves: [] }) },
-  ]);
-  const outV = await runCampaign(baseArgs({
-    taskSource: "bd-epic", bdEpic: "t-fal.1", doneWhen: "bd-epic-closed",
-    sprintTasks: 1, maxSprints: 2,
-    bdTasks: [falconLeaf("fal-v", { verify: true })],
-  }), routesV, makeState());
-  assert.ok(!outV.err, "workflow threw: " + (outV.err && outV.message));
-  assert.equal(outV.res.tasks.find((r) => r.id === "fal-v").verdict, "verified");
-  assert.equal(outV.res.stopReason, "epic-closed", "verify-only sprint reaches epic-closed without any boundary child");
-  assert.equal(routesV.count(K.boundary), 0, "0-merge sprint: bd-close no longer forces a boundary child (cursor-skip untouched)");
-  const fin = routesV.spec(K.finalClose);
-  assert.ok(fin, "post-loop bd-close launched for the verified leaf: " + JSON.stringify(routesV.keys()));
-  assert.ok(/bd close fal-v -r /.test(fin.spec.task) && /verified/.test(fin.spec.task), "verified leaf in the close list");
-  assert.ok(/no-commit \(verdict-only\)/.test(fin.spec.task), "verify leaf carries the no-commit slot in the mechanical comment");
-  assert.ok(/PART 2 - BD CLOSE/.test(fin.spec.task), "the post-loop child is the mechanical bd-close section");
-  assert.ok(!/bd list --parent/.test(fin.spec.task), "post-loop close carries NO snapshot refresh");
-  assert.ok(outV.res.log.some((l) => /post-loop: bd-close closed 1\/1/.test(l)), "post-loop close logged");
-
-  // failed path: the leaf was rejected - bd must NOT be closed by us; the boundary
+T("toy-falcon bd-close: failed leaf is never closed - boundary runs as janitor only, NO close section", async () => {
+  // the leaf was rejected - bd must NOT be closed by us; the boundary
   // child still runs (janitor for the leftover) but carries NO close section.
   const routesF = makeRuns([
     { match: K.work, handle: ok(workOut({ completed: false })) },
@@ -1705,7 +1680,7 @@ T("toy-falcon bd-close: merger bd-close failure does not sink the merge - verdic
 });
 
 // POST-LOOP bd-close (agents-qu2.1 residual a): mergers close their own merges eagerly,
-// but a close can fail or go unreported (best-effort) and verified leaves have no merger.
+// but a close can fail or go unreported (best-effort).
 // One mechanical child closes whatever is still pending after the loop, whatever the
 // stopReason - otherwise the LAST sprint's done leaves would stay open in bd forever.
 T("toy-falcon bd-close post-loop: the last sprint's merge is closed before return when the merger's bd-close failed and maxSprints ends the campaign", async () => {
@@ -1908,7 +1883,7 @@ T("contract: WORK_SCHEMA carries the acceptance fields (head/testsAddedOrUpdated
     assert.ok(sch.required.includes(f), "required: " + f);
     assert.ok(sch.properties[f], "property: " + f);
   }
-  assert.match(sch.properties.head.pattern, /\^\[0-9a-f\]\{40\}\$/, "head pattern pins 40-hex (|^$ for verify-only)");
+  assert.equal(sch.properties.head.pattern, "^[0-9a-f]{40}$", "head pattern pins 40-hex: no empty head exists (verdict-only leaves are gone)");
   assert.deepEqual(sch.properties.commandsRun.items.properties.result.enum, ["passed", "failed", "not-run"], "result enum matches the host report contract");
   assert.equal(sch.properties.commandsRun.minItems, 1, "commandsRun non-empty (a verified report has at least the gate run)");
   assert.equal(sch.properties.validationOutput.minItems, 1, "validationOutput non-empty");
@@ -1917,15 +1892,6 @@ T("contract: WORK_SCHEMA carries the acceptance fields (head/testsAddedOrUpdated
   assert.equal(sch.properties.criteriaSatisfied.maxItems, 2);
   assert.deepEqual(sch.properties.criteriaSatisfied.items.properties.id.enum, ["criterion-1", "criterion-2"], "exactly the host criterion ids");
   assert.deepEqual(sch.properties.criteriaSatisfied.items.properties.status.enum, ["satisfied"], "status enum pins EXACTLY 'satisfied' (rework r1)");
-});
-
-T("verify-only: testsAddedOrUpdated [] and head '' pass validation (verdict verified, zero salvage)", async () => {
-  const runs = verifyRuns({ work: ok(workOut({ head: "", testsAddedOrUpdated: [] })) });
-  const out = await runCampaign(tierArgs([falconLeaf("ver-s", { verify: true })]), runs, makeState());
-  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
-  assert.equal(runs.spec(K.work).spec.accVerifyOnly, true, "verify-only flag rides on the work spec (relaxes ONLY head)");
-  assert.equal(runs.count(K.reportRepair), 0, "a verify-only report with [] tests and no head is VALID - no salvage");
-  assert.equal(out.res.tasks[0].verdict, "verified");
 });
 
 T("work report without head -> schema-missing -> ONE salvage repair, merge uses the recovered head", async () => {
@@ -2050,20 +2016,6 @@ for (const [name, field, badPayload] of [
     assert.equal(res.tasks[0].verdict, "merged", "branch work survives a broken report via salvage");
   });
 }
-
-// verify-only head check: '' is the ONLY valid head for a verdict-only leaf - a verify
-// leaf claiming a commit head must fail. Deleting the `verifyOnly === true ? head !== ""`
-// branch lets the 40-hex head through and this probe reddens (verdict flips to verified).
-T("mutation probe r2: verify-only leaf reporting a non-empty head -> rejected (verdict failed, no salvage class for verdict-only leaves)", async () => {
-  const runs = verifyRuns({ work: ok(workOut({ head: "1111111111111111111111111111111111111111" })) });
-  const out = await runCampaign(tierArgs([falconLeaf("ver-s2", { verify: true })]), runs, makeState());
-  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
-  assert.equal(runs.spec(K.work).spec.accVerifyOnly, true, "the verify-only flag rides on the work spec");
-  assert.equal(runs.count(K.reportRepair), 0, "verify-only leaves never salvage (no branch to recover a report from)");
-  assert.equal(runs.count(K.rework), 0, "report-class rejection never re-runs the brief");
-  assert.equal(runs.count(K.review) + runs.count(K.merge), 0, "verdict-only leaf: no review/merge children");
-  assert.equal(out.res.tasks[0].verdict, "failed", "a verify leaf claiming a commit head is rejected");
-});
 
 T("modelLadder duplicates collapse: [m-b, m-b] behaves like [m-b]", async () => {
   const routes = happyRoutes({
@@ -2563,115 +2515,20 @@ T("review tier from a boundary refresh: a leaf that arrives mid-campaign with re
   assert.equal(out.res.tasks.find((r) => r.id === "fal-g").verdict, "merged");
 });
 
-// --- verify-only leaves (acc-verifyleaf): verdict-only product - no branch/worktree,
-// no merge child, verdict to the sprint journal/result; the FULL verify gate stays
-// on the work child; the janitor never gets an entry (nothing to clean).
-const verifyRuns = (over = {}) => makeRuns([
-  { match: K.work, handle: over.work || ok(workOut({ head: "" })) }, // verify-only leaf: no commit -> head ""
-  { match: K.rework, handle: ok(workOut({ head: "" })) },
-  { match: K.review, handle: ok(reviewOk(true)) },
-  { match: K.merge, handle: boom("merge child must never launch for a verify leaf") },
-  { match: K.drop, handle: boom("drop child must never launch for a verify leaf") },
-  { match: K.arbiter, handle: boom("arbiter must never launch for a verify leaf") },
-  { match: K.cleanup, handle: boom("janitor must never be scheduled for a verify leaf") },
-  { match: K.boundary, handle: boom("boundary must not launch in a single sprint") },
-]);
-
-T("verify leaf: repo-root brief (no worktree/branch/commit, NO scratch claim), FULL gate stays on the work child, no review/merge, verdict verified + journal instruction", async () => {
-  const runs = verifyRuns();
-  const out = await runCampaign(tierArgs([falconLeaf("ver-a", { verify: true })], { testCommandQuick: "npm run test:affected" }), runs, makeState());
+// --- retired verdict-only mode: a bd snapshot leaf carrying verify:true is an ORDINARY
+// work leaf. The field is dropped by normalizeLeaf; the leaf gets a branch/worktree, a
+// review child and a merge child exactly like any other leaf.
+T("snapshot leaf with verify:true is an ordinary work leaf: branch/worktree created, review and merge run, verdict merged", async () => {
+  const runs = tierRuns();
+  const out = await runCampaign(tierArgs([falconLeaf("ver-n", { verify: true })]), runs, makeState());
   assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
-  const { res } = out;
   const work = runs.spec(K.work).spec;
-  assert.ok(!/git worktree add/.test(work.task), "verify leaf brief never instructs a worktree");
-  assert.ok(!/git checkout|git commit|git merge/.test(work.task), "verify leaf brief carries no git write commands");
-  assert.ok(!/OUTSIDE the repo tree/.test(work.task), "no false scratch claim: the child has no cwd override and runs in the campaign repo root");
-  assert.ok(/campaign repository root/.test(work.task), "the brief states the real cwd: the campaign repository root");
-  assert.ok(/Verification command \(must pass before you finish\): npm test/.test(work.task), "FULL gate command in the brief");
-  assert.equal(work.acceptance, false, "acceptance:false (rp-schema): the structured output IS the report; the FULL gate command stays in the brief because no merge round will re-run it");
-  assert.equal(work.accVerifyOnly, true, "verify-only flag: head '' is the ONLY valid empty head");
-  assert.ok(work.task.includes(".agile-js-test/sprint-1.jsonl"), "journal write instruction names the sprint journal file");
-  assert.ok(work.task.includes('"verdict": "verified" | "failed"'), "journal line schema present");
-  assert.equal(runs.count(K.review), 0, "no review child (nothing to diff)");
-  assert.equal(runs.count(K.merge), 0, "merge child never launched");
-  assert.equal(runs.count(K.arbiter), 0, "no arbiter");
-  assert.equal(runs.count(K.rework), 0, "no rework ladder");
-  assert.equal(res.tasks[0].verdict, "verified");
-  assert.equal(res.counts.verified, 1, "verified verdict counted for the driver");
-  assert.equal(res.counts.merged, 0);
-  assert.equal(res.status, "completed");
-  assert.ok(res.log.some((l) => /verify verified/.test(l)), "verdict logged: " + JSON.stringify(res.log));
-});
-
-T("verify leaf completed=false: verdict failed, no review/merge ladder, janitor never scheduled (nothing to clean)", async () => {
-  const runs = verifyRuns({ work: ok(workOut({ completed: false })) });
-  const out = await runCampaign(tierArgs([falconLeaf("ver-f", { verify: true })]), runs, makeState());
-  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
-  const { res } = out;
-  assert.equal(res.tasks[0].verdict, "failed");
-  assert.equal(res.counts.failed, 1);
-  assert.equal(runs.count(K.review), 0, "no review child on a failed verify");
-  assert.equal(runs.count(K.merge), 0, "no merge child on a failed verify");
-  assert.equal(runs.count(K.rework), 0, "no rework ladder: a verify leaf has no branch to rework");
-  assert.equal(runs.count(K.cleanup), 0, "janitor never scheduled: a verify leaf has no branch/worktree to remove");
-  assert.equal(res.status, "failed");
-});
-
-T("verify leaf from a boundary refresh: boundary brief carries the verify field, verdict-only flow, done-set closes it (never re-runs)", async () => {
-  let calls = 0;
-  const routes = makeRuns([
-    { match: K.finalClose, handle: ok({ cleaned: [], closed: [], leaves: [] }) },
-    { match: K.work, handle: async (spec, key) => ok(workOut(key.startsWith("s2-") ? { head: "" } : {}))() }, // s2 = verify leaf: no commit -> head ""; s1 = regular leaf: default head
-    { match: K.review, handle: ok(reviewOk(true)) },
-    { match: K.merge, handle: ok(mergeOut()) },
-    { match: K.boundary, handle: async () => {
-        calls++;
-        return calls === 1
-          ? ok({ cleaned: [], leaves: [falconLeaf("fal-a", { open: false }), falconLeaf("ver-g", { verify: true })] })()
-          : ok({ cleaned: [], leaves: [falconLeaf("fal-a", { open: false }), falconLeaf("ver-g", { verify: true, open: false })] })();
-      } },
-  ]);
-  const out = await runCampaign(baseArgs({
-    taskSource: "bd-epic", bdEpic: "t-ver.1", doneWhen: "bd-epic-closed",
-    sprintTasks: 2, maxSprints: 3,
-    bdTasks: [falconLeaf("fal-a")],
-  }), routes, makeState());
-  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
-  const bnd = routes.spec(K.boundary).spec.task;
-  assert.ok(/verify = true for verdict-only leaves/.test(bnd), "boundary brief reports the verify field");
-  assert.equal(calls, 1, "only the sprint-2 refresh boundary runs: bd-close is not a boundary duty anymore, so the 0-merge sprint 3 skips it entirely");
-  const fin = routes.spec(K.finalClose);
-  assert.ok(fin && /bd close ver-g -r /.test(fin.spec.task) && /verified/.test(fin.spec.task), "the verified leaf (no merger exists) is closed by the POST-LOOP child instead");
-  assert.equal(routes.count(/^s2-t1-review/), 0, "refresh-delivered verify leaf: no review child");
-  assert.equal(routes.count(/^s2-t1-merge/), 0, "refresh-delivered verify leaf: no merge child");
-  const g = out.res.tasks.find((r) => r.id === "ver-g");
-  assert.ok(g, "verify leaf executed");
-  assert.equal(g.sprint, 2, "verify leaf picked up at the sprint-2 boundary");
-  assert.equal(g.verdict, "verified");
-  assert.equal(out.res.counts.verified, 1);
-  assert.equal(out.res.status, "completed");
-  assert.equal(out.res.stopReason, "epic-closed", "verified leaf counts as done: the epic closes without a re-run");
-});
-
-T("mixed wave: verify sibling stays verdict-only, regular sibling still reviews and merges", async () => {
-  const routes = makeRuns([
-    { match: K.work, handle: async (spec, key) => ok(workOut(key.endsWith("t1-work") ? { head: "" } : {}))() }, // t1 = verify sibling (head ""), t2 = regular
-    { match: K.review, handle: ok(reviewOk(true)) },
-    { match: K.merge, handle: ok(mergeOut()) },
-    { match: K.boundary, handle: boom("boundary must not launch in a single sprint") },
-  ]);
-  const out = await runCampaign(tierArgs([falconLeaf("ver-w", { verify: true }), falconLeaf("reg-x")]), routes, makeState());
-  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
-  assert.equal(routes.count(/^s1-t1-review/), 0, "verify sibling: no review child");
-  assert.equal(routes.count(/^s1-t1-merge/), 0, "verify sibling: no merge child");
-  assert.equal(routes.count(/^s1-t2-review/), 1, "regular sibling: review child runs");
-  assert.equal(routes.count(/^s1-t2-merge/), 1, "regular sibling: merge child runs");
-  const byId = {};
-  out.res.tasks.forEach((r) => { byId[r.id] = r.verdict; });
-  assert.equal(byId["ver-w"], "verified");
-  assert.equal(byId["reg-x"], "merged");
+  assert.ok(/git worktree add/.test(work.task), "work brief instructs a worktree: the leaf is a normal work leaf");
+  assert.equal(work.accVerifyOnly, undefined, "no verdict-only flag rides on the work spec");
+  assert.equal(runs.count(K.review), 1, "review child runs for the verify:true leaf");
+  assert.equal(runs.count(K.merge), 1, "merge child runs for the verify:true leaf");
+  assert.equal(out.res.tasks[0].verdict, "merged", "verify:true leaf merges like a regular leaf");
   assert.equal(out.res.counts.merged, 1);
-  assert.equal(out.res.counts.verified, 1);
   assert.equal(out.res.status, "completed");
 });
 

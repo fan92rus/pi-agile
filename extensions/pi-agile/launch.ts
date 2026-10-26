@@ -43,7 +43,6 @@ export interface EngineLeaf {
   deps: string[];
   open: boolean;
   review: string;
-  verify: boolean;
 }
 
 export interface LaunchPlan {
@@ -97,7 +96,6 @@ function toEngineLeaf(issue: BdIssue, closedIds: Set<string>): EngineLeaf {
       .map((d) => d.id),
     open: issue.status !== "closed",
     review: tier ? tier[1].toLowerCase() : "full",
-    verify: false,
   };
 }
 

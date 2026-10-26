@@ -352,8 +352,8 @@ function noteFiles(rec, o) {
   if (o && Array.isArray(o.files_changed)) rec.filesChanged = o.files_changed.map(String);
 }
 function recordCarry(rec) {
-  if (!rec || rec.verify === true || !rec.branch) return; // verify-only leaves have no branch
-  if (rec.verdict === "merged" || rec.verdict === "merged-after-arbitration" || rec.verdict === "verified") return;
+  if (!rec || !rec.branch) return;
+  if (rec.verdict === "merged" || rec.verdict === "merged-after-arbitration") return;
   const files = Array.isArray(rec.filesChanged) ? rec.filesChanged : [];
   rec.carry = { branch: String(rec.branch), files: files.slice(0, 10), filesTotal: files.length, stop: String(rec.stop || ("verdict " + rec.verdict)) };
   carryByBranch[rec.branch] = rec.carry;
@@ -527,9 +527,9 @@ const bundleScript = typeof args.bundleScript === "string" && args.bundleScript.
 // sprint 1, then ONE mechanical boundary child per sprint boundary (janitor + snapshot
 // refresh: picks up mid-flight growth; bd-close is NOT a boundary duty anymore - each
 // MERGE child closes the leaf it just merged, best-effort; after the loop ONE post-loop
-// child closes whatever is still pending - verified leaves and unconfirmed closes -
-// whatever the stopReason). doneWhen "bd-epic-closed": the campaign stops with
-// stopReason epic-closed as soon as the snapshot shows no open leaves. A leaf is READY when
+// child closes whatever is still pending - unconfirmed closes - whatever the
+// stopReason). doneWhen "bd-epic-closed": the campaign stops with stopReason
+// epic-closed as soon as the snapshot shows no open leaves. A leaf is READY when
 // every dep id is in the done set (closed in snapshot OR merged by this campaign earlier).
 const taskSource = args.taskSource === "bd-epic" ? "bd-epic" : "curator";
 const bdEpic = String(args.bdEpic || "");
@@ -549,13 +549,6 @@ log.push("mergeApproval: " + mergeApproval + (mergeApproval === "auto"
 // head-binding and acceptance evidence stay), lite = checklist review without the
 // judge block, full = the default review. Missing or unknown values are full.
 const REVIEW_TIERS = ["full", "lite", "none"];
-// VERIFY-ONLY leaves (bd leaf field `verify: true`): the task delivers a VERDICT,
-// not code (live data 6993e021: cb-verify merged an EMPTY branch - the whole
-// branch/worktree/merge/janitor mechanics was dead weight). The work child runs
-// the FULL verify gate in the campaign repo root (no branch/worktree, working copy
-// untouched, no quick-gate downgrade: no merge round exists to re-run the full suite) and appends the sprint
-// journal line itself. postPhase short-circuits: no review child (nothing to diff),
-// no merge/drop child, and the janitor never gets an entry for the rec.
 function reviewTierOf(v) {
   const s = String(v || "").trim().toLowerCase();
   return REVIEW_TIERS.indexOf(s) !== -1 ? s : "full";
@@ -567,8 +560,7 @@ function normalizeLeaf(l) {
     acceptance: String(l.acceptance || ""), files_hint: String(l.files_hint || ""),
     deps: Array.isArray(l.deps) ? l.deps.map(String) : [],
     open: l.open !== false,
-    review: reviewTierOf(l.review),
-    verify: l.verify === true
+    review: reviewTierOf(l.review)
   };
 }
 let bdSnapshot = (Array.isArray(args.bdTasks) ? args.bdTasks : []).map(normalizeLeaf).filter(function (l) { return l.id; });
@@ -579,9 +571,7 @@ const bdClosedIds = new Set();
 function doneSet() {
   const s = new Set();
   bdSnapshot.forEach(function (l) { if (!l.open) s.add(l.id); });
-  // "verified" is a done verdict: a leaf this campaign verified must never re-run,
-  // even when the cursor snapshot lags the driver's bd close.
-  taskResults.forEach(function (r) { if (r && r.id && (r.verdict === "merged" || r.verdict === "verified")) s.add(r.id); });
+  taskResults.forEach(function (r) { if (r && r.id && r.verdict === "merged") s.add(r.id); });
   return s;
 }
 function delayMs(ms) {
@@ -638,7 +628,7 @@ function runChild(key, spec) {
           // fail() (report failures are NEVER retried/re-briefed) and rejects this promise,
           // so the call-site rejection handler routes it into salvageReport.
           if (spec.outputSchema === WORK_SCHEMA) {
-            const bad = validateAccStructured(outOf(res), spec.accVerifyOnly === true);
+            const bad = validateAccStructured(outOf(res));
             if (bad) throw new Error("schema-missing: " + bad);
           }
           return res;
@@ -729,8 +719,7 @@ const CURSOR_SCHEMA = {
       id: { type: "string" }, title: { type: "string" }, rationale: { type: "string" },
       acceptance: { type: "string" }, files_hint: { type: "string" },
       deps: { type: "array", items: { type: "string" } }, open: { type: "boolean" },
-      review: { type: "string", enum: REVIEW_TIERS },
-      verify: { type: "boolean" }
+      review: { type: "string", enum: REVIEW_TIERS }
     }, required: ["id", "title", "open", "review"], additionalProperties: false } }
   },
   required: ["leaves"],
@@ -775,7 +764,7 @@ const WORK_SCHEMA = {
     branch: { type: "string" },
     worktree: { type: "string" },
     completed: { type: "boolean" },
-    head: { type: "string", pattern: "^[0-9a-f]{40}$|^$", description: "Full 40-hex SHA of your branch HEAD after the final commit (git rev-parse HEAD); '' ONLY for verify-only leaves (no commit)" },
+    head: { type: "string", pattern: "^[0-9a-f]{40}$", description: "Full 40-hex SHA of your branch HEAD after the final commit (git rev-parse HEAD)" },
     plan_progress: { type: "string", description: "Ceremony plan completion, e.g. '4/5 done, 1 n/a'" },
     // ACCEPTANCE FIELDS (rp-schema): the structured output IS the acceptance report.
     // Shape lives here (host schema channel - 0 rejections in ~100 live children);
@@ -803,12 +792,11 @@ const WORK_SCHEMA = {
 // Semantic acceptance validation of a WORK_SCHEMA structured output (rp-schema):
 // returns "" when valid, otherwise the offending FIELD name - callers raise
 // Error("schema-missing: " + field), the salvage-class rejection (REPORT_SHAPE_RE).
-// verifyOnly=true relaxes ONLY head: a verdict-only leaf commits nothing, so head is "".
-function validateAccStructured(so, verifyOnly) {
+function validateAccStructured(so) {
   so = so && typeof so === "object" ? so : {};
   const isStrArr = function (a) { return Array.isArray(a) && a.every(function (s) { return typeof s === "string"; }); };
   const head = typeof so.head === "string" ? so.head : "";
-  if (verifyOnly === true ? head !== "" : !/^[0-9a-f]{40}$/.test(head)) return "head";
+  if (!/^[0-9a-f]{40}$/.test(head)) return "head";
   if (!isStrArr(so.testsAddedOrUpdated)) return "testsAddedOrUpdated";
   if (!Array.isArray(so.commandsRun) || so.commandsRun.length < 1 || !so.commandsRun.every(function (c) {
     return c && typeof c === "object"
@@ -937,7 +925,6 @@ function leftoverEntries(recs) {
   const out = [];
   (recs || []).forEach(function (r) {
     if (!r || !r.branch || !r.wt) return;
-    if (r.verify === true) return; // verify-only leaf: no branch/worktree ever existed - the janitor gets no entry
     if (r.verdict === "merged" || r.verdict === "merged-after-arbitration" || r.verdict === "unknown") return;
     const b = String(r.branch);
     if (seen[b]) return;
@@ -947,16 +934,15 @@ function leftoverEntries(recs) {
   return out;
 }
 // bd-epic auto-close: leaves carrying a FINAL done verdict of THIS campaign -
-// merged/merged-after-arbitration (merge commit recorded by the merger) or verified
-// (verdict-only leaves have no commit -> the no-commit slot). Everything else
+// merged/merged-after-arbitration (merge commit recorded by the merger). Everything else
 // (failed/dropped/merge-failed/unknown/no-head/arbiter-failed) is NEVER closed: bd
 // stays the source of truth for not-delivered work. Feeds the POST-LOOP close (the
-// merger closes the merged ones eagerly during the loop; verified leaves have no merger).
+// merger closes the merged ones eagerly during the loop).
 function bdCloseEntries(recs) {
   const out = [];
   (recs || []).forEach(function (r) {
     if (!r || !r.id) return;
-    if (r.verdict !== "merged" && r.verdict !== "merged-after-arbitration" && r.verdict !== "verified") return;
+    if (r.verdict !== "merged" && r.verdict !== "merged-after-arbitration") return;
     out.push({ id: String(r.id), commit: String(r.mergeCommit || ""), verdict: String(r.verdict) });
   });
   return out;
@@ -1004,10 +990,10 @@ function boundaryBrief(entries, refresh, closables) {
     entries.map(function (e) { return "- branch " + JSON.stringify(e.branch) + ", worktree " + JSON.stringify(e.worktree); }).join("\n")
   ] : ["PART 1 - JANITOR: no leftovers at this boundary - cleaned=[]."];
   const bdClose = (closables || []).length ? [
-    "PART 2 - BD CLOSE (mechanical bookkeeping, NOT a judgment call): the leaves below carry a FINAL done verdict from this campaign (merged / merged-after-arbitration, or verified for verdict-only leaves) but bd may still show them open - close EACH of them so bd catches up with the merges (a headless campaign must reach bd-epic-closed on its own).",
+    "PART 2 - BD CLOSE (mechanical bookkeeping, NOT a judgment call): the leaves below carry a FINAL done verdict from this campaign (merged / merged-after-arbitration) but bd may still show them open - close EACH of them so bd catches up with the merges (a headless campaign must reach bd-epic-closed on its own).",
     "Run each command line below from the MAIN working copy, piped stdin, VERBATIM (the grep pre-check skips an already-closed leaf without error - a driver's close is never overwritten):",
     ...closables.map(function (e) {
-      return "  bd show " + e.id + " --json </dev/null | grep -q '\"status\": *\"closed\"' || bd close " + e.id + " -r \"" + e.id + ": merge " + (e.commit || "no-commit (verdict-only)") + " - " + e.verdict + "\" </dev/null";
+      return "  bd show " + e.id + " --json </dev/null | grep -q '\"status\": *\"closed\"' || bd close " + e.id + " -r \"" + e.id + ": merge " + (e.commit || "no-commit") + " - " + e.verdict + "\" </dev/null";
     }),
     "The -r string is the MECHANICAL close comment: leaf id, merge commit, short verdict - exactly this form, no prose.",
     "Then flush the JSONL export and commit it to the integration tree (the merge pre-flight requires a clean porcelain; this is the ONLY commit this child ever makes; NEVER `git add -A`, only this one file). NO `|| true` - a failed git command must SURFACE, never be swallowed:",
@@ -1030,7 +1016,6 @@ function boundaryBrief(entries, refresh, closables) {
     "  files_hint = the first file path named in the description, first 200 chars, '' if none;",
     "  deps = ids of dependencies[] entries whose dependency_type is \"blocks\" (parent-child entries are NOT deps), [] if none;",
     "  review = the tier word full|lite|none that the description states for the task; missing or unknown -> \"full\".",
-    "  verify = true for verdict-only leaves (the description states the task delivers a verification VERDICT, not a code deliverable); missing or unknown -> false.",
     "Return only leaves shown by (a)-(c); NEVER invent ids."
   ] : ["PART 3 - BD SNAPSHOT: NOT requested at this boundary (the snapshot did not change) - run NO bd command; leaves=[]."];
   return [
@@ -1039,7 +1024,7 @@ function boundaryBrief(entries, refresh, closables) {
     ...bdClose,
     ...snapshot,
     FINAL_MSG,
-    "Schema keys: cleaned[{branch, worktree, removed (boolean), note}], closed[{id, closed (boolean), note}] (omit when there is no BD CLOSE section), leaves[{id, title, rationale, acceptance, files_hint, deps, open, review, verify}]."
+    "Schema keys: cleaned[{branch, worktree, removed (boolean), note}], closed[{id, closed (boolean), note}] (omit when there is no BD CLOSE section), leaves[{id, title, rationale, acceptance, files_hint, deps, open, review}]."
   ].join("\n");
 }
 function salvageReport(ctx, fromLabel) {
@@ -1084,37 +1069,14 @@ function salvageReport(ctx, fromLabel) {
 }
 
 function workPhase(t, rec, parallel) {
-  const verifyOnly = t.verify === true; // verdict-only leaf: repo-root work, no branch/worktree, no merge
   const slug = rec.branch;
   const ledgerDirName = "ledger-ag-" + slug.replace(/^agile\//, "");
-  const useLedger = !verifyOnly && engineOf(t) === "ledger";
-  const sddEngine = !verifyOnly && engineOf(t) === "sdd";
+  const useLedger = engineOf(t) === "ledger";
+  const sddEngine = engineOf(t) === "sdd";
   const engineAgent = sddEngine ? "sdd-worker" : undefined;
   const relayMode = useLedger;
   const wt = wtPathFor(t, rec);
-  // VERIFY-ONLY leaf brief: repo-root work, no git writes, full gate, journal verdict.
-  const verifyLines = [
-    "You are the TASK WORKER (VERIFY-ONLY LEAF). Execute EXACTLY ONE verification task. This task delivers a VERDICT, not code.",
-    "TASK-BEGIN",
-    "Task: " + t.title,
-    "Rationale: " + (t.rationale || ""),
-    "Acceptance criteria: " + (t.acceptance || ""),
-    "Expected files (hint, not a straitjacket): " + (t.files_hint || "as the code dictates"),
-    "Global constraints: " + constraints,
-    "TASK-END",
-    bundleScript ? "STEP 0 (context bundle, ONE call, before anything else): sh " + bundleScript + " '' " + JSON.stringify(String(t.title || "").slice(0, 160)) + " - returns bd task + git state + task-relevant map; replaces DISCOVERY only, never your own gate runs or reading the field files." : "",
-    "",
-    "VERIFY-ONLY CONTRACT (hard):",
-    "- NO git write commands at all: no branch, no worktree, no commit, no checkout, no merge, no stash. The repository must remain byte-identical when you finish.",
-    "- You run in the campaign repository root (your current directory IS the repo - there is NO scratch worktree): read the repository as the verification needs it and run the gate command HERE, but NEVER modify it - no tracked-file edits; the working copy must stay byte-identical when you finish.",
-    "Verification command (must pass before you finish): " + testCommand,
-    "- VERDICT TO THE SPRINT JOURNAL (mandatory): append ONE json line to " + journalDir + "/sprint-" + sprint + ".jsonl (create the dir if needed; it lives in your current directory - the campaign repository root): {\"task\": " + JSON.stringify(t.title) + ", \"verdict\": \"verified\" | \"failed\", \"note\": <1-line>}. \"verified\" ONLY when your own gate run is green; otherwise \"failed\".",
-    "",
-    "Report format: what_done (the verdict + evidence), files_changed ([] - nothing in the repo changes), verification (YOUR OWN gate run with numbers), branch \"\" (none - verify-only), worktree \"\" (none - verify-only), head \"\" (no commit - verify-only leaves are the ONLY empty-head reports), completed (true ONLY when the gate is green), testsAddedOrUpdated ([] - a verify leaf adds no tests), commandsRun, validationOutput, residualRisks, noStagedFiles, criteriaSatisfied.",
-    FACTS, ACC_STRUCTURED,
-    "If you need a decision beyond your scope (spec ambiguity, widening scope, destructive action), ask the calling side via contact_supervisor instead of guessing."
-  ].filter(Boolean).join("\n");
-  const workLines = verifyOnly ? verifyLines : [
+  const workLines = [
     "You are the TASK WORKER. Execute EXACTLY ONE task end-to-end.",
     relayMode ? "You are operating in RELAY MODE (see IMPLEMENTATION ENGINE below): a ceremony engine implements, you verify/commit/report." : "",
     "TASK-BEGIN",
@@ -1166,7 +1128,6 @@ function workPhase(t, rec, parallel) {
     ].join("\n") : ""
   ].filter(Boolean).join("\n");
   const workSpec = { task: workLines, outputSchema: WORK_SCHEMA };
-  if (verifyOnly) workSpec.accVerifyOnly = true; // rp-schema: head "" is valid ONLY for verdict-only leaves
   const wm = nextWorkModel(); // rotation pick (round-robin over workModels)
   if (wm) { workSpec.model = wm; rec.wm = wm; }
   if (sddEngine) workSpec.agent = engineAgent; // sdd per-task engine overrides the profile; otherwise childOpts default / relay override applies — passing agent:undefined here poisons Object.assign and crashes runs.run validation
@@ -1179,7 +1140,7 @@ function workPhase(t, rec, parallel) {
     },
     function (e) {
       const msg = String((e && e.message) || e);
-      if (!verifyOnly && REPORT_SHAPE_RE.test(msg)) {
+      if (REPORT_SHAPE_RE.test(msg)) {
         // The worker RAN and may have landed commits on the branch. Recover the
         // REPORT from the actual state - never re-run the implementation brief.
         return salvageReport({ t: t, rec: rec, slug: slug, wt: wt, parallel: parallel, testCommand: testCommand, testCommandQuick: testCommandQuick, useLedger: useLedger, sprint: sprint, reason: msg }, "work").then(function (o) {
@@ -1238,16 +1199,6 @@ function ledgerRepair(t, rec, parallel, arbiterNote) {
 }
 
 function postPhase(t, rec, wOut, parallel) {
-  if (t.verify === true) {
-    // VERIFY-ONLY leaf: verdict-only product - no branch/worktree ever existed, so
-    // there is nothing to diff (no review child), nothing to integrate (no merge
-    // child) and nothing for the janitor. The work child ran the FULL verify gate
-    // and appended the sprint journal line itself; the verdict also rides in the
-    // sprint result (res.tasks/counts) to the driver.
-    rec.verdict = (wOut && wOut.completed === true) ? "verified" : "failed";
-    log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": verify " + rec.verdict + " (verdict-only leaf: no branch/worktree created, review/merge children skipped)");
-    return Promise.resolve();
-  }
   if (wOut && wOut.head) rec.head = String(wOut.head);
   const slug = rec.branch;
   const useLedger = engineOf(t) === "ledger";
@@ -1835,7 +1786,7 @@ while (sprint < maxSprints && continueCampaign && !stopReason) {
   for (const wave of waves) {
     if (wave.tasks.length === 1) {
       const t = wave.tasks[0];
-      const rec = { id: t.id || "", sprint: sprint, title: t.title, branch: branchPrefix + slugify(t.title), iterations: 0, verdict: "unknown", verify: t.verify === true };
+      const rec = { id: t.id || "", sprint: sprint, title: t.title, branch: branchPrefix + slugify(t.title), iterations: 0, verdict: "unknown" };
       rec.wt = wtPathFor(t, rec);
       const wOut = await workPhase(t, rec, false);
       log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": work " + (wOut.completed === true ? "ok" : "incomplete") + " (" + rec.iterations + " iter)");
@@ -1845,7 +1796,7 @@ while (sprint < maxSprints && continueCampaign && !stopReason) {
     } else {
       log.push("sprint " + sprint + ": wave " + wave.wave + " rolling pool: [" + wave.tasks.map(function (t) { return "t" + ((t._idx || 0) + 1); }).join(", ") + "], " + Math.max(1, Math.min(maxParallel, wave.tasks.length)) + " work slot(s), shared queue + capped post queue)");
       const recs = wave.tasks.map(function (t) {
-        const r = { id: t.id || "", sprint: sprint, title: t.title, branch: branchPrefix + slugify(t.title), iterations: 0, verdict: "unknown", verify: t.verify === true };
+        const r = { id: t.id || "", sprint: sprint, title: t.title, branch: branchPrefix + slugify(t.title), iterations: 0, verdict: "unknown" };
         r.wt = wtPathFor(t, r);
         return r;
       });
@@ -1988,8 +1939,8 @@ if (budgetHit && /^(max-sprints reached|stop-criteria \(retro\)|sdd tasks exhaus
   stopReason = "token budget exhausted (runtime usageBudget)";
 }
 // POST-LOOP bd-close (bd-epic): mergers close their own merges eagerly, but a close can
-// fail or go unreported (best-effort) and verified verdict-only leaves have no merger -
-// those would stay open in bd when the loop ends (maxSprints/budget/stall/epic-closed).
+// fail or go unreported (best-effort) - those would stay open in bd when the loop ends
+// (maxSprints/budget/stall/epic-closed).
 // One mechanical child closes whatever is still pending, whatever the stopReason.
 // Best-effort: a failed close is logged and the merge verdict stands.
 if (taskSource === "bd-epic") {
@@ -2053,8 +2004,6 @@ if (analyticsEnabled) {
   }
 }
 const mergedCount = taskResults.filter(function (r) { return r.verdict === "merged" || r.verdict === "merged-after-arbitration"; }).length;
-const verifiedCount = taskResults.filter(function (r) { return r.verdict === "verified"; }).length; // acc-verifyleaf: verdict-only deliverables
-const doneTasks = mergedCount + verifiedCount;
 // Verdict-class counters, NOT a strict partition: "drop-failed" lands in both
 // dropped and failed; "unknown"/"no-head-reported" land in neither.
 const droppedCount = taskResults.filter(function (r) { return r.verdict === "dropped" || r.verdict === "drop-failed"; }).length;
@@ -2063,11 +2012,11 @@ let STATUS;
 if (stopReason === "approval-required" || stopReason === "sdd-setup-failed") STATUS = "blocked";
 else if (/^bd-epic-stalled/.test(stopReason)) STATUS = "blocked";
 else if (/budget exhausted/.test(stopReason)) STATUS = taskResults.length ? "partial" : "failed";
-else if (doneTasks > 0 && taskResults.length > doneTasks) STATUS = "partial";
-else if (doneTasks > 0) STATUS = "completed";
+else if (mergedCount > 0 && taskResults.length > mergedCount) STATUS = "partial";
+else if (mergedCount > 0) STATUS = "completed";
 else if (taskResults.length === 0) STATUS = /curator failed|sdd items likely remain/.test(stopReason) ? "failed" : "completed"; // nothing to do is a legitimate completion; a curator breakdown is not
 else STATUS = "failed";
-log.push("campaign end: " + doneTasks + "/" + taskResults.length + " tasks merged over " + sprint + " sprint(s); " + stopReason);
+log.push("campaign end: " + mergedCount + "/" + taskResults.length + " tasks merged over " + sprint + " sprint(s); " + stopReason);
 await cpWrite({
   phase: STATUS === "completed" ? "completed" : (STATUS === "blocked" ? "waiting" : "interrupted"),
   status: STATUS,
@@ -2083,9 +2032,9 @@ if (stateOk) {
 
 return {
   status: STATUS,
-  done: doneTasks > 0, // legacy flag - use `status`/`counts` as evidence
+  done: mergedCount > 0, // legacy flag - use `status`/`counts` as evidence
   stopReason: stopReason,
-  counts: { planned: plannedTotal, merged: mergedCount, verified: verifiedCount, dropped: droppedCount, failed: failedCount },
+  counts: { planned: plannedTotal, merged: mergedCount, dropped: droppedCount, failed: failedCount },
   generation: GENERATION,
   used: usedCount,
   repairUsed: repairUsedCount,

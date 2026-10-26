@@ -96,20 +96,20 @@ T("agile_run: bd-epic launch plan from a mocked bd (open leaves, engine shape, d
       rationale: "Add parser in extensions/pi-agile/bd.ts. review: lite\nAcceptance: (1) node --test passes (2) exit 0",
       acceptance: "(1) node --test passes (2) exit 0",
       files_hint: "extensions/pi-agile/bd.ts",
-      deps: [], open: true, review: "lite", verify: false,
+      deps: [], open: true, review: "lite",
     },
     {
       id: "L2", title: "title L2",
       rationale: "Wire launch in extensions/pi-agile/launch.ts",
       acceptance: "",
       files_hint: "extensions/pi-agile/launch.ts",
-      deps: ["L1"], open: true, review: "full", verify: false,
+      deps: ["L1"], open: true, review: "full",
     },
     {
       id: "L4", title: "title L4",
       rationale: "Docs only",
       acceptance: "", files_hint: "",
-      deps: [], open: true, review: "full", verify: false,
+      deps: [], open: true, review: "full",
     },
   ]);
 
