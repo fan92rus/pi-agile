@@ -1,91 +1,63 @@
 # pi-agile
 
-Autonomous Agile/Kanban engine for [pi](https://github.com/earendil-works/pi-coding-agent) coding agent.
+Agile/Kanban campaign engine for the [pi](https://github.com/earendil-works/pi-coding-agent) coding agent.
 
-The agent independently discovers tasks, delegates to worker subagents, conducts deep code review, reflects on results, and iterates in sprints — all within configurable constraints.
+A bd epic is a campaign. The engine takes its open leaves, curates them into waves, runs each
+task in its own git worktree with a gated worker, a fresh reviewer, and a merger, and repeats
+in sprints until the stop criteria are met.
 
-## Architecture
+## Layout
 
 ```
-Agent decides · Extension runs
+extensions/pi-agile/   pi extension: two tools (agile_run, agile_status)
+workflows/agile-loop.js  the engine: a workflow script run by pi-subagents
+skills/agile-solve/    skill describing the engine contract for the caller
 ```
 
-- **Extension** (TypeScript): runs discovery tools (linters, coverage, semgrep), calls `bd` CLI for task management, delegates worker/reviewer subagents, manages git branches, persists knowledge.
-- **Agent** (LLM): reads discovery output, decides what tasks to create, evaluates constraint compliance, decides merge/rework/block, checks stop criteria.
-- **Constraints** are text injected into prompts — not programmatic checks.
-- **Stop criteria** are checked by the agent — not by an automated function.
+- **Engine** (`workflows/agile-loop.js`) lives in this repository. It is a single workflow script:
+  the parent script awaits every child (discovery, curator, worker, reviewer, arbiter/merger,
+  retrospective), and its completion receipt carries the whole trace.
+- **Extension** (`extensions/pi-agile/`) is a thin harness. It never runs the loop itself.
+  - `agile_run` — launch station. Read-only check of the epic in bd, snapshot of the open
+    leaves, defaults and validation of the launch arguments. Returns the engine path, the args
+    and a copyable `subagent({ ... })` call. Starts nothing, writes nothing.
+  - `agile_status` — read-only progress of a launched campaign: workflow state and result,
+    checkpoint (phase, sprint, cooldowns) and the last settled children.
 
 ## Quick Start
 
-```bash
-# 1. Setup project (interactive wizard)
-/agile setup
+1. Create a bd epic with the work as open leaves (`bd create ...`, attach them to the epic).
+2. In pi, plan the launch:
 
-# 2. Run sprint loop
-/agile run
+   ```
+   agile_run({ epic: "<epic-id>", testCommand: "<full test suite command>" })
+   ```
 
-# 3. Check status
-/agile status
-```
+   Optional arguments: `cwd`, `sprintTasks` (default 3), `maxSprints` (default 3),
+   `maxParallel` (default 3), `mergeApproval` (`auto` | `confirm`, default `auto`),
+   `workModels`, `reviewModels`, `bundleScript`.
+3. Start the campaign with the `subagent` call line that `agile_run` returns.
+4. Check progress at any time:
 
-## Commands
+   ```
+   agile_status({ runId: "<run-id>" })   // or agile_status({}) for the freshest run
+   ```
 
-| Command | Description |
-|---|---|
-| `/agile setup` | Run setup wizard (creates `.agile/project.yaml` + `.agile/constraints.yaml`) |
-| `/agile run` | Start sprint loop |
-| `/agile status` | Show current sprint status |
-| `/agile stop` | Graceful stop after current tasks |
-| `/agile config` | Show configuration |
-| `/agile observer` | Toggle observer on/off |
-
-## Sprint Loop
-
-```
-discovery → agent creates tasks in bd → bd ready → bd claim →
-delegate worker → delegate reviewer → bd close → retrospective → stop-check → next sprint
-```
-
-1. **Discovery**: Extension runs linters, coverage, security scans; agent reads raw output and decides what tasks to create
-2. **Execution**: Extension delegates workers (fresh-context subagents on feature branches) and reviewers (fresh-context read-only subagents)
-3. **Review**: Reviewer evaluates architecture, correctness, security, performance, tests, constraints
-4. **Retrospective**: Extension computes velocity; agent formulates lessons and checks stop criteria
-5. **Repeat**: If stop criteria not met, next sprint begins
-
-## Configuration
-
-### `.agile/project.yaml`
-
-```yaml
-project:
-  goal: "Improve auth module test coverage to 80%"
-  scope:
-    include: ["src/auth/**", "tests/auth/**"]
-    exclude: ["migrations/**"]
-  stop_when:
-    mode: any_of
-    conditions:
-      - metric: coverage
-        target: 80
-        command: "npx jest --coverage"
-  review_depth: deep
-  max_workers: 5
-```
-
-### `.agile/constraints.yaml`
-
-```yaml
-rules:
-  - id: require-tests
-    rule: "All new code must have tests"
-do_not_do:
-  - "Don't modify lockfiles directly"
-```
+`testCommand` is the host gate: no gate, no launch.
 
 ## Requirements
 
-- [pi](https://github.com/earendil-works/pi-coding-agent) coding agent
-- [bd](https://github.com/zimash/bd) CLI for task management
+- [pi](https://github.com/earendil-works/pi-coding-agent) coding agent with pi-subagents (workflow scripts)
+- [bd](https://github.com/zimash/bd) CLI for task management (the epic and its leaves live in bd)
+- Node.js >= 22 (the extension runs TypeScript directly via type stripping)
+- A git repository with a working test command
+
+## Development
+
+```bash
+npm test                                   # node --test tests/agile-loop.test.mjs
+node --experimental-strip-types --check extensions/pi-agile/index.ts
+```
 
 ## License
 
