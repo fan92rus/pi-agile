@@ -52,7 +52,9 @@
 //   QUOTA COOLING-DOWN (implemented, next to the breaker): a 429 failure parses the
 //                  provider's wait (/'requested (\d+)s retry delay'/; unparsable ->
 //                  600s; cap 7200s) and cools the burned model until now+wait in the
-//                  durable checkpoint. Model selection for subsequent children (work/
+//                  durable checkpoint; 403/forbidden quota walls ("403 Request not
+//                  allowed") carry no estimate and take the default 600s. Model
+//                  selection for subsequent children (work/
 //                  review pools, ladder start) skips cooling models (until > now); ALL
 //                  cooling -> minimal until; expired until -> eligible again.
 //   mergePolicy    ('confirm'|'auto', default 'confirm') caller confirms merges
@@ -273,8 +275,8 @@ if (!stateOk) log.push("checkpoint: mission state unavailable - recovery after a
 else if (cpPrev && typeof cpPrev === "object" && cpPrev.phase === "running") log.push("reconcile: previous checkpoint phase=running (generation " + (cpPrev.generation || "?") + ") - marked interrupted; tasks are never silently re-planned");
 await cpWrite({ phase: "running", interruptedBefore: !!(cpPrev && typeof cpPrev === "object" && cpPrev.phase === "running") });
 
-// --- overload circuit breaker (per-model 429 strikes) ------------------------------
-// Every 429 ladder step burns a STRIKE on the model that failed; a child success on
+// --- overload circuit breaker (per-model 429/403 strikes) ------------------------------
+// Every 429/403-forbidden ladder step burns a STRIKE on the model that failed; a child success on
 // a model clears its strikes; strikes >= args.overloadTripThreshold (default 2) TRIP
 // the model: runChild skips it when STARTING a new child (first healthy model leads
 // the [primary]+ladder sequence; ALL tripped -> run as-is, the breaker must not
@@ -296,9 +298,11 @@ function resetStrikes(m) {
   cpWrite({ overloadStrikes: Object.assign({}, overloadStrikes) });
 }
 
-// --- quota cooling-down (per-model 429 retry-after) ---------------------------------
+// --- quota cooling-down (per-model 429/403 retry-after) ------------------------------
 // A child that dies on a rate limit carries the provider's own wait estimate
-// ("Server requested NNNNs retry delay"). The engine parses it (unparseable ->
+// ("Server requested NNNNs retry delay"); a quota-FORBIDDEN wall ("403 Request not
+// allowed", "forbidden") carries no estimate and takes the default. The engine parses
+// it (unparseable ->
 // default 600s; capped at 7200s) and puts the burned model into COOLING-DOWN until
 // <now + wait>. Model selection for subsequent children (work pool, review pool,
 // ladder start) skips cooling models (until > now); when EVERY candidate is cooling,
@@ -323,13 +327,13 @@ function retryAfterSeconds(errText) {
   if (!Number.isFinite(n)) return COOLING_DEFAULT_S; // no parseable retry delay -> default wait
   return Math.min(n, COOLING_CAP_S); // a huge provider delay is capped
 }
-function recordCooling(m, seconds, key) {
+function recordCooling(m, seconds, key, label) {
   if (!m) return; // modeless launches have no model to cool
   const k = String(m);
   const until = Date.now() + Math.max(0, Number(seconds) || 0) * 1000;
   if (until <= coolingUntil(k)) return; // an already-longer wait wins
   coolingDown[k] = new Date(until).toISOString();
-  emit("[cooling] " + (key ? key + ": " : "") + "model '" + k + "' rate-limited (429) -> cooling down until " + coolingDown[k] + " (" + Math.round((until - Date.now()) / 1000) + "s retry-after)");
+  emit("[cooling] " + (key ? key + ": " : "") + "model '" + k + "' " + (label || "rate-limited (429)") + " -> cooling down until " + coolingDown[k] + " (" + Math.round((until - Date.now()) / 1000) + "s retry-after)");
   cpWrite({ coolingDown: Object.assign({}, coolingDown) }); // best-effort persist: cooling survives a mid-sprint crash/resume
 }
 function minCoolingModel(models) {
@@ -507,7 +511,7 @@ function withGate(extra, relayOverride) {
 // emit: host global exists in the pi-subagents sandbox, but the local definition
 // keeps retry diagnostics in the returned log without relying on the host.
 const TRANSPORT_RE = /all connection attempts failed|econn(refused|reset|aborted)|etimedout|eai_again|enotfound|fetch failed|socket hang up|bad gateway|service unavailable|gateway timeout|enginecore|engine core|internal server error/i;
-const OVERLOAD_RE = /overloaded|rate.?limit|429|too many requests|quota/i;
+const OVERLOAD_RE = /overloaded|rate.?limit|429|too many requests|quota|\b403\b|forbidden/i; // \b403\b/forbidden: quota-exhaustion/forbidden walls carry no retry estimate (live: glm "403 Request not allowed" burned 2 rework children)
 const SCHEMA_RE = /required structured output was not produced|missing structured_output|failed to produce structured output/i;
 // Q4: launch rejections from the runtime-level usageBudget (see pi-subagents docs:
 // accounts usage across completed children, rejects later launches once exhausted,
@@ -655,15 +659,17 @@ function runChild(key, spec) {
     }
     if (OVERLOAD_RE.test(errText)) {
       // Quota cooling-down FIRST: the provider told us how long this model is done for
-      // ("Server requested NNNNs retry delay"); record it so SUBSEQUENT children (work/
+      // ("Server requested NNNNs retry delay"; a 403/forbidden quota wall carries no
+      // estimate and takes the default wait); record it so SUBSEQUENT children (work/
       // review pools, fresh ladder sequences) never start on the burned model.
-      recordCooling(ladderSeq[modelIdx], retryAfterSeconds(errText), key);
+      const quotaKind = /\b403\b|forbidden/i.test(errText) ? "quota-forbidden (403)" : "rate-limited (429)";
+      recordCooling(ladderSeq[modelIdx], retryAfterSeconds(errText), key, quotaKind);
       if (modelIdx < ladderSeq.length - 1) {
         // Ladder step: same brief, next model, shared attempt counter. The launch
         // pattern is unchanged (attempt() already runs inside a .then chain).
         recordStrike(ladderSeq[modelIdx]); // breaker: the burned model takes a strike
         modelIdx++;
-        emit("[ladder] " + key + " attempt " + (n + 1) + ": model " + ladderSeq[modelIdx - 1] + " overloaded (429) -> next model: " + ladderSeq[modelIdx]);
+        emit("[ladder] " + key + " attempt " + (n + 1) + ": model " + ladderSeq[modelIdx - 1] + " " + quotaKind + " -> next model: " + ladderSeq[modelIdx]);
         return attempt(n + 1);
       }
       // No pause primitive in the sandbox - with the ladder exhausted, retrying a

@@ -2305,6 +2305,58 @@ T("cooling-down: unparsable 429 -> default 600s; parsed delay is capped at 7200s
   assert.ok(d2 > 7100 && d2 <= 7200, "99999s retry delay capped at 7200s cooling, got " + Math.round(d2) + "s");
 });
 
+// Live precedent (campaign d77a5dd8/85483e06): rework children s1-t2-rework1 and
+// s3-t1-rework1 died dead-on-arrival with "403 Request not allowed" (glm quota
+// exhaustion) - the 429-only markers missed it, so no cooling was recorded and the
+// same-brief relaunches kept burning against the wall. A 403/forbidden quota wall
+// must be treated exactly like a 429: cooling + ladder escape.
+T("cooling-down: 403 'Request not allowed' quota wall (live precedent) -> default 600s cooling + ladder escape; the resumed campaign skips it", async () => {
+  const mkRoutes = () => happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    work: (spec) => (spec.model === "m-a" ? boom("403 Request not allowed")() : ok(workOut())()),
+    review: ok(reviewOk(true), 1),
+  });
+  const st = makeState();
+  const args = baseArgs({ workModel: "m-a", modelLadder: ["m-b"], maxParallel: 1 });
+  const runs1 = makeRuns(mkRoutes());
+  const out1 = await runCampaign(args, runs1, st);
+  assert.ok(!out1.err, "campaign 1 threw: " + (out1.err && out1.err.message));
+  assert.equal(runs1.count(/s1-t1-work/), 2, "task 1 burns m-a (403 cooling recorded) and finishes on m-b");
+  assert.ok(out1.res.log.some((l) => /\[cooling\].*'m-a'.*forbidden \(403\)/.test(l)), "quota-forbidden (403) surfaced in the cooling log: " + JSON.stringify(out1.res.log.filter((l) => /cooling/.test(l))));
+  const untilIso = st.store.get("agile-cp").coolingDown && st.store.get("agile-cp").coolingDown["m-a"];
+  assert.ok(untilIso, "cooling-down {model, until} written for the 403 wall");
+  const waitS = (Date.parse(untilIso) - Date.now()) / 1000;
+  assert.ok(waitS > 590 && waitS <= 600, "403 carries no retry estimate -> default 600s cooling, got " + Math.round(waitS) + "s");
+  // resume on the SAME state: the live failure was a same-brief rework relaunch
+  // burning dead-on-arrival against the forbidden model
+  const runs2 = makeRuns(mkRoutes());
+  const out2 = await runCampaign(args, runs2, st);
+  assert.ok(!out2.err, "campaign 2 threw: " + (out2.err && out2.err.message));
+  const w2 = runs2.spec(/s1-t1-work$/);
+  assert.ok(w2, "resumed campaign launched work");
+  assert.equal(w2.spec.model, "m-b", "403-cooled m-a (until > now) skipped: the fresh child starts on m-b");
+  assert.equal(runs2.count(/s1-t1-work/), 1, "no burned attempt on the 403 wall");
+  assert.equal(out2.res.tasks[0].verdict, "merged");
+});
+
+T("cooling-down: 'forbidden' quota wall without any 429 marker -> same treatment: cooling + breaker strike + ladder escape", async () => {
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    work: (spec) => (spec.model === "m-a" ? boom("HTTP 403 Forbidden: access to this model is denied for your account")() : ok(workOut())()),
+    review: ok(reviewOk(true), 1),
+  });
+  const runs = makeRuns(routes);
+  const st = makeState();
+  const out = await runCampaign(baseArgs({ workModel: "m-a", modelLadder: ["m-b"], maxParallel: 1 }), runs, st);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(runs.count(/s1-t1-work/), 2, "task 1 burns m-a and escapes to m-b");
+  const cp = st.store.get("agile-cp");
+  assert.ok(cp.coolingDown && cp.coolingDown["m-a"], "cooling written from a 'forbidden' wall (no numeric-429 needed)");
+  assert.ok((Number(cp.overloadStrikes && cp.overloadStrikes["m-a"]) || 0) >= 1, "the 403 ladder step burns a breaker strike like a 429");
+  assert.ok(out.res.log.some((l) => /\[ladder\].*'m-a'.*next model: 'm-b'|\[ladder\].*m-a.*next model.*m-b/.test(l)), "ladder escape surfaced: " + JSON.stringify(out.res.log.filter((l) => /ladder/.test(l))));
+  assert.equal(out.res.tasks[0].verdict, "merged");
+});
+
 T("cooling-down: work pool skips a cooling model (until > now) and starts on the next one", async () => {
   const routes = happyRoutes({
     curator: ok(curatorOut(true, [task(1)])),
