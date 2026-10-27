@@ -116,6 +116,10 @@ export function makeRuns(routes) {
       specs.set(key, spec);
       events.push({ t: "start", key });
       let route = routes.find((r) => (typeof r.match === "string" ? key.includes(r.match) : r.match.test(key)));
+      if (!route && K.reportSchema.test(key)) {
+        // The campaign-start schema writer (R1) runs in EVERY campaign; most tests do not assert it.
+        route = { handle: async () => ({ ok: true, structuredOutput: { written: true } }) };
+      }
       if (!route && K.analytics.test(key)) {
         // The best-effort analytics child launches in EVERY campaign; most tests do not
         // care about it. Default no-op route keeps "unknown key -> hard error" loud for
@@ -153,6 +157,7 @@ export const K = {
   boundary: /-boundary(~retry\d+)?$/, // federation bd-epic mode: one sprint-boundary child (janitor + snapshot refresh)
   cleanup: /^final-cleanup(~retry\d+)?$/, // campaign-end leftover worktree/branch janitor
   finalClose: /^final-bd-close(~retry\d+)?$/, // bd-epic post-loop bd-close of the last sprint's merges (any stopReason)
+  reportSchema: /^report-schema(~retry\d+)?$/, // campaign-start writer of <journalDir>/report-schema.json (R1)
   analytics: /^campaign-analytics(~retry\d+)?$/, // campaign-end metrics archiver (analyze-campaign.mjs; best-effort)
   repair: /-repair/,
   retro: /-retro$/,

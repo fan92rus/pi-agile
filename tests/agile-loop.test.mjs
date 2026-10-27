@@ -376,7 +376,7 @@ T("rework schema-missing salvage reports completed=false -> verdict failed, no r
   const routes = happyRoutes({
     curator: ok(curatorOut(true, [task(1)])),
     review: ok(reviewOk(false)),
-    rework: ok(workOut({ noStagedFiles: false })), // semantic rejection: 'schema-missing: noStagedFiles'
+    rework: ok(workOut({ validationOutput: [] })), // semantic rejection: 'schema-missing: validationOutput'
     reportRepair: ok(workOut({ completed: false })),
     arbiter: ok(arbOut("drop-branch", "arbiter must never run here")),
   });
@@ -397,10 +397,10 @@ T("rework acceptance-rejected after salvage already used -> verdict failed, NO s
   // (eager review of rejected work), the verdict is failed and the campaign continues.
   const routes = happyRoutes({
     curator: ok(curatorOut(true, [task(1)])),
-    work: ok(workOut({ noStagedFiles: false })), // semantic rejection -> salvage (repaired=true)
+    work: ok(workOut({ validationOutput: [] })), // semantic rejection -> salvage (repaired=true)
     reportRepair: ok(workOut()),
     review: ok(reviewOk(false)),
-    rework: ok(workOut({ noStagedFiles: false })), // semantic rejection, salvage already used
+    rework: ok(workOut({ validationOutput: [] })), // semantic rejection, salvage already used
     arbiter: ok(arbOut("drop-branch", "arbiter must never run here")),
   });
   const runs = makeRuns(routes);
@@ -1174,7 +1174,8 @@ T("toy-falcon sprint-1 start: args.bdTasks snapshot -> first child is work (NO i
     bdTasks: [falconLeaf("fal-a")],
   }), routes, makeState());
   assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
-  const starts = out.events.filter((e) => e.t === "start").map((e) => e.key);
+  // the campaign-start report-schema writer (R1) precedes every sprint; it is not a sprint child
+  const starts = out.events.filter((e) => e.t === "start" && !/^report-schema/.test(e.key)).map((e) => e.key);
   assert.ok(/^s1-t1-work$/.test(starts[0]), "with args.bdTasks the first launched child of sprint 1 is work: " + JSON.stringify(starts));
   assert.equal(starts.filter((k) => /^s1-boundary/.test(k)).length, 0, "no initial boundary/cursor child at sprint 1 on an args snapshot");
   assert.equal(routes.count(/^s2-boundary$/), 1, "sprint 2 boundary logic unchanged (janitor + refresh after a merge)");
@@ -1190,7 +1191,7 @@ T("toy-falcon sprint-1 start: args.bdTasks snapshot -> first child is work (NO i
     sprintTasks: 2, maxSprints: 1, bdTasks: [],
   }), routes2, makeState());
   assert.ok(!out2.err, "workflow threw: " + (out2.err && out2.err.message));
-  const starts2 = out2.events.filter((e) => e.t === "start").map((e) => e.key);
+  const starts2 = out2.events.filter((e) => e.t === "start" && !/^report-schema/.test(e.key)).map((e) => e.key);
   assert.ok(/^s1-boundary/.test(starts2[0]), "without a snapshot the initial boundary child starts sprint 1: " + JSON.stringify(starts2));
 });
 
@@ -1887,7 +1888,8 @@ T("contract: WORK_SCHEMA carries the acceptance fields (head/testsAddedOrUpdated
   assert.deepEqual(sch.properties.commandsRun.items.properties.result.enum, ["passed", "failed", "not-run"], "result enum matches the host report contract");
   assert.equal(sch.properties.commandsRun.minItems, 1, "commandsRun non-empty (a verified report has at least the gate run)");
   assert.equal(sch.properties.validationOutput.minItems, 1, "validationOutput non-empty");
-  assert.equal(sch.properties.noStagedFiles.const, true, "noStagedFiles const true");
+  assert.equal(sch.properties.noStagedFiles.type, "boolean", "noStagedFiles is a boolean (R1: an honest false is a valid report)");
+  assert.equal(sch.properties.noStagedFiles.const, undefined, "noStagedFiles carries NO forced const");
   assert.equal(sch.properties.criteriaSatisfied.minItems, 2, "criteriaSatisfied exactly two entries");
   assert.equal(sch.properties.criteriaSatisfied.maxItems, 2);
   assert.deepEqual(sch.properties.criteriaSatisfied.items.properties.id.enum, ["criterion-1", "criterion-2"], "exactly the host criterion ids");
@@ -1954,7 +1956,7 @@ for (const [field, badPayload] of [
   ["commandsRun", { commandsRun: [{ command: "npm test", result: "exit 0", summary: "green" }] }], // enum violation (live poison class)
   ["validationOutput", { validationOutput: [] }], // empty evidence
   ["residualRisks", { residualRisks: "none" }], // not an array
-  ["noStagedFiles", { noStagedFiles: false }],
+  ["noStagedFiles", { noStagedFiles: "true" }], // type violation: noStagedFiles must be a boolean (R1: false itself is honest and valid)
   ["criteriaSatisfied", { criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "e" }, { id: "criterion-3", status: "satisfied", evidence: "e" }] }], // foreign id
   // rework r1: contract requires status EXACTLY "satisfied" - one not-satisfied entry must reject
   ["criteriaSatisfied", { criteriaSatisfied: [{ id: "criterion-1", status: "not-satisfied", evidence: "e" }, { id: "criterion-2", status: "satisfied", evidence: "e" }] }],
@@ -3124,7 +3126,7 @@ T("wide wave unawaited-launch contract: 2 bd-epic leaves, one sprint, no deps - 
   assert.equal(res.status, "completed");
   assert.ok(res.tasks.every((r) => r.verdict === "merged"), "both leaves merged: " + res.tasks.map((r) => r.verdict).join(", "));
   const starts = out.events.filter((e) => e.t === "start").map((e) => e.key);
-  assert.equal(starts.length, 8, "wave-4 child shape (2 work + 2 review + 2 merge + boundary + analytics): " + starts.join(", "));
+  assert.equal(starts.length, 9, "wave-4 child shape (report-schema writer + 2 work + 2 review + 2 merge + boundary + analytics): " + starts.join(", "));
   // Criterion (2): the analytics archiver is the LAST child - the retro write happens
   // only after every merge child completed, and its result is carried to the return.
   const analyticsAt = finishedOk(out.events, K.analytics);
@@ -3164,4 +3166,132 @@ T("serial path (single-task wave) under tracker emulation: every launch consumed
   const workOk = finishedOk(out.events, K.work);
   const reviewStart = started(out.events, K.review);
   assert.ok(reviewStart > workOk, "serial wave: review waits for work");
+});
+
+// --- R1: report self-check (workflows/report-check.mjs) + honest noStagedFiles -------------
+// The engine serializes its inline report schemas to <journalDir>/report-schema.json at campaign
+// start; the work/rework/merge briefs carry the checker call; the checker validates a draft.
+const REPORT_CHECK = pathMod.join(pathMod.dirname(fileURLToPath(import.meta.url)), "..", "workflows", "report-check.mjs");
+const SCHEMA_MARK = "JSON CONTENT:\n";
+const schemaMapOf = (brief) => JSON.parse(brief.slice(brief.indexOf(SCHEMA_MARK) + SCHEMA_MARK.length));
+
+T("contract: campaign start writes the report schemas to <journalDir>/report-schema.json BEFORE the first work child (R1)", async () => {
+  const runs = makeRuns(happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }));
+  const out = await runCampaign(baseArgs(), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const w = runs.spec(K.reportSchema);
+  assert.ok(w, "the report-schema writer child launched");
+  assert.ok(w.spec.task.includes(".agile-js-test/report-schema.json"), "writes to <journalDir>/report-schema.json");
+  assert.ok(started(out.events, K.reportSchema) < started(out.events, K.work), "written before the first work child");
+  const map = schemaMapOf(w.spec.task);
+  assert.deepEqual(map.work, runs.spec(K.work).spec.outputSchema, "serialized work schema == the schema the work children are validated against");
+  assert.deepEqual(map.merge, runs.spec(K.merge).spec.outputSchema, "serialized merge schema == the merge child schema");
+});
+
+T("contract: work, rework and merge briefs each carry exactly one report self-check call (R1)", async () => {
+  let reviews = 0;
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    review: async () => ok(reviewOk(reviews++ > 0))(), // first verdict rejects -> one rework child
+  });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs({ reportCheckScript: REPORT_CHECK }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const briefs = [["work", runs.spec(K.work).spec.task], ["rework", runs.spec(K.rework).spec.task], ["merge", runs.spec(K.merge).spec.task]];
+  for (const [kind, brief] of briefs) {
+    const calls = brief.split("\n").filter((l) => l.includes("report-check.mjs"));
+    assert.equal(calls.length, 1, kind + ": exactly one checker call line");
+    assert.ok(calls[0].includes("node " + REPORT_CHECK), kind + ": runs the reportCheckScript arg");
+    assert.ok(calls[0].includes("--kind " + kind), kind + ": --kind " + kind);
+    assert.ok(calls[0].includes("--schema ") && calls[0].includes("report-schema.json"), kind + ": --schema <journalDir>/report-schema.json");
+    assert.ok(calls[0].includes("--draft "), kind + ": --draft");
+  }
+  assert.ok(briefs[0][1].includes("--branch agile/") && briefs[1][1].includes("--branch agile/"), "work/rework checker line carries the branch");
+});
+
+// The checker reads the schema the ENGINE serializes - captured from a real (fake-runs) campaign.
+async function engineSchemaFile() {
+  const runs = makeRuns(happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }));
+  const out = await runCampaign(baseArgs(), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const dir = fsSync.mkdtempSync(pathMod.join(os.tmpdir(), "r1-schema-"));
+  const file = pathMod.join(dir, "report-schema.json");
+  fsSync.writeFileSync(file, JSON.stringify(schemaMapOf(runs.spec(K.reportSchema).spec.task)));
+  return file;
+}
+function makeRepo() {
+  const dir = fsSync.mkdtempSync(pathMod.join(os.tmpdir(), "r1-repo-"));
+  const git = (...a) => spawnSync("git", ["-C", dir, ...a], { encoding: "utf8", timeout: 60000, input: "" });
+  git("init");
+  git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "init");
+  return { dir, head: git("rev-parse", "HEAD").stdout.trim() };
+}
+function runCheck(args) {
+  const r = spawnSync(process.execPath, [REPORT_CHECK, ...args], { encoding: "utf8", timeout: 60000, input: "" });
+  return { status: r.status, lines: r.stdout.split(/\r?\n/).filter(Boolean) };
+}
+function draftFile(obj) {
+  const f = pathMod.join(fsSync.mkdtempSync(pathMod.join(os.tmpdir(), "r1-draft-")), "draft.json");
+  fsSync.writeFileSync(f, JSON.stringify(obj));
+  return f;
+}
+
+T("report-check: a valid work draft against the engine schema exits 0 (R1)", async () => {
+  const schema = await engineSchemaFile();
+  const repo = makeRepo();
+  const draft = draftFile(workOut({ head: repo.head, branch: "agile/r1-x", worktree: repo.dir }));
+  const r = runCheck(["--schema", schema, "--kind", "work", "--draft", draft, "--worktree", repo.dir, "--branch", "agile/r1-x"]);
+  assert.equal(r.status, 0, "clean draft exits 0: " + JSON.stringify(r.lines));
+  assert.deepEqual(r.lines, ["report-check: ok (kind=work)"]);
+});
+
+T("report-check: a valid merge draft exits 0 (R1)", async () => {
+  const schema = await engineSchemaFile();
+  const draft = draftFile({ merged: true, checks_ok: true, journal_written: true, merge_commit: "abc1234", note: "" });
+  const r = runCheck(["--schema", schema, "--kind", "merge", "--draft", draft]);
+  assert.equal(r.status, 0, "clean merge draft exits 0: " + JSON.stringify(r.lines));
+});
+
+T("report-check: head 'x', no worktree, no what_done, noStagedFiles=true over a dirty worktree -> exact per-field lines, exit 1 (R1)", async () => {
+  const schema = await engineSchemaFile();
+  const repo = makeRepo();
+  fsSync.writeFileSync(pathMod.join(repo.dir, "dirty.txt"), "x"); // untracked = dirty for `git status --short`
+  const bad = workOut({ head: "x", branch: "agile/r1-x", noStagedFiles: true });
+  delete bad.what_done;
+  delete bad.worktree;
+  const r = runCheck(["--schema", schema, "--kind", "work", "--draft", draftFile(bad), "--worktree", repo.dir, "--branch", "agile/r1-x"]);
+  assert.equal(r.status, 1, "problems exit 1");
+  assert.deepEqual(r.lines, [
+    "what_done: обязательное поле отсутствует",
+    "worktree: обязательное поле отсутствует",
+    "head: ожидалось значение по шаблону ^[0-9a-f]{40}$, получено 'x'",
+    "noStagedFiles: true, но в worktree незакоммиченные изменения (1): ?? dirty.txt",
+  ]);
+});
+
+T("report-check: an honest noStagedFiles=false over a dirty worktree is a named line, not a schema error (R1)", async () => {
+  const schema = await engineSchemaFile();
+  const repo = makeRepo();
+  fsSync.writeFileSync(pathMod.join(repo.dir, "dirty.txt"), "x");
+  const draft = draftFile(workOut({ head: repo.head, branch: "agile/r1-x", worktree: repo.dir, noStagedFiles: false }));
+  const r = runCheck(["--schema", schema, "--kind", "work", "--draft", draft, "--worktree", repo.dir, "--branch", "agile/r1-x"]);
+  assert.equal(r.status, 1);
+  assert.deepEqual(r.lines, ["noStagedFiles: false - в worktree незакоммиченные изменения (1): закоммить или откати и поставь true"]);
+});
+
+T("R1: an honest noStagedFiles=false report passes the repair schema and the in-script acceptance check (forced const removed)", async () => {
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    work: ok(workOut({ validationOutput: [] })), // 'schema-missing: validationOutput' -> report-repair
+    reportRepair: ok(workOut({ noStagedFiles: false, head: "7777777777777777777777777777777777777777" })),
+  });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs(), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const { res } = out;
+  assert.equal(runs.count(K.reportRepair), 1, "the repair child ran");
+  assert.ok(res.log.some((l) => l.includes("report repaired from branch state")), "the honest false report was accepted as the repair: " + JSON.stringify(res.log));
+  assert.ok(!res.log.some((l) => l.includes("report-repair failed")), "no repair rejection");
+  assert.equal(runs.spec(K.reportRepair).spec.outputSchema.properties.noStagedFiles.const, undefined, "no forced const in the repair schema");
+  assert.equal(res.tasks[0].verdict, "merged");
 });

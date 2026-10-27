@@ -117,6 +117,9 @@ const maxParallel = Math.min(Math.max(Number(args.maxParallel) || 3, 1), 4);
 const mergePolicy = String(args.mergePolicy || "confirm").toLowerCase() === "auto" ? "auto" : "confirm";
 const branchPrefix = String(args.branchPrefix || "agile/");
 const journalDir = String(args.journalDir || ".agile-js");
+// R1 report self-check: the mechanical checker a worker runs on its draft report before the final
+// message. It validates against journalDir/report-schema.json, written at campaign start.
+const reportCheckScript = String(args.reportCheckScript || "D:/Documents/Repositories/pi-agile/workflows/report-check.mjs");
 const ledgerWorkflowPath = String(args.ledgerWorkflowPath || "C:/Users/user/.agents/skills/ledger-solve/workflows/ledger-loop-mem.js");
 // Campaign analytics (self-reporting campaigns): at campaign end ONE mechanical child copies
 // the workflow's runtime artifacts (events.jsonl / workflow-children.jsonl / status.json - the
@@ -783,7 +786,8 @@ const WORK_SCHEMA = {
     }, required: ["command", "result", "summary"], additionalProperties: false } },
     validationOutput: { type: "array", minItems: 1, items: { type: "string" } },
     residualRisks: { type: "array", items: { type: "string" } },
-    noStagedFiles: { type: "boolean", const: true, description: "true only when `git status --short` is empty in your tree after the final commit" },
+    // R1: NO const - an honest false is a valid report; the real gate is the merge pre-flight.
+    noStagedFiles: { type: "boolean", description: "true only when `git status --short` is empty in your tree after the final commit" },
     criteriaSatisfied: { type: "array", minItems: 2, maxItems: 2, items: { type: "object", properties: {
       id: { type: "string", enum: ["criterion-1", "criterion-2"] },
       // rework r1: the host contract requires status EXACTLY "satisfied" - a report
@@ -812,7 +816,7 @@ function validateAccStructured(so) {
   })) return "commandsRun";
   if (!isStrArr(so.validationOutput) || so.validationOutput.length < 1) return "validationOutput";
   if (!isStrArr(so.residualRisks)) return "residualRisks";
-  if (so.noStagedFiles !== true) return "noStagedFiles";
+  if (typeof so.noStagedFiles !== "boolean") return "noStagedFiles";
   const crit = so.criteriaSatisfied;
   if (!Array.isArray(crit) || crit.length !== 2) return "criteriaSatisfied";
   const ids = crit.map(function (c) { return c && typeof c === "object" ? c.id : undefined; });
@@ -823,6 +827,14 @@ function validateAccStructured(so) {
       && typeof c.evidence === "string" && c.evidence.trim().length > 0;
   })) return "criteriaSatisfied";
   return "";
+}
+const SCHEMA_WRITE_SCHEMA = { type: "object", properties: { written: { type: "boolean" } }, required: ["written"], additionalProperties: false };
+const reportSchemaFile = journalDir + "/report-schema.json"; // relative to the MAIN working copy (the writer child's cwd)
+const reportSchemaPathForBrief = /^([A-Za-z]:[\\/]|\/)/.test(journalDir) ? reportSchemaFile : "<MAIN-TREE>/" + reportSchemaFile;
+// R1 self-check line for the work/rework/merge briefs: the draft report is checked mechanically
+// BEFORE the final message - a schema-broken report otherwise kills the child and costs a repair.
+function selfCheckLine(kind, wtArg, slug) {
+  return "SELF-CHECK (mandatory before your final message): write your draft report JSON to a file OUTSIDE the worktree (the system temp dir), then run: node " + reportCheckScript + " --schema " + reportSchemaPathForBrief + " --kind " + kind + " --draft <draft.json>" + (wtArg ? " --worktree \"" + wtArg + "\"" : "") + (slug ? " --branch " + slug : "") + ". Fix EVERY line it prints and re-run until it exits 0; if the schema file does not exist, skip this step." + (reportSchemaPathForBrief !== reportSchemaFile ? " (<MAIN-TREE> = absolute path of the main working copy: first `worktree` line of `git worktree list --porcelain`)" : "");
 }
 const REVIEW_SCHEMA = {
   type: "object",
@@ -867,6 +879,8 @@ const MERGE_SCHEMA = {
   required: ["merged", "checks_ok", "journal_written", "merge_commit", "note"],
   additionalProperties: false
 };
+// Serialized to <journalDir>/report-schema.json at campaign start (report self-check source).
+const REPORT_SCHEMAS = { work: WORK_SCHEMA, merge: MERGE_SCHEMA };
 // Arbiter only DECIDES (merge/drop run through the shared mergeChain); a repeated
 // one-more-round is forced to drop by the orchestrator (max one arbiter fix round).
 const ARB_SCHEMA = {
@@ -1118,6 +1132,7 @@ function workPhase(t, rec, parallel) {
     relayMode ? "COMMIT NOTE (relay): never `git add -A` - add ONLY the files the ceremony changed (see engine protocol)." : "",
     FACTS, ACC_STRUCTURED,
     "Report format: what_done (2-4 sentences), files_changed, verification (commands + results), branch, worktree, head (40-hex SHA), completed (true when done and verified), testsAddedOrUpdated, commandsRun, validationOutput, residualRisks, noStagedFiles, criteriaSatisfied.",
+    selfCheckLine("work", wt, slug),
     "FINAL REPORT MARKER: begin your FINAL report message with the exact token 'FINAL REPORT:'. Earlier structured outputs in your session (intermediate ceremony rounds, mid-run statuses) are NOT the report and are ignored by the caller.",
     "SCOPE DISCIPLINE (ceremony): the ceremony must execute its seed plan IN FULL; plan items close as done or n/a (with a one-line reason) - never dropped silently; adjacent discoveries go to findings, NOT into new work. Check the ceremony's finalState.tasks: if any item is neither done nor n/a you MUST report completed=false and put the details in what_done; include 'plan_progress' (e.g. '4/5 done, 1 n/a') in your report when the ceremony provides it.",
     "If you need a decision beyond your scope (spec ambiguity, widening scope, destructive action), ask the calling side via contact_supervisor instead of guessing.",
@@ -1263,7 +1278,7 @@ function postPhase(t, rec, wOut, parallel) {
       "", GIT_RULES, CMDS, FACTS, FINAL_MSG,
       "Schema keys: merged, checks_ok, journal_written, merge_commit, note" + (bdEpic && t.id ? ", bd_closed (boolean - set it whenever the (4.6) bd close step ran)" : "") + "."
     ].filter(Boolean).join("\n");
-    return runChild(taskKey(t, "merge"), childOpts({ task: mergeLines, outputSchema: MERGE_SCHEMA })).then(
+    return runChild(taskKey(t, "merge"), childOpts({ task: [mergeLines, selfCheckLine("merge")].join("\n"), outputSchema: MERGE_SCHEMA })).then(
       function (mg) {
         const mOut = outOf(mg);
         // A merge that reports success but a red/missing check gate is NOT merged:
@@ -1499,7 +1514,8 @@ function postPhase(t, rec, wOut, parallel) {
       "Commit your fixes to the same branch; leave the working copy clean.",
       (useLedger ? "Rework fixes are SMALL and focused: implement them DIRECTLY yourself - do NOT launch a new ledger ceremony." : ""),
       FACTS, ACC_STRUCTURED,
-      "Report format: what_done, files_changed, verification, branch, worktree, head (40-hex SHA), completed, testsAddedOrUpdated, commandsRun, validationOutput, residualRisks, noStagedFiles, criteriaSatisfied."
+      "Report format: what_done, files_changed, verification, branch, worktree, head (40-hex SHA), completed, testsAddedOrUpdated, commandsRun, validationOutput, residualRisks, noStagedFiles, criteriaSatisfied.",
+      selfCheckLine("rework", wt, slug)
     ]).filter(Boolean).join("\n");
     const rwSpec = { task: rwLines, outputSchema: WORK_SCHEMA };
     if (engineOf(t) === "sdd") rwSpec.agent = "sdd-worker"; // engineOf here: sddEngine lives in workPhase scope, not reviewRound — old code would ReferenceError at first rework
@@ -1635,6 +1651,29 @@ if (sddOverride !== "off" && taskSource !== "bd-epic") {
     } else {
       log.push("continuing without the SDD task engine (auto classification)");
     }
+  }
+}
+
+// --- report schemas on disk (R1) ----------------------------------------------------
+// The engine cannot write files itself: ONE mechanical child serializes the inline report schemas
+// to <journalDir>/report-schema.json before the first work child - the source of the report
+// self-check. Best-effort like the analytics archiver: a failed write is logged and the briefs'
+// self-check step skips itself (its brief says so).
+{
+  const schemaWriteLines = [
+    "You are a MECHANICAL WRITER. Create the file " + reportSchemaFile + " (create its directory if needed) whose ENTIRE content is exactly the JSON below - verbatim, no edits, no extra keys, no commentary.",
+    "Then report written=true (written=false only when the write really failed).",
+    "", CMDS, FINAL_MSG,
+    "Schema keys: written.",
+    "JSON CONTENT:",
+    JSON.stringify(REPORT_SCHEMAS, null, 2)
+  ].join("\n");
+  try {
+    const sw = await runChild("report-schema", Object.assign({ agent: "worker", context: "fresh", task: schemaWriteLines, outputSchema: SCHEMA_WRITE_SCHEMA, acceptance: false }));
+    const swOut = outOf(sw);
+    log.push("report-schema: " + (swOut.written === true ? "written to " + reportSchemaFile : "NOT written - the report self-check is unavailable this campaign"));
+  } catch (e) {
+    log.push("report-schema write failed (" + String(e).slice(0, 120) + "); the report self-check is unavailable this campaign");
   }
 }
 
