@@ -129,7 +129,7 @@ const ledgerWorkflowPath = String(args.ledgerWorkflowPath || "C:/Users/user/.age
 // interchangeable alternative - the runner is chosen by script extension: node|python).
 // Empty string or analytics: false disables; the child itself reports skipped=true when
 // artifacts are absent (portable).
-const metricsScript = String(args.metricsScript !== undefined && args.metricsScript !== null ? args.metricsScript : "C:/Users/user/.agents/skills/agile-solve/workflows/analyze-campaign.mjs");
+const metricsScript = String(args.metricsScript !== undefined && args.metricsScript !== null ? args.metricsScript : "C:/Users/user/.pi/agent/git/github.com/fan92rus/pi-agile/workflows/analyze-campaign.mjs");
 const metricsRunner = /\.(mjs|js)$/i.test(metricsScript) ? "node" : "python";
 const analyticsEnabled = args.analytics !== false && !!metricsScript;
 const model = args.model || undefined;
