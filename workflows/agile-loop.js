@@ -119,7 +119,7 @@ const branchPrefix = String(args.branchPrefix || "agile/");
 const journalDir = String(args.journalDir || ".agile-js");
 // R1 report self-check: the mechanical checker a worker runs on its draft report before the final
 // message. It validates against journalDir/report-schema.json, written at campaign start.
-const reportCheckScript = String(args.reportCheckScript || "D:/Documents/Repositories/pi-agile/workflows/report-check.mjs");
+const reportCheckScript = String(args.reportCheckScript || "C:/Users/user/.pi/agent/git/github.com/fan92rus/pi-agile/workflows/report-check.mjs");
 const ledgerWorkflowPath = String(args.ledgerWorkflowPath || "C:/Users/user/.agents/skills/ledger-solve/workflows/ledger-loop-mem.js");
 // Campaign analytics (self-reporting campaigns): at campaign end ONE mechanical child copies
 // the workflow's runtime artifacts (events.jsonl / workflow-children.jsonl / status.json - the
