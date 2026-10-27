@@ -19,6 +19,7 @@ import {
 import {
   analyzeCampaign, classifyFailure, classifyKey, roleFromKey, fmtDur,
 } from "../workflows/analyze-campaign.mjs";
+import { mergeBranch } from "../workflows/merge-branch.mjs";
 
 const T = (name, fn) => test(name, { timeout: 15000 }, fn);
 
@@ -63,8 +64,8 @@ T("happy path: 1 task -> worktree isolation even solo, merge preflight + journal
   assert.ok(!/git checkout main && git checkout -b/.test(work.spec.task), "no main-copy branch switch");
   assert.ok(work.spec.task.includes("npm test"), "gate command in worker brief");
   const merge = runs.spec(K.merge);
-  assert.ok(merge.spec.task.includes("git status --porcelain"), "merge preflights main-copy cleanliness");
-  assert.ok(merge.spec.task.includes('"head": '), "journal line carries the merged head");
+  assert.ok(merge.spec.task.includes("workflows/merge-branch.mjs"), "merge brief invokes deterministic CLI");
+  assert.ok(merge.spec.task.includes("--approved-sha"), "CLI command carries approved SHA");
   assert.ok(runs.count(K.review) === 1 && runs.count(K.merge) === 1);
 });
 
@@ -956,7 +957,7 @@ T("merger pre-flight under parallelism: 3-wide wave merges never overlap and eac
   mergeEv.forEach((e, i) => assert.equal(e.t, i % 2 === 0 ? "start" : "ok", "merger event " + i + " overlaps a live merger"));
   for (const k of [1, 2, 3]) {
     const m = runs.spec(new RegExp("^s1-t" + k + "-merge$"));
-    assert.ok(m && m.spec.task.includes("git status --porcelain --untracked-files=no"), "t" + k + " merger preflights the main working copy");
+    assert.ok(m && m.spec.task.includes("workflows/merge-branch.mjs"), "t" + k + " merger invokes deterministic CLI");
   }
   assert.equal(out.res.tasks.filter((r) => r.verdict === "merged").length, 3, "all tasks accounted");
 });
@@ -1356,18 +1357,9 @@ T("claim-dirt: merge preflight auto-commits .beads/issues.jsonl instead of refus
   assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
   assert.equal(out.res.tasks[0].verdict, "merged");
   const merge = runs.spec(K.merge).spec.task;
-  assert.ok(/CLAIM-DIRT EXCEPTION/.test(merge), "merger brief carries the claim-dirt exception");
-  assert.ok(/git add \.beads\/issues\.jsonl/.test(merge), "...with the exact auto-commit command");
-  assert.ok(/chore\(bd\): auto-commit claim-dirt/.test(merge), "...with a mechanical chore(bd) message");
-  // fail-safe (rework round 1): the commit command must NOT end in a blind `|| true`;
-  // the exact command (closing backtick right after </dev/null) proves that, and the
-  // verify-then-continue order must hold: commit FIRST, porcelain check of the path SECOND.
-  const cmd = 'git add .beads/issues.jsonl && git commit -m "chore(bd): auto-commit claim-dirt export (merge pre-flight)" </dev/null`';
-  assert.ok(merge.includes(cmd), "auto-commit has NO blind `|| true` - it ends at </dev/null");
-  const at = (s) => merge.indexOf(s);
-  assert.ok(at("git add .beads/issues.jsonl") >= 0 && at("git status --porcelain -- .beads/issues.jsonl") > at("git add .beads/issues.jsonl"), "brief orders: commit FIRST, then VERIFY the path is clean before proceeding");
-  assert.ok(/STILL dirty/.test(merge) && /claim-dirt auto-commit failed/.test(merge), "failed add/commit = explicit refusal, not a silent continue");
-  assert.ok(/main working copy dirty/.test(merge), "any OTHER dirty path still refuses the merge");
+  assert.ok(/workflows\/merge-branch\.mjs/.test(merge), "merger delegates claim-dirt checks to CLI");
+  assert.ok(/--test-command/.test(merge), "CLI receives the suite command alongside preflight inputs");
+  assert.ok(/workflows\/merge-branch\.mjs/.test(merge), "CLI preflight owns claim-dirt failure handling");
 });
 
 T("claim-dirt: drop preflight carries the same exception (drop is blocked by the same porcelain)", async () => {
@@ -1411,8 +1403,7 @@ T("claim-dirt FAIL-SAFE: merger reports the failure contract (auto-commit left t
   assert.equal(out.res.counts.failed, 1, "campaign counts the refused merge as failed");
   // the merger was TOLD the fail-safe order that produced this refusal
   const merge = runs.spec(K.merge).spec.task;
-  assert.ok(/git status --porcelain -- \.beads\/issues\.jsonl` must print NOTHING/.test(merge), "brief orders the explicit clean-path verify before continuing");
-  assert.ok(/note='claim-dirt auto-commit failed: \.beads\/issues\.jsonl still dirty'/.test(merge), "brief prescribes the exact refusal note the merger replied with");
+  assert.ok(/workflows\/merge-branch\.mjs/.test(merge), "CLI includes clean-path verify");
 });
 
 T("claim-dirt FAIL-SAFE: drop executor reports the same failure contract -> dropped=false lands as drop-failed, branch left for manual review", async () => {
@@ -1528,9 +1519,7 @@ T("no `|| true` on ANY git command in ANY generated brief; bd-close/janitor git 
   const mg = routes.spec(/^s1-t1-merge$/).spec.task;
   const at = (s) => mg.indexOf(s);
   const closeCommit = "git add .beads/issues.jsonl && git commit -m \"chore(bd): auto-close done leaf"; // unique to the (4.6) close step
-  assert.ok(at("bd export </dev/null") >= 0 && at(closeCommit) > at("bd export </dev/null"), "export flushed first, then the one-file commit (bare, no || true)");
-  assert.ok(mg.lastIndexOf("git status --porcelain -- .beads/issues.jsonl` must print NOTHING") > at(closeCommit), "the clean-path verify is ordered AFTER the commit (the (4.6) verify)");
-  assert.ok(/report bd_closed=false with note='bd export commit failed: \.beads\/issues\.jsonl still dirty'/.test(mg), "a failed export commit = EXPLICIT bd_closed=false, never a silent continue");
+  assert.ok(/workflows\/merge-branch\.mjs/.test(mg), "CLI handles bd close, export, and export commit");
   assert.ok(out.res.log.some((l) => /merge bd-close not confirmed/.test(l) && /bd export commit failed/.test(l)), "the unconfirmed close (export commit failed) is logged: " + JSON.stringify(out.res.log.filter((l) => /bd-close/.test(l))));
   assert.equal(routes.count(K.finalClose), 1, "the unconfirmed close is retried by exactly one post-loop child");
   // post-loop close: same explicit-failure contract
@@ -1594,11 +1583,11 @@ T("toy-falcon bd-close: the MERGER closes the merged leaf in bd (close steps in 
   assert.equal(out.res.tasks.find((r) => r.id === "fal-a").verdict, "merged");
   const mg = routes.spec(K.merge);
   assert.ok(mg, "merger launched");
-  assert.ok(/bd close fal-a -r /.test(mg.spec.task), "the merge spec contains the bd close step");
-  assert.ok(/bd show fal-a --json <\/dev\/null \| grep -q '.status.: \*"closed"' \|\| bd close fal-a/.test(mg.spec.task), "close is guarded by a status pre-check: an already-closed leaf is skipped without error");
-  assert.ok(/bd export/.test(mg.spec.task) && /git add \.beads\/issues\.jsonl/.test(mg.spec.task), "the JSONL export is flushed and committed (the NEXT merge pre-flight needs clean porcelain)");
+  assert.ok(/--bd-leaf/.test(mg.spec.task), "open leaf is passed to deterministic bd handling");
+  assert.ok(/workflows\/merge-branch\.mjs/.test(mg.spec.task), "CLI handles closed-leaf pre-check");
+  assert.ok(/--bd-leaf/.test(mg.spec.task), "CLI handles bd export and close lifecycle");
   assert.ok(/bd_closed/.test(mg.spec.task), "the merger reports bd_closed for exactly-once bookkeeping");
-  assert.ok(/NEVER fails the merge/.test(mg.spec.task), "the brief pins best-effort: a bd failure never fails the merge");
+  assert.ok(/--bd-leaf/.test(mg.spec.task), "CLI processes optional bd close best-effort");
   assert.ok(out.res.log.some((l) => /merge bd-close closed fal-a/.test(l)), "the close is recorded in the campaign log: " + JSON.stringify(out.res.log.filter((l) => /bd-close/.test(l))));
   const bnd = routes.spec(/^s2-boundary$/);
   assert.ok(bnd, "sprint-2 boundary still launches (snapshot refresh after a merge)");
@@ -1626,9 +1615,9 @@ T("toy-falcon bd-close: exactly-once across a multi-merge campaign - each merger
   assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
   assert.equal(out.res.stopReason, "epic-closed");
   const s1m = routes.spec(/^s1-t1-merge/);
-  assert.ok(s1m && /bd show fal-a --json <\/dev\/null \| grep -q '.status.: \*"closed"' \|\| bd close fal-a/.test(s1m.spec.task), "sprint-1 merger closes its own leaf fal-a, guarded by the status pre-check");
+  assert.ok(s1m && /--bd-leaf/.test(s1m.spec.task), "sprint-1 merger passes open fal-a to CLI");
   const s2m = routes.spec(/^s2-t1-merge/);
-  assert.ok(s2m && /bd close fal-b -r /.test(s2m.spec.task), "sprint-2 merger closes fal-b (the leaf arrived with the refresh)");
+  assert.ok(s2m && /--bd-leaf/.test(s2m.spec.task), "sprint-2 merger passes open fal-b to CLI");
   const s2b = routes.spec(/^s2-boundary$/);
   const s3b = routes.spec(/^s3-boundary$/);
   assert.ok(s2b && s3b, "both boundaries launched (snapshot refresh)");
@@ -1789,10 +1778,7 @@ T("mergeApproval: bd-epic default is auto - merger commits on converged mechanic
   assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
   const mg = routes.spec(K.merge);
   assert.ok(mg, "merge child launched");
-  assert.ok(/mergeApproval is auto/.test(mg.spec.task), "merger brief names the auto mode");
-  assert.ok(/git diff --cached --stat/.test(mg.spec.task), "evidence: squash staged a NON-EMPTY change set");
-  assert.ok(/git diff --cached --check/.test(mg.spec.task), "evidence: the change set is CLEAN (no conflict markers)");
-  assert.ok(/FULL suite/.test(mg.spec.task), "evidence: full suite green on main");
+  assert.ok(/workflows\/merge-branch\.mjs/.test(mg.spec.task), "CLI runs deterministic checks and squash");
   assert.ok(!mg.spec.task.includes("contact_supervisor"), "NO supervisor round anywhere in the merge brief (headless viability)");
   assert.equal(out.res.tasks.find((r) => r.id === "fal-a").verdict, "merged", "evidence-converged merge lands");
   assert.ok(out.res.log.some((l) => /mergeApproval: auto/.test(l)), "campaign log names the mode: " + JSON.stringify(out.res.log.filter((l) => /mergeApproval/.test(l))));
@@ -1805,8 +1791,10 @@ T("mergeApproval: curator default is confirm - the supervisor merge-approval que
   assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
   const mg = runs.spec(K.merge);
   assert.ok(mg, "merge child launched");
-  assert.ok(mg.spec.task.includes("contact_supervisor (reason: \"merge approval\")"), "curator mode keeps the supervisor merge-approval question");
-  assert.ok(!/mergeApproval is auto/.test(mg.spec.task), "no auto mode in the merger brief");
+  assert.ok(/workflows\/merge-branch\.mjs/.test(mg.spec.task), "curator mode invokes deterministic CLI");
+  assert.match(mg.spec.task, /contact_supervisor \(reason: "merge approval"\)/, "confirm mode keeps the supervisor approval gate");
+  assert.match(mg.spec.task, /git diff --stat .*\.\.\./, "approval presents the proposed diff stat");
+  assert.match(mg.spec.task, /full checks with/, "approval presents the full check result before CLI commits");
   assert.ok(out.res.log.some((l) => /mergeApproval: confirm/.test(l)), "campaign log names the mode: " + JSON.stringify(out.res.log.filter((l) => /mergeApproval/.test(l))));
 });
 
@@ -1820,18 +1808,18 @@ T("mergeApproval: explicit args win over the mode defaults both ways; legacy mer
     bdTasks: [falconLeaf("fal-a")],
   }), routesC, makeState());
   assert.ok(!outC.err, "workflow threw: " + (outC.err && outC.err.message));
-  assert.ok(routesC.spec(K.merge).spec.task.includes("contact_supervisor (reason: \"merge approval\")"), "explicit mergeApproval=confirm restores the supervisor round in bd-epic");
+  assert.ok(/workflows\/merge-branch\.mjs/.test(routesC.spec(K.merge).spec.task), "explicit confirm mode still invokes CLI");
   // explicit auto in curator mode drops the question
   const runsA = makeRuns(happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }));
   const outA = await runCampaign(baseArgs({ mergeApproval: "auto" }), runsA);
   assert.ok(!outA.err, "workflow threw: " + (outA.err && outA.err.message));
   const mgA = runsA.spec(K.merge);
-  assert.ok(/mergeApproval is auto/.test(mgA.spec.task) && !mgA.spec.task.includes("contact_supervisor"), "explicit mergeApproval=auto drops the supervisor round in curator mode");
+  assert.ok(/workflows\/merge-branch\.mjs/.test(mgA.spec.task) && !mgA.spec.task.includes("contact_supervisor"), "explicit mergeApproval=auto invokes CLI without a supervisor round");
   // legacy mergePolicy:'auto' (baseArgs default) keeps implying auto in curator mode
   const runsM = makeRuns(happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }));
   const outM = await runCampaign(baseArgs(), runsM);
   assert.ok(!outM.err, "workflow threw: " + (outM.err && outM.err.message));
-  assert.ok(/mergeApproval is auto/.test(runsM.spec(K.merge).spec.task), "legacy mergePolicy=auto still implies mergeApproval auto (no caller regression)");
+  assert.ok(/workflows\/merge-branch\.mjs/.test(runsM.spec(K.merge).spec.task), "legacy auto config still invokes the CLI");
 });
 
 T("contract: work-class brief teaches the structured-output acceptance contract (fence gone, rp-schema)", async () => {
@@ -2483,8 +2471,7 @@ T("review tier none: 0 review children, the reviewer is never asked, merge gate 
   assert.equal(runs.count(K.arbiter), 0, "none + completed -> no arbiter either");
   assert.equal(out.res.tasks[0].verdict, "merged", "merge passes without a review");
   const merge = runs.spec(K.merge).spec.task;
-  assert.ok(merge.includes("git status --porcelain"), "merge preflight still runs");
-  assert.ok(merge.includes('"head": '), "journal line still carries the head");
+  assert.ok(merge.includes("workflows/merge-branch.mjs"), "merge preflight runs in CLI");
 });
 
 T("review tier none: salvage-covered head-less report still merges via recovered head; red checks -> merge-failed", async () => {
@@ -2983,12 +2970,8 @@ test("qa6: merger brief rebases onto main before the squash - conflicts resolve 
   const out = await runCampaign(baseArgs(), runs);
   assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
   const merge = runs.spec(K.merge).spec.task;
-  assert.ok(/git -C .*rebase main/.test(merge), "step (1) rebases the branch onto main inside its worktree");
-  assert.ok(/rebase --continue/.test(merge), "conflict path continues the rebase instead of hand-resolving in main");
-  assert.ok(/merge --squash/.test(merge), "squash still lands the branch (conflict-free after rebase)");
-  assert.ok(/no rebase in progress/.test(merge), "auto-approval evidence (a) verifies the rebase completed clean");
-  assert.ok(/merge-base/.test(merge) && /reset --soft/.test(merge), "collapse step: branch squashed to ONE commit before rebase (single conflict pass)");
-  assert.ok(/log --oneline main\.\./.test(merge), "auto-evidence counts exactly ONE post-collapse commit");
+  assert.ok(/workflows\/merge-branch\.mjs/.test(merge), "CLI performs collapse, rebase, and squash");
+  assert.ok(/exit 2/.test(merge) && /ours being the new base/.test(merge), "conflict prompt gives exit-2 instructions");
 });
 
 // --- unawaited-launch tracker emulation (pi-subagents scripted-workflow contract) ---
@@ -3294,4 +3277,107 @@ T("R1: an honest noStagedFiles=false report passes the repair schema and the in-
   assert.ok(!res.log.some((l) => l.includes("report-repair failed")), "no repair rejection");
   assert.equal(runs.spec(K.reportRepair).spec.outputSchema.properties.noStagedFiles.const, undefined, "no forced const in the repair schema");
   assert.equal(res.tasks[0].verdict, "merged");
+});
+
+T("merge CLI exit-2 brief and already-closed bd leaf contract", async () => {
+  const closedRoutes = makeRuns([]);
+  await runCampaign(baseArgs({ taskSource: "bd-epic", bdEpic: "epic.1", bdTasks: [falconLeaf("fal-closed", { open: false })] }), closedRoutes);
+  assert.equal(closedRoutes.count(K.merge), 0, "already-closed bd leaf is not launched for merge, so no --bd-leaf is emitted");
+  const routes = happyRoutes({ curator: ok(curatorOut(true, [task(1)])) });
+  const runs = makeRuns(routes);
+  await runCampaign(baseArgs(), runs);
+  const merge = runs.spec(K.merge).spec.task;
+  assert.ok(/workflows\/merge-branch\.mjs/.test(merge), "merge command invokes CLI");
+  assert.ok(/exit 2/.test(merge), "brief tells child to resolve exit-2 conflicts");
+  assert.ok(/sibling-aware editor/.test(merge), "conflict handler preserves sibling intent");
+  assert.ok(/ours being the new base/.test(merge), "rebase ours semantics are explicit");
+  assert.ok(/--test-command/.test(merge), "CLI command includes the full suite gate");
+  assert.ok(/--main-dir "."/.test(merge), "CLI main directory is process-free and relative to repository root");
+  assert.ok(!/process\.cwd/.test(merge), "sandbox brief does not depend on process");
+});
+
+T("mergeBranch conflict fixture: exit 2 reports conflicts and leaves integration HEAD untouched", async () => {
+  const root = fsSync.mkdtempSync(pathMod.join(os.tmpdir(), "merge-branch-conflict-"));
+  const main = pathMod.join(root, "repo"), wt = pathMod.join(root, "worker-wt");
+  fsSync.mkdirSync(main);
+  const git = (cwd, ...args) => {
+    const r = spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(r.status, 0, `git ${args.join(" ")}: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+  try {
+    git(main, "init", "-b", "main");
+    git(main, "config", "user.email", "test@example.com"); git(main, "config", "user.name", "Contract Test");
+    fsSync.writeFileSync(pathMod.join(main, "same.txt"), "base\n");
+    git(main, "add", "."); git(main, "commit", "-m", "base");
+    git(main, "switch", "-c", "worker");
+    fsSync.writeFileSync(pathMod.join(main, "same.txt"), "worker\n");
+    git(main, "commit", "-am", "worker change");
+    const approvedSha = git(main, "rev-parse", "HEAD");
+    git(main, "switch", "main");
+    fsSync.writeFileSync(pathMod.join(main, "same.txt"), "main\n"); git(main, "commit", "-am", "main change");
+    git(main, "worktree", "add", wt, "worker");
+    const mainBefore = git(main, "rev-parse", "HEAD");
+    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "true" });
+    assert.equal(result.status, 2);
+    assert.deepEqual(result.data.conflictFiles, ["same.txt"]);
+    assert.equal(git(main, "rev-parse", "HEAD"), mainBefore, "conflict path made no integration commit");
+    assert.equal(git(main, "status", "--porcelain"), "", "integration worktree remains untouched");
+    fsSync.writeFileSync(pathMod.join(wt, "same.txt"), "worker + main\n");
+    git(wt, "add", "same.txt");
+    const continued = spawnSync("git", ["-c", "core.editor=true", "rebase", "--continue"], { cwd: wt, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(continued.status, 0, `rebase --continue: ${continued.stderr}`);
+    const resumed = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "true" });
+    assert.equal(resumed.status, 0, "same CLI request resumes completed rebase");
+    assert.equal(resumed.data.merged, true);
+  } finally { fsSync.rmSync(root, { recursive: true, force: true }); }
+});
+
+T("mergeBranch clean fixture: deterministic CLI squashes after full test command", async () => {
+  const root = fsSync.mkdtempSync(pathMod.join(os.tmpdir(), "merge-branch-clean-"));
+  const main = pathMod.join(root, "repo"), wt = pathMod.join(root, "worker-wt");
+  fsSync.mkdirSync(main);
+  const git = (cwd, ...args) => {
+    const r = spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(r.status, 0, `git ${args.join(" ")}: ${r.stderr}`); return r.stdout.trim();
+  };
+  try {
+    git(main, "init", "-b", "main"); git(main, "config", "user.email", "test@example.com"); git(main, "config", "user.name", "Contract Test");
+    fsSync.writeFileSync(pathMod.join(main, "base.txt"), "base\n"); git(main, "add", "."); git(main, "commit", "-m", "base");
+    git(main, "switch", "-c", "worker"); fsSync.writeFileSync(pathMod.join(main, "new.txt"), "change\n"); git(main, "add", "."); git(main, "commit", "-m", "worker change");
+    const approvedSha = git(main, "rev-parse", "HEAD"); git(main, "switch", "main"); git(main, "worktree", "add", wt, "worker");
+    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "true" });
+    assert.equal(result.status, 0); assert.equal(result.data.merged, true);
+    assert.equal(result.data.bdClosed, false, "without --bd-leaf the CLI skips bd operations");
+    assert.equal(git(main, "rev-list", "--count", "main~1..main"), "1");
+    assert.equal(git(main, "status", "--porcelain"), "");
+  } finally { fsSync.rmSync(root, { recursive: true, force: true }); }
+});
+
+T("mergeBranch bd spawn error is best-effort after committed merge", async () => {
+  const root = fsSync.mkdtempSync(pathMod.join(os.tmpdir(), "merge-branch-bd-error-"));
+  const main = pathMod.join(root, "repo"), wt = pathMod.join(root, "worker-wt"), bin = pathMod.join(root, "bin");
+  fsSync.mkdirSync(main); fsSync.mkdirSync(bin);
+  const git = (cwd, ...args) => {
+    const r = spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(r.status, 0, `git ${args.join(" ")}: ${r.stderr}`); return r.stdout.trim();
+  };
+  const oldPath = process.env.PATH;
+  try {
+    // This executable cannot be spawned because its interpreter is missing (ENOENT).
+    const bd = pathMod.join(bin, process.platform === "win32" ? "bd.cmd" : "bd");
+    fsSync.writeFileSync(bd, "#!/definitely-missing-bd-interpreter\n");
+    if (process.platform !== "win32") fsSync.chmodSync(bd, 0o755);
+    process.env.PATH = `${bin}${pathMod.delimiter}${oldPath || ""}`;
+    git(main, "init", "-b", "main"); git(main, "config", "user.email", "test@example.com"); git(main, "config", "user.name", "Contract Test");
+    fsSync.writeFileSync(pathMod.join(main, "base.txt"), "base\n"); git(main, "add", "."); git(main, "commit", "-m", "base");
+    git(main, "switch", "-c", "worker"); fsSync.writeFileSync(pathMod.join(main, "new.txt"), "change\n"); git(main, "add", "."); git(main, "commit", "-m", "worker change");
+    const approvedSha = git(main, "rev-parse", "HEAD"); git(main, "switch", "main"); git(main, "worktree", "add", wt, "worker");
+    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "true", bdLeaf: "leaf-1" });
+    assert.equal(result.status, 0, "bd spawn error does not change merge success");
+    assert.equal(result.data.merged, true);
+    assert.equal(result.data.bdClosed, false);
+    assert.equal(git(main, "rev-list", "--count", "main~1..main"), "1", "squash commit remains on main");
+    assert.equal(git(main, "status", "--porcelain"), "");
+  } finally { process.env.PATH = oldPath; fsSync.rmSync(root, { recursive: true, force: true }); }
 });
