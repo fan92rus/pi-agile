@@ -1605,6 +1605,98 @@ T("merge child hard failure -> merged=false (verdict merge-failed), sibling stil
   assert.equal(runs.count(K.merge), 2, "each task ran its own merger (a poisoned chain would silently no-op the second)");
 });
 
+// --- ISSUE-3: repeated identical merge failures escalate the leaf to needs-attention ----
+// Fingerprint = leaf + stage + normalized signature. Two identical merge failures in a row hold the
+// leaf: its third merge never starts. Different signatures, provider walls and other stages break the
+// streak. The streak rides in the checkpoint, so a resumed campaign keeps the counter.
+
+const BD_MERGE_ARGS = (over = {}) => baseArgs(Object.assign({
+  taskSource: "bd-epic", bdEpic: "t-fal.6", doneWhen: "bd-epic-closed", sprintTasks: 1,
+  bdTasks: [falconLeaf("fal-e")],
+}, over));
+function mergeRoutes(mergeHandle, workHandle) {
+  return makeRuns([
+    { match: K.work, handle: workHandle || ok(workOut()) },
+    { match: K.review, handle: ok(reviewOk(true)) },
+    { match: K.merge, handle: mergeHandle },
+    { match: K.boundary, handle: ok({ cleaned: [], leaves: [] }) },
+    { match: K.cleanup, handle: ok({ cleaned: [] }) },
+  ]);
+}
+const refused = (note) => mergeOut({ merged: false, checks_ok: false, note });
+
+T("ISSUE-3 escalation: two identical merge failures in a row -> the third merge never starts; return carries needs-attention with both signatures", async () => {
+  const runs = mergeRoutes(ok(refused("red gate: npm test exit 1 in test 12")));
+  const out = await runCampaign(BD_MERGE_ARGS({ maxSprints: 3 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(runs.count(K.merge), 2, "exactly two merger children ran - the third merge is held");
+  assert.equal(out.res.tasks.length, 3, "three attempts landed");
+  assert.equal(out.res.tasks[2].verdict, "needs-attention", "the third attempt lands as needs-attention");
+  assert.equal(out.res.needsAttention.length, 1, "the held leaf is named in the return");
+  const na = out.res.needsAttention[0];
+  assert.equal(na.leaf, "fal-e");
+  assert.equal(na.stage, "merge");
+  assert.deepEqual(na.signatures, ["merge: merged/checks_ok not confirmed | red gate: npm test exit <n> in test <n>", "merge: merged/checks_ok not confirmed | red gate: npm test exit <n> in test <n>"], "both normalized signatures are named");
+  assert.ok(out.res.log.some((l) => /NEEDS-ATTENTION.*fal-e/.test(l)), "hold logged: " + JSON.stringify(out.res.log.filter((l) => /ATTENTION|ESCALATION/.test(l))));
+  assert.equal(out.res.counts.failed, 3, "needs-attention counts as failed");
+});
+
+T("ISSUE-3 escalation: different merge errors in a row do not escalate - every merge runs", async () => {
+  const notes = ["conflict in src/a.txt", "red gate: npm test exit 1", "conflict in src/b.txt"];
+  let n = 0;
+  const runs = mergeRoutes(async () => ok(refused(notes[n++]))());
+  const out = await runCampaign(BD_MERGE_ARGS({ maxSprints: 3 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(runs.count(K.merge), 3, "three different failures in a row: no hold, the third merge runs");
+  assert.deepEqual(out.res.needsAttention, [], "nothing escalated");
+  assert.ok(out.res.tasks.every((t) => t.verdict === "merge-failed"), "every attempt is a plain merge-failed");
+});
+
+T("ISSUE-3 escalation: the streak survives a resume - the pair completes in the resumed campaign and the next merge is held", async () => {
+  const st = makeState();
+  const out1 = await runCampaign(BD_MERGE_ARGS({ maxSprints: 1 }), mergeRoutes(ok(refused("red gate: npm test exit 1"))), st);
+  assert.ok(!out1.err, "campaign 1 threw: " + (out1.err && out1.err.message));
+  assert.equal(st.store.get("agile-cp").escalations["fal-e"].count, 1, "campaign 1: one failure persisted in the checkpoint");
+
+  const runs2 = mergeRoutes(ok(refused("red gate: npm test exit 1")));
+  const out2 = await runCampaign(BD_MERGE_ARGS({ maxSprints: 1 }), runs2, st);
+  assert.ok(!out2.err, "campaign 2 threw: " + (out2.err && out2.err.message));
+  assert.equal(out2.res.generation, 2, "campaign 2 is a resume");
+  assert.equal(runs2.count(K.merge), 1, "the resumed campaign's merge runs (the pair completes with it)");
+  assert.equal(out2.res.needsAttention.length, 1, "the pair completed in campaign 2: the leaf is held");
+  assert.equal(out2.res.needsAttention[0].signatures.length, 2, "both signatures from both campaigns");
+
+  const runs3 = mergeRoutes(ok(mergeOut()));
+  const out3 = await runCampaign(BD_MERGE_ARGS({ maxSprints: 1 }), runs3, st);
+  assert.ok(!out3.err, "campaign 3 threw: " + (out3.err && out3.err.message));
+  assert.equal(runs3.count(K.merge), 0, "held across a second resume: the green merge never starts");
+  assert.equal(out3.res.tasks[0].verdict, "needs-attention");
+  assert.equal(out3.res.needsAttention[0].signatures.length, 2, "the signatures survive the resume");
+});
+
+T("ISSUE-3 escalation: a provider wall between two identical merge failures breaks the streak (walls never fingerprint)", async () => {
+  const seq = [refused("red gate: npm test exit 1"), refused("HTTP 429 rate_limit_error: quota"), refused("red gate: npm test exit 1")];
+  let n = 0;
+  const runs = mergeRoutes(async () => ok(seq[n++])());
+  const out = await runCampaign(BD_MERGE_ARGS({ maxSprints: 3 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(runs.count(K.merge), 3, "the wall broke the pair: the third identical failure is not held");
+  assert.deepEqual(out.res.needsAttention, [], "no escalation across a provider wall");
+});
+
+T("ISSUE-3 escalation: an attempt ending in another stage between two identical merge failures resets the streak", async () => {
+  let w = 0;
+  const runs = mergeRoutes(
+    ok(refused("red gate: npm test exit 1")),
+    async () => ok(workOut({ completed: w++ !== 1 }))(), // sprint 2 work reports completed=false
+  );
+  const out = await runCampaign(BD_MERGE_ARGS({ maxSprints: 3 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(out.res.tasks[1].verdict, "failed", "sprint 2 ended in the work stage");
+  assert.equal(runs.count(K.merge), 2, "sprint 3 merge runs: the work-stage attempt reset the streak");
+  assert.deepEqual(out.res.needsAttention, [], "nothing escalated");
+});
+
 // --- stale PLANNED markers: docs must describe implemented behavior ----------------
 // Criterion: zero stale PLANNED markers in agile-loop.js and SKILL.md (the r1
 // regression: a comment claimed the circuit breaker was "not in code yet" while the

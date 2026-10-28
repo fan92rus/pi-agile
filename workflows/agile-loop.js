@@ -377,6 +377,49 @@ function carryLines(c) {
   ];
 }
 
+// --- repeated identical merge failures (ISSUE-3): escalation to needs-attention --------
+// Fingerprint = leaf + stage + normalized error signature. TWO identical merge failures in a row on
+// one leaf hold the leaf: its THIRD merge does not start, the attempt lands as needs-attention and
+// the return names the signatures (needsAttention). Only content failures count: a provider wall
+// (OVERLOAD_RE / retry-after - the breaker and cooling own those) never fingerprints and breaks the
+// streak. Any other outcome of the leaf's attempt (another stage or class, merged) resets it. The
+// streaks ride in the checkpoint, so a resumed campaign keeps the counter.
+const ESCALATE_AFTER = 2;
+const escalations = Object.assign({}, (cpPrev && typeof cpPrev === "object" && cpPrev.escalations && typeof cpPrev.escalations === "object") ? cpPrev.escalations : {});
+function leafKey(rec) { return String(rec.id || rec.branch); }
+function normalizeSignature(text) {
+  // identical failures differ in line numbers, shas and timings: normalize those away
+  return String(text || "").toLowerCase()
+    .replace(/\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/g, "<sha>")
+    .replace(/\d+/g, "<n>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160);
+}
+function escalationHold(rec) {
+  const s = escalations[leafKey(rec)];
+  return (s && s.stage === "merge" && s.count >= ESCALATE_AFTER) ? s : null;
+}
+function noteEscalation(rec) {
+  // Called once per finished attempt (every taskResults push). A held attempt keeps the hold.
+  const key = leafKey(rec);
+  if (rec.verdict === "needs-attention") return;
+  const detail = String(rec.failText || "");
+  const raw = String(rec.stop || "") + " " + detail;
+  if (rec.verdict === "merge-failed" && !OVERLOAD_RE.test(raw) && !RETRY_DELAY_RE.test(raw)) {
+    const sig = normalizeSignature(String(rec.stop || "") + " | " + detail);
+    const s = escalations[key];
+    escalations[key] = (s && s.stage === "merge" && s.sig === sig)
+      ? { stage: "merge", sig: sig, count: s.count + 1, sigs: s.sigs.concat([sig]) }
+      : { stage: "merge", sig: sig, count: 1, sigs: [sig] };
+    if (escalations[key].count === ESCALATE_AFTER) log.push("ESCALATION: leaf " + key + " failed to merge " + ESCALATE_AFTER + " times in a row with the same signature (" + sig + ") - the next merge on this leaf is held");
+  } else {
+    if (!escalations[key]) return; // nothing to reset
+    delete escalations[key];
+  }
+  cpWrite({ escalations: Object.assign({}, escalations) }); // best-effort persist: the streak survives a resume
+}
+
 // --- main-copy isolation (ISSUE-5) -------------------------------------------------
 // The main working copy is the ONE tree no worker may write: a relative edit/write from a
 // worker resolves THERE, not into its worktree. The campaign records the main copy's porcelain
@@ -1379,6 +1422,15 @@ function postPhase(t, rec, wOut, parallel) {
     );
   }
   function doMerge() {
+    // ISSUE-3: a leaf held after two identical merge failures gets no third merge; the attempt
+    // lands as needs-attention (branch left as it is, the signatures are in the return).
+    const hold = escalationHold(rec);
+    if (hold) {
+      rec.verdict = "needs-attention";
+      rec.stop = "escalated: " + hold.count + " identical merge failures in a row - third merge held (" + hold.sig + ")";
+      log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": NEEDS-ATTENTION - leaf " + leafKey(rec) + " failed to merge " + hold.count + " times with the same signature; merge not started");
+      return Promise.resolve();
+    }
     // CODE GATE (not prompt-only): integration is refused without HEAD evidence.
     // Review still runs (it may route the task into rework); only the MERGE requires
     // a verified head. workPhase catches and ledgerRepair both fill rec.head.
@@ -1427,7 +1479,7 @@ function postPhase(t, rec, wOut, parallel) {
         // A merge that reports success but a red/missing check gate is NOT merged:
         // the integration evidence must be complete, not just the git operation.
         rec.verdict = (mOut.merged === true && mOut.checks_ok === true) ? "merged" : "merge-failed";
-        if (rec.verdict === "merge-failed") rec.stop = "merge: merged/checks_ok not confirmed";
+        if (rec.verdict === "merge-failed") { rec.stop = "merge: merged/checks_ok not confirmed"; rec.failText = String(mOut.note || ""); }
         // Merge commit lands on main - the bd-close comment carries it as evidence.
         if (rec.verdict === "merged" && mOut.merge_commit) rec.mergeCommit = String(mOut.merge_commit);
         // MERGER bd-close (perf: boundary children burned 1.5-4 min per boundary on it):
@@ -1447,6 +1499,7 @@ function postPhase(t, rec, wOut, parallel) {
       function (e) {
         rec.verdict = "merge-failed";
         rec.stop = "merge: merger child failed";
+        rec.failText = String(e);
         log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": merger failed (" + String(e).slice(0, 120) + ")");
       }
     ).catch(function (e) {
@@ -1462,6 +1515,7 @@ function postPhase(t, rec, wOut, parallel) {
       }
       rec.verdict = "merge-failed";
       rec.stop = "merge: merger child failed";
+      rec.failText = msg;
       log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": merger failed (" + msg + ")");
     });
   }
@@ -2016,6 +2070,7 @@ while (sprint < maxSprints && continueCampaign && !stopReason) {
       await postPhase(t, rec, wOut, false);
       taskResults.push(rec);
       recordCarry(rec);
+      noteEscalation(rec);
     } else {
       log.push("sprint " + sprint + ": wave " + wave.wave + " rolling pool: [" + wave.tasks.map(function (t) { return "t" + ((t._idx || 0) + 1); }).join(", ") + "], " + Math.max(1, Math.min(maxParallel, wave.tasks.length)) + " work slot(s), shared queue + capped post queue)");
       const recs = wave.tasks.map(function (t) {
@@ -2094,6 +2149,7 @@ while (sprint < maxSprints && continueCampaign && !stopReason) {
               return postPhase(t, recs[idx], wOut, true).then(function () {
                 taskResults.push(recs[idx]);
                 recordCarry(recs[idx]);
+                noteEscalation(recs[idx]);
               }, function (e) {
                 log.push("sprint " + sprint + " task " + (idx + 1) + ": postPhase failed (" + String(e).slice(0, 120) + ")");
               });
@@ -2107,6 +2163,7 @@ while (sprint < maxSprints && continueCampaign && !stopReason) {
             recs[idx].stop = "work: work-phase error";
             taskResults.push(recs[idx]);
             recordCarry(recs[idx]);
+            noteEscalation(recs[idx]);
             log.push("sprint " + sprint + " task " + (idx + 1) + ": work failed (" + String(e).slice(0, 120) + ")");
             return workWorker();
           });
@@ -2248,7 +2305,7 @@ const mergedCount = taskResults.filter(function (r) { return r.verdict === "merg
 // Verdict-class counters, NOT a strict partition: "drop-failed" lands in both
 // dropped and failed; "unknown"/"no-head-reported" land in neither.
 const droppedCount = taskResults.filter(function (r) { return r.verdict === "dropped" || r.verdict === "drop-failed"; }).length;
-const failedCount = taskResults.filter(function (r) { return ["failed", "arbiter-failed", "merge-failed", "drop-failed", "main-mutated"].indexOf(r.verdict) !== -1; }).length;
+const failedCount = taskResults.filter(function (r) { return ["failed", "arbiter-failed", "merge-failed", "drop-failed", "main-mutated", "needs-attention"].indexOf(r.verdict) !== -1; }).length;
 let STATUS;
 if (stopReason === "approval-required" || stopReason === "sdd-setup-failed") STATUS = "blocked";
 else if (/^bd-epic-stalled/.test(stopReason)) STATUS = "blocked";
@@ -2271,6 +2328,11 @@ if (stateOk) {
   Promise.resolve(state.set("nextReadyAction", { title: "agile campaign " + STATUS + ": " + stopReason, kind: STATUS === "completed" ? "done" : "attention" })).catch(function () {});
 }
 
+// ISSUE-3: leaves held after identical merge failures - the operator's list, signatures included
+const needsAttention = Object.keys(escalations).filter(function (k) { return escalations[k].count >= ESCALATE_AFTER; }).map(function (k) {
+  return { leaf: k, stage: escalations[k].stage, attempts: escalations[k].count, signatures: escalations[k].sigs.slice() };
+});
+
 return {
   status: STATUS,
   done: mergedCount > 0, // legacy flag - use `status`/`counts` as evidence
@@ -2285,6 +2347,7 @@ return {
   tasks: taskResults,
   analytics: analytics,
   mainIncidents: mainIncidents,
+  needsAttention: needsAttention,
   log: log
 };
 
