@@ -858,6 +858,9 @@ const GIT_RULES = "Git rules: work on YOUR feature branch only; never push; neve
 // Shared by the work/rework/repair briefs below.
 const NO_SCRATCH_DEBUG = "NO SCRATCH DEBUG SCRIPTS: find answers with EXISTING commands (`bd list --json`, `bd show`, `node --test <file>` with a timeout, ready-made repo analyzers); self-written helper scripts (debug-*.mjs, temp-file+node:fs scripting) are FORBIDDEN without explicit justification in your final report.\n";
 
+// L4: a failed edit is retried from the FILE, never from memory (CRLF files defeated three memory-based edits in one campaign).
+const EDIT_FAILURE_RULE = "EDIT FAILURE RULE (mandatory; counted per file): 1) on the FIRST failed edit of a file (oldText not found or not unique - typical for CRLF files), READ THE WHOLE FILE with the read tool (no offset/limit) and retry the edit with oldText copied verbatim from that read, never from memory; 2) on the SECOND failure of the same file, OVERWRITE the whole file with the write tool using the content you read, then check `git diff --stat` shows only your intended change; 3) on the THIRD failure (or a failed write), STOP - make no further attempts and report completed=false with the file path, the failed calls and what is left undone.";
+
 // ISSUE-5: the worker's edit/write tools resolve RELATIVE paths against the main working copy.
 function absPathRule(wt) {
   return "ABSOLUTE PATH RULE (mandatory): the MAIN working copy is NOT yours. Your worktree \"" + wt + "\" is a path RELATIVE to the main working copy: resolve it to an ABSOLUTE path (`git -C \"" + wt + "\" rev-parse --show-toplevel`) and use that absolute prefix in EVERY edit/write tool call (e.g. <absolute worktree>/src/a.txt). A RELATIVE edit/write path resolves to the MAIN working copy and corrupts the integration branch - FORBIDDEN. After cd-ing into the worktree, verify with `pwd` that you are inside it.";
@@ -1283,7 +1286,7 @@ function workPhase(t, rec, parallel) {
     "Verification command (must pass before you finish): " + (relayMode && testCommandQuick ? gateRun(testCommandQuick) + " (quick gate; the FULL suite runs again at merge)" : gateRun(testCommand)),
     "",
     "Global constraints (repeated for direct workers): " + constraints,
-    GIT_RULES, CMDS, NO_SCRATCH_DEBUG,
+    GIT_RULES, CMDS, NO_SCRATCH_DEBUG, EDIT_FAILURE_RULE,
     "MINIMALITY CONTRACT: the acceptance criteria and the verification command are the source of truth; delete anything no criterion needs before finishing.",
     "TDD preference: for aspects the verification command does not cover, write a failing test first and keep it in the deliverable.",
     isAnalysisLeaf(t) ? "NO-CODE EXCEPTION: do NOT commit. Leave the branch at its original HEAD; report that HEAD SHA and the exact artifact path. The artifact may be ignored/untracked and must be verified by review." : parallel ? "Before finishing: commit all your changes ON YOUR BRANCH inside your worktree (git add <files> && git commit), leave the worktree clean, report branch + worktree." : "Before finishing: commit all your changes to your branch (git add <your changed files> && git commit - NEVER 'git add -A': journal/.env/beads files must not leak into the branch), leave the working copy clean, report your branch name.",
@@ -1665,6 +1668,7 @@ function postPhase(t, rec, wOut, parallel) {
       // in production. Harness-green is NOT production evidence for runtime-boundary
       // assumptions - the reviewer must verify them against the REAL launch path.
       "RUNTIME-BOUNDARY RULE: if the change depends on runtime primitives (host channels like runs.host, launch mode, env, host limits), you MUST verify their availability in the REAL launch path (host/launcher sources or docs), NOT only in the test harness; 'harness-green' is NOT production evidence for such changes - an unverifiable runtime assumption -> approved=false with the unverified boundary named in rework_reasons.",
+      EDIT_FAILURE_RULE,
       "approved=false requires concrete, actionable rework_reasons.",
       "approved=false with CONCRETE per-file fixes -> also emit fix_list: [{\"file\": \"<path>\", \"fix\": \"<the exact edit>\"}] - the rework child then applies ONLY these fixes without re-researching the task; omit fix_list for design-level or exploratory rework.",
       FACTS, FINAL_MSG,
@@ -1722,7 +1726,7 @@ function postPhase(t, rec, wOut, parallel) {
       absPathRule(wt),
       (fixOnly ? "Reviewer verdict reasons (context only): " : "Reviewer rework reasons to address: ") + notes,
       "Verification command: " + gateRun(testCommand),
-      "", "Global constraints: " + constraints, GIT_RULES, CMDS, NO_SCRATCH_DEBUG,
+      "", "Global constraints: " + constraints, GIT_RULES, CMDS, NO_SCRATCH_DEBUG, EDIT_FAILURE_RULE,
       "HEAD REPORT (mandatory): after your FINAL commit run `git rev-parse HEAD` and report the full SHA in the `head` field.",
       "Commit your fixes to the same branch; leave the working copy clean.",
       (useLedger ? "Rework fixes are SMALL and focused: implement them DIRECTLY yourself - do NOT launch a new ledger ceremony." : ""),

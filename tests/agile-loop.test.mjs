@@ -758,6 +758,30 @@ T("contract: work/rework/repair briefs carry the no-scratch-debug diagnostic rul
   assertRule(repairRuns.spec(K.repair).spec.task, "repair brief");
 });
 
+T("contract: work, rework and review briefs carry the edit-failure rule (first failure reads the whole file, second overwrites via write, third stops)", async () => {
+  // L4: a CRLF file defeated three memory-based edits in one campaign. The rule rides in the
+  // work and rework briefs (implementation rounds) and in the review brief: a failed edit is
+  // retried from the FILE - read it whole, overwrite via write on the second failure, stop on the third.
+  const assertRule = (brief, label) => {
+    assert.ok(brief.includes("EDIT FAILURE RULE"), label + " names the edit-failure rule");
+    assert.ok(/FIRST failed edit[\s\S]*READ THE WHOLE FILE[\s\S]*SECOND failure[\s\S]*write tool[\s\S]*THIRD failure[\s\S]*STOP/.test(brief), label + " orders the rule: first failure reads the whole file, second overwrites via write, third stops");
+  };
+  const workRuns = makeRuns(happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }));
+  const wOut = await runCampaign(baseArgs(), workRuns);
+  assert.ok(!wOut.err, "work campaign threw: " + (wOut.err && wOut.err.message));
+  assertRule(workRuns.spec(K.work).spec.task, "work brief");
+  assertRule(workRuns.spec(K.review).spec.task, "review brief");
+  let reviewCalls = 0;
+  const reworkRuns = makeRuns(happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    review: async () => { reviewCalls++; return ok(reviewOk(reviewCalls >= 2))(); },
+  }));
+  const rOut = await runCampaign(baseArgs({ reworkLimit: 1 }), reworkRuns);
+  assert.ok(!rOut.err, "rework campaign threw: " + (rOut.err && rOut.err.message));
+  assert.ok(reworkRuns.spec(K.rework), "rework round launched");
+  assertRule(reworkRuns.spec(K.rework).spec.task, "rework brief");
+});
+
 T("ISSUE-7 contract: work/rework/report-repair/repair briefs run the gate as env -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_DEPTH <testCommand>", async () => {
   const GATE = "env -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_DEPTH npm test";
   const workRuns = makeRuns(happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }));
