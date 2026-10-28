@@ -33,10 +33,10 @@ function fixtureData() {
     epic: { id: "E", title: "Epic title", status: "open", description: "", dependencies: [] },
     children: { E: ["L1", "L2", "L3", "L4", "P"], P: ["C"] },
     issues: {
-      L1: issue("L1", "open", "Add parser in extensions/pi-agile/bd.ts. review: lite\nAcceptance: (1) node --test passes (2) exit 0"),
-      L2: issue("L2", "open", "Wire launch in extensions/pi-agile/launch.ts", ["L1"]),
+      L1: issue("L1", "open", "Add parser (old notes in tests/old.mjs). review: lite\nФайлы: extensions/pi-agile/bd.ts\nAcceptance: (1) node --test passes (2) exit 0"),
+      L2: issue("L2", "open", "Wire launch in docs/old.md\nФайлы: extensions/pi-agile/launch.ts", ["L1"]),
       L3: issue("L3", "closed", "Old leaf, already merged"),
-      L4: issue("L4", "open", "Docs only", ["L3"]),
+      L4: issue("L4", "open", "Docs only\nФайлы: README.md", ["L3"]),
       P: issue("P", "open", "Parent with a child: not a leaf"),
     },
   };
@@ -93,22 +93,22 @@ T("agile_run: bd-epic launch plan from a mocked bd (open leaves, engine shape, d
   assert.deepEqual(a.bdTasks, [
     {
       id: "L1", title: "title L1",
-      rationale: "Add parser in extensions/pi-agile/bd.ts. review: lite\nAcceptance: (1) node --test passes (2) exit 0",
+      rationale: "Add parser (old notes in tests/old.mjs). review: lite\nФайлы: extensions/pi-agile/bd.ts\nAcceptance: (1) node --test passes (2) exit 0",
       acceptance: "(1) node --test passes (2) exit 0",
       files_hint: "extensions/pi-agile/bd.ts",
       deps: [], open: true, review: "lite",
     },
     {
       id: "L2", title: "title L2",
-      rationale: "Wire launch in extensions/pi-agile/launch.ts",
+      rationale: "Wire launch in docs/old.md\nФайлы: extensions/pi-agile/launch.ts",
       acceptance: "",
       files_hint: "extensions/pi-agile/launch.ts",
       deps: ["L1"], open: true, review: "full",
     },
     {
       id: "L4", title: "title L4",
-      rationale: "Docs only",
-      acceptance: "", files_hint: "",
+      rationale: "Docs only\nФайлы: README.md",
+      acceptance: "", files_hint: "README.md",
       deps: [], open: true, review: "full",
     },
   ]);
@@ -127,6 +127,28 @@ T("agile_run: bundleScript absent -> warning in the output, args carry no bundle
   assert.equal(plan.args.bundleScript, undefined);
   assert.equal(plan.warnings.length, 1);
   assert.match(plan.warnings[0], /bundleScript/);
+});
+
+T("agile_run: files_hint is the Файлы: line up to the sentence end; a path after that dot stays out, length capped", async () => {
+  const data = fixtureData();
+  data.issues.L4.description = "Docs only\nФайлы: a/b.js, c/d.mjs. Прочее: см. D:/tmp/notes.md";
+  data.issues.L2.description = "Wire launch\nФайлы: " + "x/".repeat(120) + "y.js";
+  const plan = await planLaunch({ ...BASE, bundleScript: "C:/bundle.sh" }, { cwd: "/repo", run: mockBd(data) });
+  const byId = Object.fromEntries(plan.args.bdTasks.map((t) => [t.id, t]));
+  assert.equal(byId.L4.files_hint, "a/b.js, c/d.mjs");
+  assert.equal(byId.L2.files_hint, ("x/".repeat(120) + "y.js").slice(0, 200));
+  assert.equal(byId.L2.files_hint.length, 200);
+});
+
+T("agile_run: leaf without a Файлы: line -> empty files_hint and a warning; prose paths never used", async () => {
+  const data = fixtureData();
+  data.issues.L2.description = "Wire launch in extensions/pi-agile/launch.ts";
+  const plan = await planLaunch({ ...BASE, bundleScript: "C:/bundle.sh" }, { cwd: "/repo", run: mockBd(data) });
+  const l2 = plan.args.bdTasks.find((t) => t.id === "L2");
+  assert.equal(l2.files_hint, "");
+  assert.equal(plan.warnings.length, 1);
+  assert.match(plan.warnings[0], /L2/);
+  assert.match(plan.warnings[0], /Файлы:/);
 });
 
 T("agile_run: workModels overlapping reviewModels -> error string", async () => {

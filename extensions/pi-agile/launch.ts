@@ -62,7 +62,7 @@ export interface LaunchOptions {
 const RATIONALE_MAX = 300;
 const ACCEPTANCE_MAX = 300;
 const FILES_HINT_MAX = 200;
-const PATH_RE = /[\w.\-\/]+\.(?:ts|tsx|js|mjs|cjs|md|json|ya?ml|toml)\b/;
+const FILES_LINE_RE = /^[ \t]*Файлы[ \t]*:(.*)$/m;
 const ACCEPTANCE_RE = /acceptance\s*:/i;
 const REVIEW_RE = /\breview\s*:\s*(full|lite|none)\b/i;
 
@@ -79,18 +79,28 @@ function modelList(value: unknown, name: string): string[] {
   return value.map((v) => String(v).trim()).filter((v) => v !== "");
 }
 
+/**
+ * files_hint = the value of the "Файлы:" line, up to the sentence end ("a.js, b.js. prose" -> "a.js, b.js").
+ * No such line -> '' (the planner warns); paths in the prose are never used.
+ */
+function filesHint(desc: string): string {
+  const line = FILES_LINE_RE.exec(desc);
+  if (!line) return "";
+  const value = line[1].split(/\.(?:\s|$)/)[0].trim();
+  return value.slice(0, FILES_HINT_MAX).trim();
+}
+
 /** Maps a bd leaf to the engine snapshot. Deps on closed leaves are dropped: already satisfied. */
 function toEngineLeaf(issue: BdIssue, closedIds: Set<string>): EngineLeaf {
   const desc = issue.description;
   const acc = ACCEPTANCE_RE.exec(desc);
   const tier = REVIEW_RE.exec(desc);
-  const filePath = PATH_RE.exec(desc);
   return {
     id: issue.id,
     title: issue.title,
     rationale: desc.slice(0, RATIONALE_MAX),
     acceptance: acc ? desc.slice(acc.index + acc[0].length).trim().slice(0, ACCEPTANCE_MAX) : "",
-    files_hint: filePath ? filePath[0].slice(0, FILES_HINT_MAX) : "",
+    files_hint: filesHint(desc),
     deps: issue.dependencies
       .filter((d) => d.dependency_type === "blocks" && !closedIds.has(d.id))
       .map((d) => d.id),
@@ -138,12 +148,13 @@ export async function planLaunch(input: LaunchInput, opts: LaunchOptions): Promi
   const open = leaves.filter((l) => l.status !== "closed");
   if (open.length === 0) throw new Error(`epic ${epicId} has no open leaves (nothing to launch)`);
 
+  const bdTasks = open.map((l) => toEngineLeaf(l, closedIds));
   const args: Record<string, unknown> = {
     description: `Close bd epic ${epicId} (${epic.title}): every open leaf merged and closed in bd`,
     testCommand,
     taskSource: "bd-epic",
     bdEpic: epicId,
-    bdTasks: open.map((l) => toEngineLeaf(l, closedIds)),
+    bdTasks,
     doneWhen: "bd-epic-closed",
     mergeApproval,
     sprintTasks,
@@ -157,6 +168,9 @@ export async function planLaunch(input: LaunchInput, opts: LaunchOptions): Promi
   const warnings: string[] = [];
   if (!bundleScript) {
     warnings.push("bundleScript not set: the campaign runs without the STEP 0 context bundle (children discover context themselves)");
+  }
+  for (const t of bdTasks) {
+    if (!t.files_hint) warnings.push(`leaf ${t.id}: no "Файлы:" line - files_hint left empty (paths in the prose are not used)`);
   }
 
   const call = `subagent({ workflowScriptPath: ${JSON.stringify(ENGINE_WORKFLOW)}, args: ${JSON.stringify(args)}, async: true, timeoutMs: ${LAUNCH_TIMEOUT_MS} })`;
