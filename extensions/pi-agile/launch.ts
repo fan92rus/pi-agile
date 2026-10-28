@@ -183,6 +183,6 @@ export async function planLaunch(input: LaunchInput, opts: LaunchOptions): Promi
     if (!t.files_hint) warnings.push(`leaf ${t.id}: no "Файлы:" line - files_hint left empty (paths in the prose are not used)`);
   }
 
-  const call = `subagent({ workflowScriptPath: ${JSON.stringify(ENGINE_WORKFLOW)}, args: ${JSON.stringify(args)}, async: true, timeoutMs: ${LAUNCH_TIMEOUT_MS} })`;
+  const call = `subagent({ workflow: ${JSON.stringify(ENGINE_WORKFLOW)}, args: ${JSON.stringify(args)}, async: true, options: { timeoutMs: ${LAUNCH_TIMEOUT_MS} } })`;
   return { workflow: ENGINE_WORKFLOW, args, cwd, timeoutMs: LAUNCH_TIMEOUT_MS, warnings, call };
 }

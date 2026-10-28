@@ -118,8 +118,12 @@ T("agile_run: bd-epic launch plan from a mocked bd (open leaves, engine shape, d
 
   // no bundleScript warning when one is given; the copyable subagent call is present
   assert.deepEqual(plan.warnings, []);
-  assert.ok(plan.call.startsWith("subagent({ workflowScriptPath: "), plan.call);
+  // the copyable call matches the subagent API: workflow (not workflowScriptPath), timeoutMs inside options
+  assert.ok(plan.call.startsWith("subagent({ workflow: "), plan.call);
+  assert.ok(!plan.call.includes("workflowScriptPath"), plan.call);
   assert.ok(plan.call.includes(JSON.stringify(ENGINE_WORKFLOW)));
+  assert.ok(plan.call.includes(`options: { timeoutMs: ${LAUNCH_TIMEOUT_MS} }`), plan.call);
+  assert.ok(!plan.call.includes(", timeoutMs:"), plan.call);
 });
 
 T("agile_run: bundleScript absent -> warning in the output, args carry no bundleScript", async () => {
