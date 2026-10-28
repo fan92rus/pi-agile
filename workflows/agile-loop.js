@@ -550,6 +550,13 @@ function isAnalysisLeaf(t) {
 function slugify(t) {
   return String(t).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "task";
 }
+// ISSUE-7: a worker's shell inherits PI_SUBAGENT_CHILD / PI_SUBAGENT_DEPTH from pi-subagents,
+// and the gate then goes red without a real regression. Briefs run the gate command as
+// `env -u ... <cmd>` (command level only: the agent's own environment is not modified and its
+// pi-tools still see the variables). The merger seals its own gate in merge-branch.mjs gateEnv().
+function gateRun(cmd) {
+  return "env -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_DEPTH " + cmd;
+}
 function withGate(extra, relayOverride) {
   const relay = relayOverride === undefined ? ledgerAvailable : relayOverride === true;
   const o = childOpts(extra, "work");
@@ -1172,7 +1179,7 @@ function salvageReport(ctx, fromLabel) {
     absPathRule(wt),
     "1) `git log --oneline main.." + slug + "` and `git diff main..." + slug + "` - what landed vs the task.",
     "2) Task intent: " + t.title + " | Acceptance criteria: " + (t.acceptance || ""),
-    "3) Run the verification command YOURSELF: " + (testCommandQuick ? testCommandQuick + " (quick gate; the FULL suite runs at merge)" : testCommand),
+    "3) Run the verification command YOURSELF: " + (testCommandQuick ? gateRun(testCommandQuick) + " (quick gate; the FULL suite runs at merge)" : gateRun(testCommand)),
     MAIN_BRANCH_NOTE,
     "Report EXACTLY the schema: what_done (2-4 sentences on what the PREVIOUS worker actually landed), files_changed (from the diff), verification (YOUR OWN gate run with numbers), branch (" + slug + "), worktree, head (`git rev-parse " + slug + "` - full 40-hex SHA), completed (true ONLY if the EXISTING work satisfies every acceptance criterion).",
     "", GIT_RULES, CMDS, FACTS, ACC_STRUCTURED,
@@ -1230,7 +1237,7 @@ function workPhase(t, rec, parallel) {
       " (4) never touch the main working copy and never switch branches there;" +
       " (5) report the ABSOLUTE worktree path in the worktree field of your result.",,
     absPathRule(wt),
-    "Verification command (must pass before you finish): " + (relayMode && testCommandQuick ? testCommandQuick + " (quick gate; the FULL suite runs again at merge)" : testCommand),
+    "Verification command (must pass before you finish): " + (relayMode && testCommandQuick ? gateRun(testCommandQuick) + " (quick gate; the FULL suite runs again at merge)" : gateRun(testCommand)),
     "",
     "Global constraints (repeated for direct workers): " + constraints,
     GIT_RULES, CMDS, NO_SCRATCH_DEBUG,
@@ -1309,7 +1316,7 @@ function ledgerRepair(t, rec, parallel, arbiterNote) {
     "2) Launch the ledger ceremony as REPAIR exactly like this (fill placeholders):",
     "   subagent({ workflowScriptPath: " + JSON.stringify(ledgerWorkflowPath) + ", args: { task: <THE PAYLOAD between TASK-BEGIN/TASK-END above, verbatim, PLUS this prefix line: 'REPAIR CONTEXT: partial work already exists on the current branch - inspect git status/diff first and complete it rather than restart; keep existing commits.'>, testCommand: " + JSON.stringify(testCommand) + (testCommandQuick ? ", quickCommand: " + JSON.stringify(testCommandQuick) : "") + ", ledgerDir: " + JSON.stringify(parallel ? "<ABSOLUTE path to the MAIN working tree>/" + ledgerDirName + " (main tree = first `worktree` line of `git worktree list --porcelain`)" : ledgerDirName) + ", cwd: <repo root you are in>, maxIters: 10" + ((workModel || model) ? ", model: " + JSON.stringify(workModel || model) : "") + " }, async: false, timeoutMs: 14400000 })\n   NOTE: if the workflowScriptPath above does not exist on this machine (different OS/container), locate ledger-loop-mem.js under the ledger-solve skill dir (e.g. ~/.agents/skills/ledger-solve/workflows/) and use that absolute path instead.",
     "   async:false is MANDATORY - block until the ceremony receipt. Do not poll. While that call is blocked you cannot act and need not act: the receipt arrives as the call result. NEVER watch the ceremony with sleep loops (no `sleep 330`, no polling cats of state files) - they burn wall time; any sleep above 60 seconds is FORBIDDEN (sole exception: the KILLED-CALL RECOVERY procedure of your relay agent profile, only after a blocking call was actually killed).",
-    "3) done:true -> run the gate yourself" + (testCommandQuick ? " (QUICK gate: " + testCommandQuick + " - the full authoritative gate runs at merge)" : "") + " and inspect git diff; red gate or empty diff -> completed=false with details. done:false -> completed=false with the stopReason and what landed.",
+    "3) done:true -> run the gate yourself" + (testCommandQuick ? " (QUICK gate: " + gateRun(testCommandQuick) + " - the full authoritative gate runs at merge)" : ": " + gateRun(testCommand)) + " and inspect git diff; red gate or empty diff -> completed=false with details. done:false -> completed=false with the stopReason and what landed.",
     "4) Commit ONLY the files the ceremony changed (never `git add -A`); verify `git show --stat HEAD` lists only your files; if a hook staged .beads/issues.jsonl: git checkout <pre-commit HEAD> -- .beads/issues.jsonl && git add .beads/issues.jsonl && git commit --amend --no-edit.",
     "HEAD REPORT (mandatory): after your FINAL commit run `git rev-parse HEAD` on YOUR branch and report the full SHA in the `head` field - review and merge verify exactly this commit after the repair.",
     "5) Report: what_done (incl. ceremony receipt summary: rounds, stopReason), files_changed, verification (YOUR OWN gate run with numbers), branch, worktree, head (40-hex SHA), completed, testsAddedOrUpdated, commandsRun, validationOutput, residualRisks, noStagedFiles, criteriaSatisfied.",
@@ -1660,7 +1667,7 @@ function postPhase(t, rec, wOut, parallel) {
       parallel ? wtNote : "",
       absPathRule(wt),
       (fixOnly ? "Reviewer verdict reasons (context only): " : "Reviewer rework reasons to address: ") + notes,
-      "Verification command: " + testCommand,
+      "Verification command: " + gateRun(testCommand),
       "", "Global constraints: " + constraints, GIT_RULES, CMDS, NO_SCRATCH_DEBUG,
       "HEAD REPORT (mandatory): after your FINAL commit run `git rev-parse HEAD` and report the full SHA in the `head` field.",
       "Commit your fixes to the same branch; leave the working copy clean.",

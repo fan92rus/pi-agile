@@ -14,6 +14,16 @@ function git(cwd, args, check = true) {
   if (check && result.status !== 0) throw new Error(result.stderr.trim() || `git ${args.join(" ")} failed (${result.status})`);
   return result;
 }
+// ISSUE-7: pi-subagents exports PI_SUBAGENT_CHILD / PI_SUBAGENT_DEPTH into every child, and a
+// test inherited from a worker then goes red without a real regression. The gate command is
+// sealed at its spawn (env copy, this process's env untouched). Limit: the agent's own pi-tools
+// still see these variables - only the gate command is sealed.
+const GATE_STRIPPED_ENV = ["PI_SUBAGENT_CHILD", "PI_SUBAGENT_DEPTH"];
+function gateEnv() {
+  const env = { ...process.env };
+  for (const key of GATE_STRIPPED_ENV) delete env[key];
+  return env;
+}
 function parseArgs(argv) {
   const opts = {};
   for (let i = 0; i < argv.length; i++) {
@@ -90,7 +100,7 @@ export async function mergeBranch(options) {
       git(main, ["add", options.sddFile]);
     }
   }
-  const suite = run(options.testCommand, [], { cwd: main, shell: true });
+  const suite = run(options.testCommand, [], { cwd: main, shell: true, env: gateEnv() });
   if (suite.status !== 0) { git(main, ["reset", "--hard", "HEAD"]); throw new Error(`testCommand failed (${suite.status}): ${suite.stderr || suite.stdout}`); }
   git(main, ["commit", "-m", options.message || `feat: ${branch}`]);
   const mergeCommit = git(main, ["rev-parse", "HEAD"]).stdout.trim();

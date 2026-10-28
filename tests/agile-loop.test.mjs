@@ -632,7 +632,7 @@ T("fix-only rework: structured fix_list -> rework brief carries ONLY the listed 
     "scope guard: nothing beyond the list, no re-research");
   assert.ok(!rw.task.includes("Same task, same rules as before"), "legacy re-research brief is replaced");
   assert.ok(!rw.task.includes("Acceptance criteria: acc 1"), "no task re-statement in the fix-only brief");
-  assert.ok(rw.task.includes("Verification command: npm test"), "FULL suite stays the rework gate");
+  assert.ok(rw.task.includes("Verification command: env -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_DEPTH npm test"), "FULL suite stays the rework gate (sealed from PI_SUBAGENT_*)");
   assert.equal(rw.acceptance, false, "report contract unchanged (structured output IS the report)");
   const review2 = runs.spec(/-review-r1$/);
   assert.ok(review2, "fix-only report still goes through review");
@@ -756,6 +756,38 @@ T("contract: work/rework/repair briefs carry the no-scratch-debug diagnostic rul
   assert.ok(!pOut.err, "repair campaign threw: " + (pOut.err && pOut.err.message));
   assert.ok(repairRuns.spec(K.repair), "repair ceremony launched");
   assertRule(repairRuns.spec(K.repair).spec.task, "repair brief");
+});
+
+T("ISSUE-7 contract: work/rework/report-repair/repair briefs run the gate as env -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_DEPTH <testCommand>", async () => {
+  const GATE = "env -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_DEPTH npm test";
+  const workRuns = makeRuns(happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }));
+  const wOut = await runCampaign(baseArgs(), workRuns);
+  assert.ok(!wOut.err, "work campaign threw: " + (wOut.err && wOut.err.message));
+  assert.ok(workRuns.spec(K.work).spec.task.includes("Verification command (must pass before you finish): " + GATE), "work brief");
+  let reviewCalls = 0;
+  const reworkRuns = makeRuns(happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    review: async () => { reviewCalls++; return ok(reviewOk(reviewCalls >= 2))(); },
+  }));
+  const rOut = await runCampaign(baseArgs({ reworkLimit: 1 }), reworkRuns);
+  assert.ok(!rOut.err, "rework campaign threw: " + (rOut.err && rOut.err.message));
+  assert.ok(reworkRuns.spec(K.rework).spec.task.includes("Verification command: " + GATE), "rework brief");
+  const reportRuns = makeRuns(happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    work: fail("required structured output was not produced"),
+  }));
+  const sOut = await runCampaign(baseArgs(), reportRuns);
+  assert.ok(!sOut.err, "report-repair campaign threw: " + (sOut.err && sOut.err.message));
+  assert.ok(reportRuns.spec(K.reportRepair).spec.task.includes("Run the verification command YOURSELF: " + GATE), "report-repair brief");
+  const repairRuns = makeRuns(happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    review: ok(reviewOk(false)),
+    arbiter: ok(arbOut("escalate-ledger", "genuinely nontrivial")),
+    repair: ok(workOut({ head: "9999999999999999999999999999999999999999", what_done: "repair ceremony done" })),
+  }));
+  const pOut = await runCampaign(baseArgs({ reworkLimit: 0, agentWork: "ledger-worker" }), repairRuns);
+  assert.ok(!pOut.err, "repair campaign threw: " + (pOut.err && pOut.err.message));
+  assert.ok(repairRuns.spec(K.repair).spec.task.includes("run the gate yourself: " + GATE), "repair brief");
 });
 
 T("merged:true with checks_ok:false is NOT a merged verdict", async () => {
@@ -3543,6 +3575,54 @@ T("mergeBranch bd spawn error is best-effort after committed merge", async () =>
     assert.equal(git(main, "rev-list", "--count", "main~1..main"), "1", "squash commit remains on main");
     assert.equal(git(main, "status", "--porcelain"), "");
   } finally { process.env.PATH = oldPath; fsSync.rmSync(root, { recursive: true, force: true }); }
+});
+
+// --- ISSUE-7: gate environment (a worker's PI_SUBAGENT_* must not poison the merge gate) ---
+// Fixture: main + one-commit worker branch ready to merge; each test supplies its own testCommand.
+function gateFixture(prefix) {
+  const root = fsSync.mkdtempSync(pathMod.join(os.tmpdir(), prefix));
+  const main = pathMod.join(root, "repo"), wt = pathMod.join(root, "worker-wt");
+  fsSync.mkdirSync(main);
+  const git = (cwd, ...args) => {
+    const r = spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(r.status, 0, `git ${args.join(" ")}: ${r.stderr}`); return r.stdout.trim();
+  };
+  git(main, "init", "-b", "main"); git(main, "config", "user.email", "test@example.com"); git(main, "config", "user.name", "Contract Test");
+  fsSync.writeFileSync(pathMod.join(main, "base.txt"), "base\n"); git(main, "add", "."); git(main, "commit", "-m", "base");
+  git(main, "switch", "-c", "worker"); fsSync.writeFileSync(pathMod.join(main, "new.txt"), "change\n"); git(main, "add", "."); git(main, "commit", "-m", "worker change");
+  const approvedSha = git(main, "rev-parse", "HEAD"); git(main, "switch", "main"); git(main, "worktree", "add", wt, "worker");
+  return { root, main, wt, approvedSha };
+}
+const restoreEnv = (saved) => { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } };
+
+T("ISSUE-7 unit: mergeBranch gate env drops PI_SUBAGENT_CHILD/DEPTH, keeps PATH/HOME, leaves the merger's own env intact", async () => {
+  const fx = gateFixture("merge-gate-env-");
+  const dump = pathMod.join(fx.root, "dump-gate-env.mjs"), out = pathMod.join(fx.root, "gate-env.json");
+  fsSync.writeFileSync(dump, `import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(out)}, JSON.stringify({ PATH: process.env.PATH ?? null, HOME: process.env.HOME ?? null, PI_SUBAGENT_CHILD: process.env.PI_SUBAGENT_CHILD ?? null, PI_SUBAGENT_DEPTH: process.env.PI_SUBAGENT_DEPTH ?? null }));\n`);
+  const saved = { PI_SUBAGENT_CHILD: process.env.PI_SUBAGENT_CHILD, PI_SUBAGENT_DEPTH: process.env.PI_SUBAGENT_DEPTH, HOME: process.env.HOME };
+  process.env.PI_SUBAGENT_CHILD = "1"; process.env.PI_SUBAGENT_DEPTH = "2"; process.env.HOME = fx.root;
+  try {
+    const result = await mergeBranch({ mainDir: fx.main, mainBranch: "main", worktree: fx.wt, branch: "worker", approvedSha: fx.approvedSha, testCommand: `"${process.execPath}" "${dump}"` });
+    assert.equal(result.status, 0); assert.equal(result.data.merged, true);
+    const env = JSON.parse(fsSync.readFileSync(out, "utf8"));
+    assert.equal(env.PI_SUBAGENT_CHILD, null, "gate spawn env has no PI_SUBAGENT_CHILD");
+    assert.equal(env.PI_SUBAGENT_DEPTH, null, "gate spawn env has no PI_SUBAGENT_DEPTH");
+    assert.equal(env.PATH, process.env.PATH ?? null, "PATH kept in the gate env");
+    assert.equal(env.HOME, fx.root, "HOME kept in the gate env");
+    assert.equal(process.env.PI_SUBAGENT_CHILD, "1", "the merger's own process.env is not modified");
+  } finally { restoreEnv(saved); fsSync.rmSync(fx.root, { recursive: true, force: true }); }
+});
+
+T("ISSUE-7 carrier: a gate script that fails on an inherited PI_SUBAGENT_CHILD passes under the merger gate", async () => {
+  const fx = gateFixture("merge-gate-carrier-");
+  const carrier = pathMod.join(fx.root, "carrier-gate.mjs");
+  fsSync.writeFileSync(carrier, "if (process.env.PI_SUBAGENT_CHILD || process.env.PI_SUBAGENT_DEPTH) { console.error('PI_SUBAGENT_* leaked into the gate'); process.exit(1); }\n");
+  const saved = { PI_SUBAGENT_CHILD: process.env.PI_SUBAGENT_CHILD, PI_SUBAGENT_DEPTH: process.env.PI_SUBAGENT_DEPTH };
+  process.env.PI_SUBAGENT_CHILD = "1"; process.env.PI_SUBAGENT_DEPTH = "1";
+  try {
+    const result = await mergeBranch({ mainDir: fx.main, mainBranch: "main", worktree: fx.wt, branch: "worker", approvedSha: fx.approvedSha, testCommand: `"${process.execPath}" "${carrier}"` });
+    assert.equal(result.status, 0, "inherited worker env must not red the gate"); assert.equal(result.data.merged, true);
+  } finally { restoreEnv(saved); fsSync.rmSync(fx.root, { recursive: true, force: true }); }
 });
 
 // --- ISSUE-5: main-copy isolation (the main working copy is never written by a worker) ------
