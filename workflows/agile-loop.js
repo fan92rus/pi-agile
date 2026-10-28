@@ -587,7 +587,7 @@ function delayMs(ms) {
   if (ms <= 0 || typeof setTimeout !== "function") return Promise.resolve();
   return new Promise(function (resolve) { setTimeout(resolve, ms); });
 }
-function runChild(key, spec) {
+function runChild(key, spec, opts) {
   // Q3 model ladder: on provider overload the NEXT attempt moves to the next model
   // in args.modelLadder (shared attempt counter - a ladder step burns an attempt;
   // transport retries keep the CURRENT fallback model). Review/arbiter children
@@ -615,6 +615,11 @@ function runChild(key, spec) {
     : (coolingLead ? [coolingLead].concat(ladderFull.filter(function (m) { return m !== coolingLead; })) : ladderFull);
   if (coolingLead) emit("[cooling] " + key + ": every ladder candidate is unhealthy - leading with '" + coolingLead + "' (minimal until, recovers first)");
   let modelIdx = 0;
+  // ISSUE-4: opts.schemaRetry (review children only) - a missing structured_output gets ONE
+  // re-run of the same brief with SCHEMA_REMINDER appended (same approved SHA; the reviewer
+  // is read-only, so the re-run cannot overwrite landed work). One-shot: the flag stays set.
+  const schemaRetry = !!(opts && opts.schemaRetry);
+  let reminded = false;
   // Plain promise-chain retry loop (nested async functions are rejected by the sandbox).
   // runs.run is called at the CHAIN HEAD: the tracker requires direct .then/await
   // registration on the launch promise - wrapping it in Promise.resolve().then(...)
@@ -624,7 +629,8 @@ function runChild(key, spec) {
   function attempt(n) {
     usedCount++; // every launch attempt counts toward the campaign's LLM budget
     const m = ladderSeq[modelIdx];
-    const spec2 = m && m !== spec.model ? Object.assign({}, spec, { model: m }) : spec;
+    const specR = reminded ? Object.assign({}, spec, { task: spec.task + SCHEMA_REMINDER }) : spec;
+    const spec2 = m && m !== spec.model ? Object.assign({}, specR, { model: m }) : specR;
     return runs.run(n === 0 ? key : key + "~retry" + (n + 1), spec2).then(
       function (res) {
         if (res && res.ok !== false) {
@@ -657,6 +663,11 @@ function runChild(key, spec) {
       throw new Error("token-budget-exhausted: " + errText.slice(0, 300));
     }
     if (SCHEMA_RE.test(errText)) {
+      if (schemaRetry && !reminded) {
+        reminded = true;
+        emit("[schema-retry] " + key + " attempt " + (n + 1) + ": missing structured_output - one re-run of the same review with a reminder");
+        return attempt(n + 1);
+      }
       // The child RAN (it may have landed work on the branch) - never auto re-brief.
       throw new Error("schema-missing: " + errText.slice(0, 300));
     }
@@ -697,6 +708,8 @@ function runChild(key, spec) {
 }
 
 // --- shared discipline lines -----------------------------------------------------
+// ISSUE-4: appended to the brief of the ONE schema re-run of a review child.
+const SCHEMA_REMINDER = "\nSCHEMA REMINDER (re-run after a missing structured_output): your previous attempt ended WITHOUT calling the structured_output tool. This is a re-run of the SAME review on the SAME approved HEAD SHA - do NOT modify any files. Your final action MUST be the structured_output call carrying the verdict (approved, rework_reasons, notes; fix_list when approved=false with concrete fixes).\n";
 const FINAL_MSG = "FINAL MESSAGE DISCIPLINE: your final message must be ONLY the JSON value with EXACTLY the schema keys listed in your instructions. Do NOT emit acceptanceReport or any other key; narrative goes inside string fields.\n";
 const ACC_STRUCTURED = "ACCEPTANCE SOURCE (structured output IS the report): your structured_output JSON IS the acceptance report - the workflow validates it semantically and any violation fails as 'schema-missing: <field>'. There is NO fenced acceptance_report block anymore: do NOT emit one; your final message is a free-text summary for the caller. Acceptance fields (ALL required, inside the structured output):\n- head: the full 40-hex SHA of YOUR branch HEAD after the final commit (run `git rev-parse HEAD` and report exactly that).\n- testsAddedOrUpdated: array of '<file>: <N> cases' strings; [] exactly when the task truly adds no tests.\n- commandsRun: array of {command, result, summary}; result is EXACTLY one of \"passed\", \"failed\", \"not-run\" (NEVER \"exit 0\" or any other free text - a live campaign lost two workers to a brief that demonstrated exit 0).\n- validationOutput: NON-EMPTY array of the decisive gate output lines.\n- residualRisks: array of strings ([] when none).\n- noStagedFiles: must be true - after your final commit `git status --short` in YOUR tree must be empty.\n- criteriaSatisfied: EXACTLY two entries with ids EXACTLY \"criterion-1\" (scope discipline: implement without widening) and \"criterion-2\" (evidence sufficiency), each {id, status: \"satisfied\", evidence: <verified fact: numbers, exit codes, file paths>}.\n";
 const REPORT_SHAPE_RE = /^schema-missing:/i; // salvage-class rejections: the machine-readable REPORT is broken; the WORK on the branch may be fine (live classes: host "required structured output was not produced" via runChild fail(), and validateAccStructured 'schema-missing: <field>'; the fence classes "Structured acceptance report not found" / "Required criterion ... not reported" are GONE with acceptance:false)
@@ -1456,9 +1469,20 @@ function postPhase(t, rec, wOut, parallel) {
     const revSpec = { task: revLines, outputSchema: REVIEW_SCHEMA };
     const rvm = nextReviewModel(rec.wm); // rotation + skip the author's model (cross-model per task)
     if (rvm) revSpec.model = rvm; // never pass model:undefined - poisons the launch spec
-    return runChild(taskKey(t, "review" + (r > 0 ? "-r" + r : "")), childOpts(revSpec, "review")).then(
+    return runChild(taskKey(t, "review" + (r > 0 ? "-r" + r : "")), childOpts(revSpec, "review"), { schemaRetry: true }).then(
       function (v) { return decide(outOf(v), curWOut, r, reworkNotes); },
       function (e) {
+        const msg = String((e && e.message) || e);
+        if (REPORT_SHAPE_RE.test(msg)) {
+          // review-schema-miss: no verdict even after the one schema re-run. Nothing to act
+          // on - verdict failed WITHOUT rework, arbitration or a review-r round (a rejected
+          // review is not a content verdict, so it must not spend the rework budget).
+          rec.verdict = "failed";
+          rec.failClass = "review-schema-miss";
+          rec.stop = "review-schema-miss: reviewer produced no structured_output after one re-run";
+          log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": review-schema-miss after one re-run - no rework, verdict failed (branch " + slug + " left for cleanup)");
+          return Promise.resolve();
+        }
         // reviewer child failed after retries -> synthesize not-approved, same flow
         return decide({ approved: false, rework_reasons: "reviewer failed: " + String(e).slice(0, 200) }, curWOut, r, reworkNotes);
       }

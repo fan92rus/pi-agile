@@ -208,6 +208,70 @@ T("schema-missing: NO re-brief (single work launch), flow degrades to arbiter, d
   assert.equal(res.done, false);
 });
 
+// ISSUE-4: a review child that ends without structured_output gets ONE re-run of the
+// same review (same approved SHA, reminder appended) before any rework is spent.
+T("review schema-miss: ONE re-run of the same review with a reminder, ok on the retry -> merged, zero rework", async () => {
+  let reviewCalls = 0;
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    review: (spec, key) => {
+      reviewCalls++;
+      return reviewCalls === 1 ? fail("required structured output was not produced")() : ok(reviewOk(true))();
+    },
+  });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs({ reworkLimit: 2 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const { res } = out;
+  assert.equal(runs.count(K.review), 2, "exactly two review launches: the original + ONE re-run");
+  assert.equal(runs.count(K.rework), 0, "schema-miss spends no rework round");
+  assert.equal(runs.count(/-review-r\d+$/), 0, "no review-r round after a schema-miss");
+  const orig = runs.spec(/t1-review$/).spec;
+  const retry = runs.spec(/t1-review~retry2$/).spec;
+  assert.ok(retry, "the re-run is keyed as a review retry");
+  assert.equal(retry.model, orig.model, "re-run stays on the same reviewer model (no ladder)");
+  assert.ok(retry.task.startsWith(orig.task), "re-run brief = the original brief (same approved SHA) + a reminder");
+  assert.ok(/SCHEMA REMINDER/.test(retry.task.slice(orig.task.length)), "re-run carries the structured_output reminder");
+  assert.equal(res.tasks[0].verdict, "merged", "ok verdict on the retry merges the task");
+});
+
+T("review schema-miss twice: exactly two review launches, zero rework/review-r, verdict failed with class review-schema-miss", async () => {
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    review: fail("required structured output was not produced"),
+  });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs({ reworkLimit: 2 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const { res } = out;
+  assert.equal(runs.count(K.review), 2, "exactly two review launches: the original + ONE re-run");
+  assert.equal(runs.count(K.rework), 0, "no rework after the review schema-miss");
+  assert.equal(runs.count(/-review-r\d+$/), 0, "no review-r round after the review schema-miss");
+  assert.equal(runs.count(K.arbiter), 0, "no arbitration after the review schema-miss");
+  assert.equal(runs.count(K.merge), 0, "unreviewed work is never merged");
+  assert.equal(res.tasks[0].verdict, "failed");
+  assert.equal(res.tasks[0].failClass, "review-schema-miss");
+  assert.ok(/review-schema-miss/.test(res.tasks[0].stop), "stop names the class: " + res.tasks[0].stop);
+});
+
+T("review approved:false is a verdict, not a schema-miss: no re-run, rework as before", async () => {
+  let reviewCalls = 0;
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    review: (spec, key) => {
+      reviewCalls++;
+      return reviewCalls === 1 ? ok(reviewOk(false))() : ok(reviewOk(true))();
+    },
+  });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs({ reworkLimit: 2 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(launchedKeys(out.events, /~retry/).filter((k) => /review/.test(k)).length, 0, "approved:false never re-runs the review");
+  assert.equal(runs.count(/-review(-r\d+)?$/), 2, "review + one review-r1 after the rework, nothing extra");
+  assert.equal(runs.count(K.rework), 1, "approved:false spends exactly one rework round");
+  assert.equal(out.res.tasks[0].verdict, "merged");
+});
+
 T("arbiter merge-as-is: orchestrator merges via mergeChain (serialized), verdict merged-after-arbitration", async () => {
   const routes = happyRoutes({
     curator: ok(curatorOut(true, [task(1), task(2)])),
