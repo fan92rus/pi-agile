@@ -460,6 +460,13 @@ function contractMismatch(t, changed) {
   if (hit) return null;
   return "contract names " + uniq.join(", ") + " but the branch changed " + (ch.length ? ch.slice(0, 5).join(", ") + (ch.length > 5 ? ", ..." : "") : "no files");
 }
+// NO-CODE ANALYSIS LEAF: a line 'deliverable: analysis' within the first 300 chars of the
+// leaf's description (the rationale field). The deliverable is a report artifact at the
+// leaf's files_hint path: no commit, empty diff is expected, and the merge is a no-code
+// disposition (bd close + worktree removal) instead of a merge-branch CLI squash.
+function isAnalysisLeaf(t) {
+  return /^\s*deliverable:\s*analysis\s*$/im.test(String((t && t.rationale) || "").slice(0, 300));
+}
 function slugify(t) {
   return String(t).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "task";
 }
@@ -1120,6 +1127,7 @@ function workPhase(t, rec, parallel) {
     sddActive && t.sdd_item ? "SDD item (verbatim): " + String(t.sdd_item) : "",
     sddActive ? "Authoritative spec: " + sddTasksFile + " (SDD artifacts under " + sddDir + "/specs) - read YOUR item there for full context (requirements/design)." : "",
     sddEngine ? "SDD ENGINE: this task adds NEW behavior - walk a COMPACT sdd chain FIRST using the sdd-* skills (read each SKILL.md: sdd-idea -> sdd-prd -> sdd-spec -> sdd-tasks; self-answer clarifying questions, record decisions in the artifacts' Gate Log, advance .status gates). Artifacts under " + sddDir + "/specs/<task-slug>/ committed ON YOUR BRANCH; tasks.md = checkbox items. Then implement per your own tasks.md. Code never precedes artifacts; keep the chain lean (this is a per-task spec, not a project bible)." : "",
+    isAnalysisLeaf(t) ? "NO-CODE ANALYSIS DELIVERABLE (deliverable: analysis): produce the requested report as the artifact at the Expected files path below; your report must name that path and the verification you ran. Do not change tracked files. An empty git diff is expected - the artifact itself is the deliverable." : "",
     "Expected files (hint, not a straitjacket): " + (t.files_hint || "as the code dictates"),
     "Global constraints: " + constraints,
     "TASK-END",
@@ -1141,7 +1149,7 @@ function workPhase(t, rec, parallel) {
     GIT_RULES, CMDS, NO_SCRATCH_DEBUG,
     "MINIMALITY CONTRACT: the acceptance criteria and the verification command are the source of truth; delete anything no criterion needs before finishing.",
     "TDD preference: for aspects the verification command does not cover, write a failing test first and keep it in the deliverable.",
-    parallel ? "Before finishing: commit all your changes ON YOUR BRANCH inside your worktree (git add <files> && git commit), leave the worktree clean, report branch + worktree." : "Before finishing: commit all your changes to your branch (git add <your changed files> && git commit - NEVER 'git add -A': journal/.env/beads files must not leak into the branch), leave the working copy clean, report your branch name.",
+    isAnalysisLeaf(t) ? "NO-CODE EXCEPTION: do NOT commit. Leave the branch at its original HEAD; report that HEAD SHA and the exact artifact path. The artifact may be ignored/untracked and must be verified by review." : parallel ? "Before finishing: commit all your changes ON YOUR BRANCH inside your worktree (git add <files> && git commit), leave the worktree clean, report branch + worktree." : "Before finishing: commit all your changes to your branch (git add <your changed files> && git commit - NEVER 'git add -A': journal/.env/beads files must not leak into the branch), leave the working copy clean, report your branch name.",
     "HEAD REPORT (mandatory): after your FINAL commit run `git rev-parse HEAD` on YOUR branch and report the full SHA in the `head` field - review and merge verify exactly this commit; a missing or mismatched head fails the task.",
     relayMode ? "COMMIT NOTE (relay): never `git add -A` - add ONLY the files the ceremony changed (see engine protocol)." : "",
     FACTS, ACC_STRUCTURED,
@@ -1264,17 +1272,33 @@ function postPhase(t, rec, wOut, parallel) {
     }
     const closedAtStart = doneSet().has(String(t.id || ""));
     const cliArgs = ["node", "workflows/merge-branch.mjs", "--main-dir", JSON.stringify("."), ...(mainBranch ? ["--main-branch", JSON.stringify(mainBranch)] : []), "--worktree", JSON.stringify(wt), "--branch", JSON.stringify(slug), "--approved-sha", JSON.stringify(rec.head), "--test-command", JSON.stringify(testCommand), "--journal-file", JSON.stringify(journalDir + "/sprint-" + sprint + ".jsonl"), "--task-title", JSON.stringify(t.title), ...(sddActive && t.sdd_item ? ["--sdd-file", JSON.stringify(sddTasksFile), "--sdd-item", JSON.stringify(String(t.sdd_item))] : []), ...(bdEpic && t.id && !closedAtStart ? ["--bd-leaf", JSON.stringify(t.id)] : [])].join(" ");
+    // NO-CODE ANALYSIS merge: nothing lands on the integration branch, so the merge CLI (which
+    // squashes commits) is not run. The merger closes the leaf, journals it and removes the worktree.
+    const noCode = isAnalysisLeaf(t);
+    const bdLeafClose = bdEpic && t.id && !closedAtStart;
+    const artifactPath = wt + "/" + String(t.files_hint || "");
+    const noCodeSteps = [
+      "NO-CODE ANALYSIS MERGE: the deliverable is the report artifact at " + JSON.stringify(artifactPath) + "; no merge CLI runs and NO git commit is created. Run these steps from the repository root:",
+      "1) artifact check: `test -f " + JSON.stringify(artifactPath) + "` must succeed; otherwise merged=false, note='analysis artifact missing', and stop.",
+      "2) no-code check: `git rev-parse " + slug + "` must equal the approved SHA and `git rev-list --count " + (mainBranch || "main") + ".." + slug + "` must print 0; otherwise merged=false with the reason and stop.",
+      bdLeafClose ? "3) bd close: `bd close " + t.id + " -r " + JSON.stringify(t.id + ": no-code analysis deliverable - merged") + " </dev/null`; bd_closed = exit 0; a failed close does not fail the merge." : "3) bd close: not applicable (no open bd leaf to close).",
+      "4) journal: mkdir -p " + journalDir + " and append ONE json line to " + journalDir + "/sprint-" + sprint + ".jsonl: {\"task\": " + JSON.stringify(t.title) + ", \"verdict\": \"merged\", \"branch\": " + JSON.stringify(slug) + ", \"head\": " + JSON.stringify(rec.head) + ", \"note\": \"no-code analysis deliverable at " + String(t.files_hint || "").replace(/["\\]/g, "") + "; no git commit\"}; journal_written = true only when the append succeeded.",
+      "5) worktree: `git worktree remove --force " + wt + "` (the branch " + slug + " is left as it is).",
+      "6) report: merged=true, checks_ok=true (steps 1-2 passed), journal_written, merge_commit='' (no git commit exists), bd_closed when step 3 applies, note='no-code analysis deliverable'."
+    ];
     const mergeLines = [
-      "You are the MERGER. Run the deterministic merge CLI; do not perform deterministic git, test, bd, or cleanup steps yourself.",
+      noCode ? "You are the MERGER for a NO-CODE ANALYSIS deliverable. Follow the no-code steps exactly; do not run any merge CLI." : "You are the MERGER. Run the deterministic merge CLI; do not perform deterministic git, test, bd, or cleanup steps yourself.",
       "Branch: " + slug + " | Task: " + t.title + " | approved SHA: " + rec.head,
-      "Run from the repository root exactly: " + cliArgs,
+      ...(noCode ? noCodeSteps : ["Run from the repository root exactly: " + cliArgs]),
       ...(mergeApproval === "confirm" ? [
         "Before running the CLI, perform the merge approval gate from the repository root: show `git diff --stat " + mainBranch + "..." + slug + "` and run the full checks with `" + testCommand + " </dev/null`. Present the diff stat and exact check result to the calling side via contact_supervisor (reason: \"merge approval\"). If refused, abort without running the merge CLI or changing either tree. Proceed only after explicit approval.",
       ] : []),
-      "CLI exit 0: report its JSON facts as merged=true, checks_ok=true, journal_written=<journalWritten>, merge_commit=<mergeCommit>, bd_closed=<bdClosed when applicable>; do not alter the result.",
-      "CLI exit 2: its JSON lists conflictFiles and worktree. Resolve only those conflicts in that worktree as a sibling-aware editor: read sibling branches' diffs to preserve both intents, with ours being the new base during rebase; stage resolved files, run `git rebase --continue` there, then rerun the exact CLI command. No main-tree write occurs on exit 2.",
-      "Any other exit or invalid JSON: report merged=false and the CLI error; make no manual integration changes.",
-      "Only report bd_closed when the CLI returns it; already-closed leaves omit --bd-leaf. Schema keys: merged, checks_ok, journal_written, merge_commit, note" + (bdEpic && t.id && !closedAtStart ? ", bd_closed" : "") + "."
+      ...(noCode ? [] : [
+        "CLI exit 0: report its JSON facts as merged=true, checks_ok=true, journal_written=<journalWritten>, merge_commit=<mergeCommit>, bd_closed=<bdClosed when applicable>; do not alter the result.",
+        "CLI exit 2: its JSON lists conflictFiles and worktree. Resolve only those conflicts in that worktree as a sibling-aware editor: read sibling branches' diffs to preserve both intents, with ours being the new base during rebase; stage resolved files, run `git rebase --continue` there, then rerun the exact CLI command. No main-tree write occurs on exit 2.",
+        "Any other exit or invalid JSON: report merged=false and the CLI error; make no manual integration changes.",
+      ]),
+      noCode ? "Only report bd_closed when step 3 closed the leaf; already-closed leaves skip it. Schema keys: merged, checks_ok, journal_written, merge_commit, note" + (bdLeafClose ? ", bd_closed" : "") + "." : "Only report bd_closed when the CLI returns it; already-closed leaves omit --bd-leaf. Schema keys: merged, checks_ok, journal_written, merge_commit, note" + (bdLeafClose ? ", bd_closed" : "") + "."
     ].join("\n");
     return runChild(taskKey(t, "merge"), childOpts({ task: [mergeLines, selfCheckLine("merge")].join("\n"), outputSchema: MERGE_SCHEMA })).then(
       function (mg) {
@@ -1434,7 +1458,8 @@ function postPhase(t, rec, wOut, parallel) {
     }
     // Contract pre-check BEFORE the LLM reviewer: a header/files_hint that names files the
     // branch never touched is a fast, mechanical rejection - the review child is not launched.
-    const preMismatch = contractMismatch(t, (curWOut && Array.isArray(curWOut.files_changed)) ? curWOut.files_changed : []);
+    // A no-code analysis leaf changes no tracked file: its files_hint names the artifact, not a change.
+    const preMismatch = isAnalysisLeaf(t) ? null : contractMismatch(t, (curWOut && Array.isArray(curWOut.files_changed)) ? curWOut.files_changed : []);
     if (preMismatch) {
       rec.verdict = "failed";
       rec.stop = "contract pre-check: " + preMismatch;
@@ -1446,12 +1471,15 @@ function postPhase(t, rec, wOut, parallel) {
       "Campaign goal: " + description,
       "Task under review: " + t.title,
       "Acceptance criteria: " + (t.acceptance || ""),
+      isAnalysisLeaf(t) ? "Declared analysis artifact: " + (t.files_hint || "(none declared)") + " in the task worktree \"" + wt + "\"" : "",
       "Worker report: " + JSON.stringify(curWOut || wOut).slice(0, 1200),
       "Approved HEAD SHA: " + String((curWOut || wOut || {}).head || "unknown") + " - FIRST verify it: run `git rev-parse " + slug + "`; if the branch head differs from the approved SHA -> approved=false, rework_reasons='branch head moved after the work report'.",
       reworkNotes ? ("Previous rework reasons to re-check: " + reworkNotes) : "",
       "",
       "Review the branch diff: `git log --oneline main.." + slug + "` and `git diff main..." + slug + "` (MAIN BRANCH: if 'main' does not exist, substitute the actual integration branch - typically 'master'; never create 'main').",
-      "If the diff vs the integration branch is EMPTY: approved=false with reason 'empty diff - the work never landed on the branch'.",
+      isAnalysisLeaf(t)
+        ? "NO-CODE ANALYSIS: an empty diff is expected, not a rejection. Verify the worker report names the declared artifact, then inspect that artifact in the task worktree and confirm it exists and satisfies the acceptance criteria; a missing or irrelevant artifact -> approved=false with a concrete reason."
+        : "If the diff vs the integration branch is EMPTY: approved=false with reason 'empty diff - the work never landed on the branch'.",
       ...(tier === "lite" ? [
         "CHECKLIST REVIEW (lite tier, mechanical change): tick each item against the diff; do not build counter-arguments beyond this list.",
         "(a) every acceptance criterion is evidenced by the diff or the worker's verification; (b) the diff holds only the task's mechanical change (renames, moves, uniform edits) - no scope creep; (c) constraints compliance; (d) tests and gate evidence present and not tautological."

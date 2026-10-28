@@ -1184,6 +1184,65 @@ T("budget classification beats transport look-alikes", async () => {
   assert.ok(/budget exhausted/.test(out.res.stopReason));
 });
 
+// --- no-code analysis deliverable: 'deliverable: analysis' in the leaf rationale (first 300 chars) ---
+const analysisLeaf = (id, over = {}) => falconLeaf(id, Object.assign({
+  rationale: "deliverable: analysis\nWrite the analysis report.", files_hint: ".ignored/report.md",
+}, over));
+
+T("no-code analysis leaf (marker in rationale, artifact in ignored path): work+review pass, empty diff not rejected, merged no-code with bd close and no git commit", async () => {
+  const runs = tierRuns({ merge: ok(mergeOut({ merged: true, checks_ok: true, journal_written: true, merge_commit: "", bd_closed: true })) });
+  const out = await runCampaign(tierArgs([analysisLeaf("analysis-a")]), runs, makeState());
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(out.res.tasks[0].verdict, "merged");
+  const work = runs.spec(K.work).spec.task;
+  assert.match(work, /NO-CODE ANALYSIS DELIVERABLE/);
+  assert.match(work, /NO-CODE EXCEPTION: do NOT commit/);
+  assert.ok(!/Before finishing: commit all your changes/.test(work), "no commit instruction on the no-code path");
+  const review = runs.spec(K.review).spec.task;
+  assert.match(review, /an empty diff is expected, not a rejection/);
+  assert.ok(review.includes(".ignored/report.md"), "review inspects the declared artifact");
+  assert.ok(!/empty diff - the work never landed/.test(review), "empty-diff rejection disabled for the analysis leaf");
+  const merge = runs.spec(K.merge).spec.task;
+  assert.match(merge, /NO-CODE ANALYSIS MERGE/);
+  assert.match(merge, /NO git commit is created/);
+  assert.ok(!/merge-branch\.mjs/.test(merge), "the merge-branch CLI does not run on the no-code path");
+  assert.match(merge, /bd close analysis-a /, "merger closes the bd leaf");
+  assert.match(merge, /bd_closed/);
+  assert.ok(out.res.log.some((l) => /merge bd-close closed analysis-a in bd/.test(l)), "bd close confirmed: " + JSON.stringify(out.res.log));
+  assert.equal(runs.count(K.merge), 1, "exactly one no-code merge child");
+});
+
+T("no-code analysis: a missing artifact is rejected by the reviewer and the no-code merge never runs", async () => {
+  const runs = tierRuns({ review: ok(reviewOk(false, { rework_reasons: "analysis artifact .ignored/report.md is missing in the worktree" })) });
+  const out = await runCampaign(tierArgs([analysisLeaf("analysis-missing")]), runs, makeState());
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.match(runs.spec(K.review).spec.task, /missing or irrelevant artifact -> approved=false/);
+  assert.notEqual(out.res.tasks[0].verdict, "merged");
+  assert.equal(runs.count(K.merge), 0, "no no-code merge without an approved artifact");
+});
+
+T("plain leaf with an empty diff keeps the empty-diff rejection and the merge-branch CLI (no marker)", async () => {
+  const runs = tierRuns();
+  const out = await runCampaign(tierArgs([falconLeaf("plain-a", { rationale: "Implement the plain change", files_hint: "" })]), runs, makeState());
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(out.res.tasks[0].verdict, "merged");
+  assert.ok(!/NO-CODE/.test(runs.spec(K.work).spec.task), "no no-code work brief without the marker");
+  assert.match(runs.spec(K.review).spec.task, /empty diff - the work never landed on the branch/);
+  assert.ok(!/NO-CODE/.test(runs.spec(K.review).spec.task));
+  assert.match(runs.spec(K.merge).spec.task, /merge-branch\.mjs/);
+  assert.ok(!/NO-CODE ANALYSIS MERGE/.test(runs.spec(K.merge).spec.task));
+});
+
+T("no-code marker past the first 300 chars of the description does not select the analysis path", async () => {
+  const runs = tierRuns({ review: ok(reviewOk(false, { rework_reasons: "empty diff - the work never landed on the branch" })) });
+  const late = "x".repeat(300) + "\ndeliverable: analysis";
+  const out = await runCampaign(tierArgs([falconLeaf("late-a", { rationale: late, files_hint: "" })]), runs, makeState());
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.ok(!/NO-CODE/.test(runs.spec(K.work).spec.task), "marker beyond 300 chars is ignored");
+  assert.match(runs.spec(K.review).spec.task, /empty diff - the work never landed on the branch/);
+  assert.equal(runs.count(K.merge), 0, "rejected empty diff is not merged");
+});
+
 // --- toy-falcon: FICTIONAL bd-epic federation fixtures (no real bd touched) ---
 const falconLeaf = (id, over = {}) => Object.assign({
   id, title: "falcon: " + id, rationale: "why " + id, acceptance: "gate " + id,
