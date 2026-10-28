@@ -377,6 +377,86 @@ function carryLines(c) {
   ];
 }
 
+// --- main-copy isolation (ISSUE-5) -------------------------------------------------
+// The main working copy is the ONE tree no worker may write: a relative edit/write from a
+// worker resolves THERE, not into its worktree. The campaign records the main copy's porcelain
+// ONCE at start (BASELINE: dirt that predates the campaign belongs to the operator, not to a
+// worker) and re-checks it before every merge. A line that is neither in the baseline nor on the
+// engine's own safe-list is an INCIDENT: that merge is refused and reported. NOTHING is reverted -
+// the evidence stays where it is for the operator. Porcelain alone cannot see a dirty path being
+// rewritten (` M src/a.txt` before and after), so the baseline also records each dirty path's content
+// hash and the pre-merge check compares those too. The baseline lives in the checkpoint, so a
+// resumed campaign compares against the same starting state.
+const MAIN_STATUS_SCHEMA = { type: "object", properties: { lines: { type: "array", items: { type: "string" } }, content: { type: "array", items: { type: "string" } } }, required: ["lines", "content"], additionalProperties: false };
+let mainBaseline = (cpPrev && typeof cpPrev === "object" && Array.isArray(cpPrev.mainBaseline)) ? cpPrev.mainBaseline.map(String) : null;
+// Content evidence for the baseline dirt: "<sha> <path>" per dirty path. Porcelain lines alone do not
+// move when a dirty file is overwritten again (` M src/a.txt` stays ` M src/a.txt`).
+let mainBaselineContent = (cpPrev && typeof cpPrev === "object" && Array.isArray(cpPrev.mainBaselineContent)) ? cpPrev.mainBaselineContent.map(String) : [];
+const mainIncidents = (cpPrev && typeof cpPrev === "object" && Array.isArray(cpPrev.mainIncidents)) ? cpPrev.mainIncidents.slice() : [];
+// Engine-owned writes into the main copy that are NOT incidents: the journal and SDD dirs, bd's
+// exported issue file (.beads/issues.jsonl ONLY - claim-dirt export, boundary export) and the ledger ceremony dirs (ledgerDir).
+function mainSafePath(p) {
+  const n = String(p || "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+  const under = function (dir) {
+    const d = String(dir).replace(/\\/g, "/").replace(/\/+$/, "");
+    return !!d && (n === d || n.indexOf(d + "/") === 0);
+  };
+  return under(journalDir) || under(sddDir) || n === ".beads/issues.jsonl" || /^ledger-ag-[^/]+(\/|$)/.test(n);
+}
+// porcelain line: "XY <path>" (untracked: "?? <path>"); a rename reads "R  <old> -> <new>"
+function mainStatusPaths(line) {
+  return String(line || "").slice(3).split(" -> ").map(function (p) { return p.trim().replace(/^"|"$/g, ""); });
+}
+function mainStatusOf(o) {
+  return (o && Array.isArray(o.lines) ? o.lines : []).map(String).filter(function (l) { return l.trim().length > 0; });
+}
+function mainContentOf(o) {
+  return (o && Array.isArray(o.content) ? o.content : []).map(String).filter(function (l) { return l.trim().length > 0; });
+}
+// "<sha> <path>" entries -> Map(path -> sha); sha "-" = the path is absent from the working tree
+function mainContentMap(list) {
+  const m = new Map();
+  for (const e of list) {
+    const i = e.indexOf(" ");
+    if (i > 0) m.set(e.slice(i + 1).trim(), e.slice(0, i));
+  }
+  return m;
+}
+function mainIncidentLines(current, currentContent) {
+  const base = new Set(mainBaseline || []);
+  const lines = current.filter(function (l) {
+    return !base.has(l) && !mainStatusPaths(l).every(mainSafePath);
+  });
+  // Content evidence (ISSUE-5): a baseline path keeps its porcelain line while its bytes may change
+  // (overwrite, edit, delete and recreate, or a commit/restore that makes it clean). Each non-safe
+  // baseline path must still hash to its campaign-start sha. Fail closed: a path without a recorded
+  // sha never matches; a path still dirty without a current sha never matches; a path that is no
+  // longer dirty reads "clean", which never matches a recorded sha.
+  const baseSha = mainContentMap(mainBaselineContent);
+  const nowSha = mainContentMap(currentContent);
+  const dirtyNow = new Set([].concat.apply([], current.map(mainStatusPaths)));
+  const changed = [];
+  for (const l of mainBaseline || []) {
+    for (const p of mainStatusPaths(l)) {
+      if (mainSafePath(p)) continue;
+      if (!baseSha.has(p)) { changed.push(p + " (no content evidence recorded at campaign start)"); continue; }
+      const now = dirtyNow.has(p) ? (nowSha.has(p) ? nowSha.get(p) : "?") : "clean";
+      if (now !== baseSha.get(p)) changed.push(p + " (content changed since campaign start)");
+    }
+  }
+  return lines.concat(changed);
+}
+function mainStatusBrief() {
+  return [
+    "You are a MECHANICAL PROBE - NOT a reviewer, NOT an implementer. Report the state of the MAIN working copy: the repository root this campaign runs in (first `worktree` line of `git worktree list --porcelain`), NOT any task worktree.",
+    "Run exactly: `git status --porcelain --untracked-files=all </dev/null` from the MAIN working copy (piped stdin). Do NOT modify anything: no add, commit, checkout, reset, stash, no file creation or removal.",
+    "Schema key lines: one string per output line, VERBATIM (keep the status characters and the path exactly as printed); [] when the output is empty.",
+    "Schema key content: for EVERY path named in lines (a rename `R  old -> new` names both paths; drop the surrounding quotes porcelain adds), one string `<sha> <path>`: sha = the output of `git hash-object -- <path> </dev/null` run from the MAIN working copy (read-only: NO -w) when the path is an existing file, or `-` when the path does not exist; path verbatim. [] when lines is empty.",
+    FINAL_MSG,
+    "Schema keys: lines, content."
+  ].join("\n");
+}
+
 // --- helpers ------------------------------------------------------------------
 function childOpts(extra, role) {
   const o = Object.assign({ agent: "worker", context: "fresh" }, extra || {});
@@ -727,6 +807,11 @@ const GIT_RULES = "Git rules: work on YOUR feature branch only; never push; neve
 // scripts (bd-cursor ys9, debug-tracker.mjs) because they read BRIEFS, not AGENTS.md.
 // Shared by the work/rework/repair briefs below.
 const NO_SCRATCH_DEBUG = "NO SCRATCH DEBUG SCRIPTS: find answers with EXISTING commands (`bd list --json`, `bd show`, `node --test <file>` with a timeout, ready-made repo analyzers); self-written helper scripts (debug-*.mjs, temp-file+node:fs scripting) are FORBIDDEN without explicit justification in your final report.\n";
+
+// ISSUE-5: the worker's edit/write tools resolve RELATIVE paths against the main working copy.
+function absPathRule(wt) {
+  return "ABSOLUTE PATH RULE (mandatory): the MAIN working copy is NOT yours. Your worktree \"" + wt + "\" is a path RELATIVE to the main working copy: resolve it to an ABSOLUTE path (`git -C \"" + wt + "\" rev-parse --show-toplevel`) and use that absolute prefix in EVERY edit/write tool call (e.g. <absolute worktree>/src/a.txt). A RELATIVE edit/write path resolves to the MAIN working copy and corrupts the integration branch - FORBIDDEN. After cd-ing into the worktree, verify with `pwd` that you are inside it.";
+}
 
 // --- schemas ---------------------------------------------------------------------
 const DISC_SCHEMA = {
@@ -1084,6 +1169,7 @@ function salvageReport(ctx, fromLabel) {
     "You are the REPORT-REPAIR worker. A previous worker EXECUTED the task on branch " + slug + " but its structured report failed validation ('schema-missing'). Your ONLY job: reconstruct the COMPLETE structured report (the acceptance report) from the ACTUAL repository state.",
     "HARD RULES: do NOT implement anything new; do NOT create branches, worktrees or commits; do NOT reset or delete anything. Read-only investigation plus ONE report.",
     parallel ? "The task worktree is \"" + wt + "\" (branch " + slug + " checked out there) - inspect THERE." : "",
+    absPathRule(wt),
     "1) `git log --oneline main.." + slug + "` and `git diff main..." + slug + "` - what landed vs the task.",
     "2) Task intent: " + t.title + " | Acceptance criteria: " + (t.acceptance || ""),
     "3) Run the verification command YOURSELF: " + (testCommandQuick ? testCommandQuick + " (quick gate; the FULL suite runs at merge)" : testCommand),
@@ -1093,7 +1179,7 @@ function salvageReport(ctx, fromLabel) {
     "Reconstruct the acceptance fields from REAL state: testsAddedOrUpdated from test files in the diff ('<file>: <N> cases', [] when none); commandsRun from YOUR OWN gate run (result is exactly passed|failed|not-run); validationOutput = decisive gate output lines; residualRisks = [] when none; noStagedFiles from `git status --short` in your tree; criteriaSatisfied = exactly criterion-1 (scope) and criterion-2 (evidence), judged against the diff and the task's acceptance criteria.",
     "Schema keys: what_done, files_changed, verification, branch, worktree, head, completed, testsAddedOrUpdated, commandsRun, validationOutput, residualRisks, noStagedFiles, criteriaSatisfied."
   ].filter(Boolean).join("\n");
-  return runChild(taskKey(t, "report-repair"), withGate(Object.assign({ task: repairLines, outputSchema: WORK_SCHEMA }, rec.wm ? { model: rec.wm } : {}), useLedger)).then(
+  return runChild(taskKey(t, "report-repair"), withGate(Object.assign({ task: repairLines, outputSchema: WORK_SCHEMA, cwd: wt }, rec.wm ? { model: rec.wm } : {}), useLedger)).then(
     function (r) {
       const o = outOf(r);
       rec.iterations++;
@@ -1143,6 +1229,7 @@ function workPhase(t, rec, parallel) {
       " (3) if package.json exists: run `npm ci --prefer-offline` ONLY when node_modules is missing or the lockfile is newer than node_modules - reuse the existing install otherwise (bootstrap by lockfile, not per task); `npm install` only as a last-resort fallback;" +
       " (4) never touch the main working copy and never switch branches there;" +
       " (5) report the ABSOLUTE worktree path in the worktree field of your result.",,
+    absPathRule(wt),
     "Verification command (must pass before you finish): " + (relayMode && testCommandQuick ? testCommandQuick + " (quick gate; the FULL suite runs again at merge)" : testCommand),
     "",
     "Global constraints (repeated for direct workers): " + constraints,
@@ -1214,6 +1301,7 @@ function ledgerRepair(t, rec, parallel, arbiterNote) {
     "ARBITER CONTEXT: " + String(arbiterNote || "rework exhausted").slice(0, 400),
     "",
     "Your worktree is \"" + wt + "\" (branch " + slug + " is checked out there). cd into it first; verify `git status` is clean; never touch the main working copy.",,
+    absPathRule(wt),
     "",
     "RELAY PROTOCOL (mandatory):",
     MAIN_BRANCH_NOTE,
@@ -1228,7 +1316,7 @@ function ledgerRepair(t, rec, parallel, arbiterNote) {
     "", GIT_RULES, CMDS, NO_SCRATCH_DEBUG, FACTS, ACC_STRUCTURED,
     "If you need a decision beyond your scope, ask the calling side via contact_supervisor instead of guessing."
   ].join("\n");
-  return runChild(taskKey(t, "repair"), withGate(Object.assign({ task: lines, outputSchema: WORK_SCHEMA }, rec.wm ? { model: rec.wm } : {}), true)).then(
+  return runChild(taskKey(t, "repair"), withGate(Object.assign({ task: lines, outputSchema: WORK_SCHEMA, cwd: wt }, rec.wm ? { model: rec.wm } : {}), true)).then(
     function (w) {
       const o = outOf(w);
       rec.iterations++;
@@ -1260,6 +1348,29 @@ function postPhase(t, rec, wOut, parallel) {
   }
   const wt = rec.worktree || wtPathFor(t, rec);
   const wtNote = "Worktree for this task: \"" + wt + "\" (cd there first; all edits, tests and commits happen inside it). ";
+  function mainGuard() {
+    // ISSUE-5 pre-merge check: the main copy must hold no change outside the baseline and the
+    // safe-list. An incident refuses THIS merge (verdict main-mutated); nothing is reverted here.
+    return runChild(taskKey(t, "maincheck"), childOpts({ task: mainStatusBrief(), outputSchema: MAIN_STATUS_SCHEMA, acceptance: false })).then(
+      function (mc) {
+        const mo = outOf(mc);
+        const bad = mainIncidentLines(mainStatusOf(mo), mainContentOf(mo));
+        if (!bad.length) return true;
+        rec.verdict = "main-mutated";
+        rec.stop = "main-copy incident: " + bad.slice(0, 5).join(" | ");
+        mainIncidents.push({ sprint: sprint, task: (t._idx || 0) + 1, title: t.title, branch: slug, lines: bad.slice(0, 20) });
+        log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": MAIN-COPY INCIDENT - the main working copy changed outside the baseline (" + bad.slice(0, 5).join(" | ") + "); merge refused, NOTHING reverted (branch " + slug + " is not merged; main is left for the operator)");
+        cpWrite({ mainIncidents: mainIncidents.slice() }); // best-effort persist: the incident survives a resume
+        return false;
+      },
+      function (e) {
+        rec.verdict = "merge-failed";
+        rec.stop = "main-check: child failed";
+        log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": main-copy check failed (" + String(e).slice(0, 120) + ") - merge refused");
+        return false;
+      }
+    );
+  }
   function doMerge() {
     // CODE GATE (not prompt-only): integration is refused without HEAD evidence.
     // Review still runs (it may route the task into rework); only the MERGE requires
@@ -1270,6 +1381,9 @@ function postPhase(t, rec, wOut, parallel) {
       log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": no HEAD SHA reported by any work/rework/repair round - integration refused (branch " + slug + " left for manual review)");
       return Promise.resolve();
     }
+    return mainGuard().then(function (clear) { return clear ? doMergeChild() : undefined; });
+  }
+  function doMergeChild() {
     const closedAtStart = doneSet().has(String(t.id || ""));
     const cliArgs = ["node", "workflows/merge-branch.mjs", "--main-dir", JSON.stringify("."), ...(mainBranch ? ["--main-branch", JSON.stringify(mainBranch)] : []), "--worktree", JSON.stringify(wt), "--branch", JSON.stringify(slug), "--approved-sha", JSON.stringify(rec.head), "--test-command", JSON.stringify(testCommand), "--journal-file", JSON.stringify(journalDir + "/sprint-" + sprint + ".jsonl"), "--task-title", JSON.stringify(t.title), ...(sddActive && t.sdd_item ? ["--sdd-file", JSON.stringify(sddTasksFile), "--sdd-item", JSON.stringify(String(t.sdd_item))] : []), ...(bdEpic && t.id && !closedAtStart ? ["--bd-leaf", JSON.stringify(t.id)] : [])].join(" ");
     // NO-CODE ANALYSIS merge: nothing lands on the integration branch, so the merge CLI (which
@@ -1544,6 +1658,7 @@ function postPhase(t, rec, wOut, parallel) {
     ]).concat([
       "Branch: " + slug + " (continue on it; do NOT create a new branch).",
       parallel ? wtNote : "",
+      absPathRule(wt),
       (fixOnly ? "Reviewer verdict reasons (context only): " : "Reviewer rework reasons to address: ") + notes,
       "Verification command: " + testCommand,
       "", "Global constraints: " + constraints, GIT_RULES, CMDS, NO_SCRATCH_DEBUG,
@@ -1554,7 +1669,7 @@ function postPhase(t, rec, wOut, parallel) {
       "Report format: what_done, files_changed, verification, branch, worktree, head (40-hex SHA), completed, testsAddedOrUpdated, commandsRun, validationOutput, residualRisks, noStagedFiles, criteriaSatisfied.",
       selfCheckLine("rework", wt, slug)
     ]).filter(Boolean).join("\n");
-    const rwSpec = { task: rwLines, outputSchema: WORK_SCHEMA };
+    const rwSpec = { task: rwLines, outputSchema: WORK_SCHEMA, cwd: wt };
     if (engineOf(t) === "sdd") rwSpec.agent = "sdd-worker"; // engineOf here: sddEngine lives in workPhase scope, not reviewRound — old code would ReferenceError at first rework
     if (rec.wm) rwSpec.model = rec.wm; // SAME worker continues the work - rework pins the task's model, rotation picks the next task
     return runChild(taskKey(t, "rework" + (r + 1)), withGate(rwSpec, useLedger)).then(
@@ -1645,6 +1760,25 @@ function bucketWaves(taskArr) {
 // --- campaign-level state (declared BEFORE phase 0: the SDD catch writes stopReason)
 let continueCampaign = true;
 let stopReason = "";
+
+// --- main-copy baseline (ISSUE-5): ONE probe before any engine child can write into main ---
+// Skipped on resume when the checkpoint already carries the baseline (the comparison must keep
+// the campaign's ORIGINAL starting state). A failed probe records an empty baseline: every change
+// outside the safe-list then counts as an incident - visible, never a silent pass.
+if (!mainBaseline) {
+  try {
+    const mb = await runChild("main-baseline", childOpts({ task: mainStatusBrief(), outputSchema: MAIN_STATUS_SCHEMA, acceptance: false }));
+    const bo = outOf(mb);
+    mainBaseline = mainStatusOf(bo);
+    mainBaselineContent = mainContentOf(bo);
+    log.push("main-copy baseline: " + mainBaseline.length + " pre-existing change(s) recorded (not incidents)");
+  } catch (e) {
+    mainBaseline = [];
+    mainBaselineContent = [];
+    log.push("main-copy baseline failed (" + String(e).slice(0, 120) + ") - every change outside the safe-list counts as a main-copy incident");
+  }
+  await cpWrite({ mainBaseline: mainBaseline, mainBaselineContent: mainBaselineContent });
+}
 
 // --- phase 0: SDD task-engine (campaign-level; runs once) --------------------------
 // Artifacts first, code never: an sdd-worker child classifies the campaign and,
@@ -2107,7 +2241,7 @@ const mergedCount = taskResults.filter(function (r) { return r.verdict === "merg
 // Verdict-class counters, NOT a strict partition: "drop-failed" lands in both
 // dropped and failed; "unknown"/"no-head-reported" land in neither.
 const droppedCount = taskResults.filter(function (r) { return r.verdict === "dropped" || r.verdict === "drop-failed"; }).length;
-const failedCount = taskResults.filter(function (r) { return ["failed", "arbiter-failed", "merge-failed", "drop-failed"].indexOf(r.verdict) !== -1; }).length;
+const failedCount = taskResults.filter(function (r) { return ["failed", "arbiter-failed", "merge-failed", "drop-failed", "main-mutated"].indexOf(r.verdict) !== -1; }).length;
 let STATUS;
 if (stopReason === "approval-required" || stopReason === "sdd-setup-failed") STATUS = "blocked";
 else if (/^bd-epic-stalled/.test(stopReason)) STATUS = "blocked";
@@ -2143,6 +2277,7 @@ return {
   retries: retriesTotal,
   tasks: taskResults,
   analytics: analytics,
+  mainIncidents: mainIncidents,
   log: log
 };
 

@@ -1299,7 +1299,7 @@ T("toy-falcon sprint-1 start: args.bdTasks snapshot -> first child is work (NO i
   }), routes, makeState());
   assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
   // the campaign-start report-schema writer (R1) precedes every sprint; it is not a sprint child
-  const starts = out.events.filter((e) => e.t === "start" && !/^report-schema/.test(e.key)).map((e) => e.key);
+  const starts = out.events.filter((e) => e.t === "start" && !/^report-schema/.test(e.key) && !K.mainStatus.test(e.key)).map((e) => e.key);
   assert.ok(/^s1-t1-work$/.test(starts[0]), "with args.bdTasks the first launched child of sprint 1 is work: " + JSON.stringify(starts));
   assert.equal(starts.filter((k) => /^s1-boundary/.test(k)).length, 0, "no initial boundary/cursor child at sprint 1 on an args snapshot");
   assert.equal(routes.count(/^s2-boundary$/), 1, "sprint 2 boundary logic unchanged (janitor + refresh after a merge)");
@@ -1315,7 +1315,7 @@ T("toy-falcon sprint-1 start: args.bdTasks snapshot -> first child is work (NO i
     sprintTasks: 2, maxSprints: 1, bdTasks: [],
   }), routes2, makeState());
   assert.ok(!out2.err, "workflow threw: " + (out2.err && out2.err.message));
-  const starts2 = out2.events.filter((e) => e.t === "start" && !/^report-schema/.test(e.key)).map((e) => e.key);
+  const starts2 = out2.events.filter((e) => e.t === "start" && !/^report-schema/.test(e.key) && !K.mainStatus.test(e.key)).map((e) => e.key);
   assert.ok(/^s1-boundary/.test(starts2[0]), "without a snapshot the initial boundary child starts sprint 1: " + JSON.stringify(starts2));
 });
 
@@ -3240,8 +3240,10 @@ T("wide wave unawaited-launch contract: 2 bd-epic leaves, one sprint, no deps - 
   assert.equal(res.stopReason, "epic-closed", "normal stop resonance, not a tracker failure: " + res.stopReason);
   assert.equal(res.status, "completed");
   assert.ok(res.tasks.every((r) => r.verdict === "merged"), "both leaves merged: " + res.tasks.map((r) => r.verdict).join(", "));
-  const starts = out.events.filter((e) => e.t === "start").map((e) => e.key);
+  const allStarts = out.events.filter((e) => e.t === "start").map((e) => e.key);
+  const starts = allStarts.filter((k) => !K.mainStatus.test(k));
   assert.equal(starts.length, 10, "wave-4 child shape (report-schema writer + 2 work + 2 review + 2 merge + boundary + epic-close + analytics): " + starts.join(", "));
+  assert.equal(allStarts.filter((k) => K.mainStatus.test(k)).length, 3, "ISSUE-5 main-copy probes: 1 baseline + 1 pre-merge check per merge: " + allStarts.join(", "));
   assert.ok(starts.includes("epic-close"), "engine explicitly closes completed bd epic");
   // Criterion (2): the analytics archiver is the LAST child - the retro write happens
   // only after every merge child completed, and its result is carried to the return.
@@ -3541,4 +3543,160 @@ T("mergeBranch bd spawn error is best-effort after committed merge", async () =>
     assert.equal(git(main, "rev-list", "--count", "main~1..main"), "1", "squash commit remains on main");
     assert.equal(git(main, "status", "--porcelain"), "");
   } finally { process.env.PATH = oldPath; fsSync.rmSync(root, { recursive: true, force: true }); }
+});
+
+// --- ISSUE-5: main-copy isolation (the main working copy is never written by a worker) ------
+// The probe answers per key: the campaign baseline sees the starting state, the pre-merge
+// probe sees whatever a worker left in main. Nothing here reverts main - it is observed only.
+// Content evidence ("<sha> <path>") rides along: a test that alters a dirty file keeps its porcelain line.
+function mainProbe(baseline, premerge, baseContent = [], preContent = []) {
+  return { match: K.mainStatus, handle: async (spec, key) => {
+    const b = /baseline/.test(key);
+    return { ok: true, structuredOutput: { lines: b ? baseline : premerge, content: b ? baseContent : preContent } };
+  } };
+}
+
+T("main-copy isolation: a change in main between baseline and merge blocks the merge, is reported, and is NOT reverted", async () => {
+  const runs = makeRuns([
+    ...happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }),
+    mainProbe([], [" M src/a.txt", "?? stray.txt"]),
+  ]);
+  const st = makeState();
+  const out = await runCampaign(baseArgs(), runs, st);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const { res } = out;
+  assert.equal(res.tasks[0].verdict, "main-mutated", "the task is refused as a main-copy incident");
+  assert.equal(runs.count(K.merge), 0, "the merge child never launches over a mutated main");
+  assert.equal(res.counts.merged, 0);
+  assert.equal(res.counts.failed, 1, "the incident counts as a failed verdict");
+  assert.equal(res.mainIncidents.length, 1, "incident reported in the return");
+  assert.deepEqual(res.mainIncidents[0].lines, [" M src/a.txt", "?? stray.txt"], "the offending lines are named");
+  assert.ok(res.log.some((l) => /MAIN-COPY INCIDENT/.test(l) && /NOTHING reverted/.test(l)), "incident logged: " + JSON.stringify(res.log));
+  assert.equal(runs.keys().filter((k) => /revert|rollback|restore/.test(k)).length, 0, "no rollback child: the evidence stays in main");
+  assert.equal(st.store.get("agile-cp").mainIncidents.length, 1, "incident persisted in the checkpoint");
+  assert.equal(res.status, "failed");
+});
+
+const SHA_A = "a".repeat(40), SHA_B = "b".repeat(40), SHA_C = "c".repeat(40), SHA_D = "d".repeat(40);
+
+T("main-copy isolation: a PRE-EXISTING dirty tracked file overwritten during the campaign (porcelain line unchanged) blocks the merge and is NOT reverted", async () => {
+  const runs = makeRuns([
+    ...happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }),
+    mainProbe([" M src/a.txt"], [" M src/a.txt"], [SHA_A + " src/a.txt"], [SHA_B + " src/a.txt"]),
+  ]);
+  const st = makeState();
+  const out = await runCampaign(baseArgs(), runs, st);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const { res } = out;
+  assert.equal(res.tasks[0].verdict, "main-mutated", "same porcelain line, different bytes: a main-copy incident");
+  assert.equal(runs.count(K.merge), 0, "the merge child never launches over an altered main");
+  assert.deepEqual(res.mainIncidents[0].lines, ["src/a.txt (content changed since campaign start)"], "the altered path is named");
+  assert.equal(runs.keys().filter((k) => /revert|rollback|restore/.test(k)).length, 0, "no rollback child: the evidence stays in main");
+  assert.deepEqual(st.store.get("agile-cp").mainBaselineContent, [SHA_A + " src/a.txt"], "the campaign-start evidence is not overwritten by the pre-merge probe");
+  assert.equal(res.status, "failed");
+});
+
+T("main-copy isolation: a PRE-EXISTING untracked file rewritten during the campaign (porcelain line unchanged) blocks the merge", async () => {
+  const runs = makeRuns([
+    ...happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }),
+    mainProbe(["?? notes/new.txt"], ["?? notes/new.txt"], [SHA_C + " notes/new.txt"], [SHA_D + " notes/new.txt"]),
+  ]);
+  const out = await runCampaign(baseArgs(), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const { res } = out;
+  assert.equal(res.tasks[0].verdict, "main-mutated", "a rewritten untracked dirty file is an incident");
+  assert.equal(runs.count(K.merge), 0);
+  assert.deepEqual(res.mainIncidents[0].lines, ["notes/new.txt (content changed since campaign start)"]);
+});
+
+T("main-copy isolation: pre-existing baseline dirt and engine-owned safe-list paths are NOT incidents; the baseline is recorded", async () => {
+  const baseline = [" M notes.txt", "?? nul", " M .beads/issues.jsonl"];
+  const baseContent = [SHA_A + " notes.txt", SHA_B + " nul", SHA_C + " .beads/issues.jsonl"];
+  // safe-listed .beads changed bytes (bd export) and new engine files: still NOT incidents; the unchanged dirt keeps its sha
+  const premerge = baseline.concat(["?? .agile-js-test/sprint-1.jsonl", "?? .ai/sdd/specs/x/tasks.md", "?? ledger-ag-task-1/"]);
+  const preContent = [SHA_A + " notes.txt", SHA_B + " nul", SHA_D + " .beads/issues.jsonl"];
+  const runs = makeRuns([
+    ...happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }),
+    mainProbe(baseline, premerge, baseContent, preContent),
+  ]);
+  const st = makeState();
+  const out = await runCampaign(baseArgs(), runs, st);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const { res } = out;
+  assert.equal(res.tasks[0].verdict, "merged", "unchanged dirt and safe-listed writes do not block the merge");
+  assert.equal(runs.count(K.merge), 1);
+  assert.deepEqual(res.mainIncidents, [], "no incident");
+  assert.deepEqual(st.store.get("agile-cp").mainBaseline, baseline, "baseline persisted in the checkpoint");
+  assert.deepEqual(st.store.get("agile-cp").mainBaselineContent, baseContent, "content evidence persisted in the checkpoint");
+  const probeBrief = runs.spec(/^main-baseline/).spec.task;
+  assert.ok(/--untracked-files=all/.test(probeBrief) && /git hash-object -- <path>/.test(probeBrief), "probe brief asks for per-path content evidence (untracked files expanded)");
+  assert.ok(res.log.some((l) => /main-copy baseline: 3 pre-existing change/.test(l)), "baseline logged: " + JSON.stringify(res.log));
+});
+
+T("main-copy isolation: resume keeps the campaign baseline (no re-probe) and still catches a NEW mutation only", async () => {
+  const st = makeState({ "agile-cp": { phase: "running", generation: 2, mainBaseline: [" M legacy.txt"], mainBaselineContent: [SHA_A + " legacy.txt"] } });
+  const runs = makeRuns([
+    ...happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }),
+    mainProbe([], [" M legacy.txt", " M src/a.txt"], [], [SHA_A + " legacy.txt", SHA_B + " src/a.txt"]),
+  ]);
+  const out = await runCampaign(baseArgs(), runs, st);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const { res } = out;
+  assert.equal(runs.count(/^main-baseline/), 0, "resume does not re-take the baseline");
+  assert.equal(res.tasks[0].verdict, "main-mutated");
+  assert.deepEqual(res.mainIncidents[0].lines, [" M src/a.txt"], "only the NEW change is an incident; the pre-campaign legacy dirt is not");
+  assert.deepEqual(st.store.get("agile-cp").mainBaseline, [" M legacy.txt"], "the original baseline survives the resume");
+  assert.deepEqual(st.store.get("agile-cp").mainBaselineContent, [SHA_A + " legacy.txt"], "the original content evidence survives the resume");
+});
+
+T("main-copy isolation: a resumed checkpoint WITHOUT content evidence fails closed on its dirty baseline paths", async () => {
+  const st = makeState({ "agile-cp": { phase: "running", generation: 2, mainBaseline: [" M legacy.txt"] } });
+  const runs = makeRuns([
+    ...happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }),
+    mainProbe([], [" M legacy.txt"], [], [SHA_A + " legacy.txt"]),
+  ]);
+  const out = await runCampaign(baseArgs(), runs, st);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(out.res.tasks[0].verdict, "main-mutated", "no recorded sha for a dirty baseline path: refused, never a silent pass");
+  assert.deepEqual(out.res.mainIncidents[0].lines, ["legacy.txt (no content evidence recorded at campaign start)"]);
+});
+
+T("main-copy isolation: a NEW .beads/ path other than issues.jsonl is NOT engine-owned: it is an incident, the merge is refused, nothing is reverted", async () => {
+  const runs = makeRuns([
+    ...happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }),
+    mainProbe([], [" M .beads/config.yaml", "?? .beads/notes.txt"]),
+  ]);
+  const st = makeState();
+  const out = await runCampaign(baseArgs(), runs, st);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const { res } = out;
+  assert.equal(res.tasks[0].verdict, "main-mutated", "a .beads/ path other than .beads/issues.jsonl is a main-copy incident");
+  assert.equal(runs.count(K.merge), 0, "the merge child never launches over the mutated main");
+  assert.deepEqual(res.mainIncidents[0].lines, [" M .beads/config.yaml", "?? .beads/notes.txt"], "the offending .beads/ paths are named");
+  assert.ok(res.log.some((l) => /MAIN-COPY INCIDENT/.test(l) && /\.beads\/config\.yaml/.test(l)), "incident logged naming the path: " + JSON.stringify(res.log));
+  assert.equal(runs.keys().filter((k) => /revert|rollback|restore/.test(k)).length, 0, "no rollback child: the evidence stays in main");
+  assert.equal(res.status, "failed");
+});
+
+T("main-copy isolation: rework and report-repair specs carry the worktree cwd; work-class briefs carry the absolute-path rule", async () => {
+  const wt = "D:/arena/wt-t1-task-1";
+  let reviewCalls = 0;
+  const runs = makeRuns([
+    ...happyRoutes({
+      curator: ok(curatorOut(true, [task(1)])),
+      work: ok(workOut({ worktree: wt })),
+      review: async () => { reviewCalls++; return ok(reviewOk(reviewCalls >= 2))(); },
+      rework: ok(workOut({ worktree: wt, residualRisks: "none" })), // schema-missing -> report-repair salvage
+      reportRepair: ok(workOut({ worktree: wt, head: "5555555555555555555555555555555555555555", what_done: "recovered" })),
+    }),
+  ]);
+  const out = await runCampaign(baseArgs({ reworkLimit: 2 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(runs.spec(K.rework).spec.cwd, wt, "rework child is launched inside its worktree");
+  assert.equal(runs.spec(K.reportRepair).spec.cwd, wt, "report-repair child is launched inside its worktree");
+  assert.equal(runs.spec(K.work).spec.cwd, undefined, "the first work child creates the worktree - no cwd before it exists");
+  for (const k of [K.work, K.rework, K.reportRepair]) {
+    assert.ok(runs.spec(k).spec.task.includes("ABSOLUTE PATH RULE"), "absolute-path rule in the brief of " + k);
+    assert.ok(runs.spec(k).spec.task.includes(wt) || k === K.work, "brief names the worktree for " + k);
+  }
 });
