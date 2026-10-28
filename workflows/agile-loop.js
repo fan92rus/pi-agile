@@ -1029,12 +1029,13 @@ function boundaryBrief(entries, refresh, closables) {
       return "  bd show " + e.id + " --json </dev/null | grep -q '\"status\": *\"closed\"' || bd close " + e.id + " -r \"" + e.id + ": merge " + (e.commit || "no-commit") + " - " + e.verdict + "\" </dev/null";
     }),
     "The -r string is the MECHANICAL close comment: leaf id, merge commit, short verdict - exactly this form, no prose.",
-    "Then flush the JSONL export and commit it to the integration tree (the merge pre-flight requires a clean porcelain; this is the ONLY commit this child ever makes; NEVER `git add -A`, only this one file). NO `|| true` - a failed git command must SURFACE, never be swallowed:",
+    "Before exporting, inspect the actual git path state from the MAIN working copy: run `git check-ignore -q .beads/issues.jsonl` and `git ls-files --error-unmatch .beads/issues.jsonl`. If check-ignore succeeds OR ls-files fails, this is stealth-bd (ignored or untracked): do NOT run bd export, git add, or git commit for .beads; report note='export=stealth' and consider each close successful only when bd confirms the id closed. Otherwise the file is tracked and not ignored: run the export commit below as before.",
+    "Tracked export path only: flush the JSONL export and commit it to the integration tree (the merge pre-flight requires a clean porcelain; this is the ONLY commit this child ever makes; NEVER `git add -A`, only this one file). NO `|| true` - a failed git command must SURFACE, never be swallowed:",
     "  bd export </dev/null",
     "  git add .beads/issues.jsonl && git commit -m \"chore(bd): auto-close done leaves (" + closables.map(function (e) { return e.id; }).join(",") + ")\"",
-    "Then VERIFY: `git status --porcelain -- .beads/issues.jsonl` must print NOTHING - only a CLEAN path proves the commit landed. If the path is STILL dirty (the add/commit/export failed: locked index, missing user identity, hook rejection), do NOT retry blindly and do NOT reset: report the failure EXPLICITLY - every closed[] entry of this run gets closed=false with note='export commit failed: .beads/issues.jsonl still dirty' (the close itself is idempotent in bd and is retried later; the failure must be visible, never silent).",
+    "On the tracked path VERIFY: `git status --porcelain -- .beads/issues.jsonl` must print NOTHING - only a CLEAN path proves the commit landed. If the path is STILL dirty (the add/commit/export failed: locked index, missing user identity, hook rejection), do NOT retry blindly and do NOT reset: report the failure EXPLICITLY - every closed[] entry of this run gets closed=false with note='export commit failed: .beads/issues.jsonl still dirty'.",
     "NEVER close an id NOT listed here; do NOT create or modify any other bd issue.",
-    "Report each listed leaf: closed=true ONLY when the leaf is closed in bd (you closed it, or the pre-check found it closed already) AND the export commit landed clean; false otherwise, with the reason in note."
+    "Report each listed leaf: closed=true ONLY when the leaf is closed in bd and (tracked export commit landed clean OR note identifies export=stealth); false otherwise, with the reason in note."
   ] : [];
   const snapshot = refresh ? [
     "PART 3 - BD SNAPSHOT (read-only). Report EVERY leaf of bd epic " + JSON.stringify(bdEpic) + " (children with no children of their own).",
@@ -2006,6 +2007,24 @@ if (taskSource === "bd-epic") {
     } catch (e) {
       log.push("post-loop: bd-close child failed (" + String(e).slice(0, 120) + "); " + finalClosables.length + " done leaf(s) stay open in bd");
     }
+  }
+}
+// A fully completed bd epic must be closed explicitly after its leaves. Keep this
+// mechanical action in the engine so headless runs do not depend on an outer driver.
+if (taskSource === "bd-epic" && doneWhen === "bd-epic-closed" && stopReason === "epic-closed" && bdEpic) {
+  const epicCloseTask = [
+    "You perform only the final bd epic-close bookkeeping for " + JSON.stringify(bdEpic) + ".",
+    "From the MAIN working copy, verify the epic is not already closed (`bd show " + bdEpic + " --json </dev/null`). If open, run `bd close " + bdEpic + " -r \"all done leaves merged\" </dev/null` and verify with bd show. Do not close any leaf or other issue.",
+    "Inspect git state for .beads/issues.jsonl using `git check-ignore -q .beads/issues.jsonl` and `git ls-files --error-unmatch .beads/issues.jsonl`. If ignored or untracked, do not export/add/commit. If tracked and not ignored, run bd export then git add only .beads/issues.jsonl and commit the export. Report closed=true only if bd confirms the epic closed and tracked export is clean when applicable; otherwise false.",
+    FINAL_MSG,
+    "Schema keys: cleaned, closed[{id, closed, note}], leaves."
+  ].join("\n");
+  try {
+    const ec = await runChild("epic-close", childOpts({ task: epicCloseTask, outputSchema: BOUNDARY_SCHEMA, acceptance: false }));
+    const ecClosed = (outOf(ec).closed || []).some(function (c) { return c && String(c.id) === bdEpic && c.closed === true; });
+    log.push("post-loop: bd epic-close " + (ecClosed ? "confirmed " : "not confirmed ") + bdEpic);
+  } catch (e) {
+    log.push("post-loop: bd epic-close failed (" + String(e).slice(0, 120) + ")");
   }
 }
 // Final cleanup (ALL modes): no leftover worktrees/branches of never-merged work.

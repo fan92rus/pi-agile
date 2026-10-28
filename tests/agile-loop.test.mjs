@@ -1635,6 +1635,7 @@ T("toy-falcon bd-close: the MERGER closes the merged leaf in bd (close steps in 
         boundaries++;
         return ok({ cleaned: [], leaves: [falconLeaf("fal-a", { open: false })] })();
       } },
+    { match: /^epic-close$/, handle: ok({ cleaned: [], closed: [{ id: "t-fal.1", closed: true }], leaves: [] }) },
   ]);
   const out = await runCampaign(baseArgs({
     taskSource: "bd-epic", bdEpic: "t-fal.1", doneWhen: "bd-epic-closed",
@@ -1652,11 +1653,17 @@ T("toy-falcon bd-close: the MERGER closes the merged leaf in bd (close steps in 
   assert.ok(/--bd-leaf/.test(mg.spec.task), "CLI handles bd export and close lifecycle");
   assert.ok(/bd_closed/.test(mg.spec.task), "the merger reports bd_closed for exactly-once bookkeeping");
   assert.ok(/--bd-leaf/.test(mg.spec.task), "CLI processes optional bd close best-effort");
+  const mergerSource = fsSync.readFileSync(new URL("../workflows/merge-branch.mjs", import.meta.url), "utf8");
+  assert.ok(/check-ignore/.test(mergerSource) && /ls-files.*error-unmatch/.test(mergerSource), "CLI detects ignored and untracked stealth-bd state");
   assert.ok(out.res.log.some((l) => /merge bd-close closed fal-a/.test(l)), "the close is recorded in the campaign log: " + JSON.stringify(out.res.log.filter((l) => /bd-close/.test(l))));
   const bnd = routes.spec(/^s2-boundary$/);
   assert.ok(bnd, "sprint-2 boundary still launches (snapshot refresh after a merge)");
   assert.ok(!/bd close /.test(bnd.spec.task), "boundary spec contains NO bd-close");
   assert.ok(!/PART 2 - BD CLOSE/.test(bnd.spec.task), "boundary brief has no BD CLOSE section");
+  assert.ok(out.res.log.some((l) => /bd epic-close confirmed t-fal\.1/.test(l)), "engine confirms epic closure after leaf closure");
+  const epicClose = routes.spec(/^epic-close$/);
+  assert.ok(epicClose && /bd close t-fal\.1/.test(epicClose.spec.task), "epic-closed scenario invokes bd close for the epic");
+  assert.ok(/check-ignore/.test(epicClose.spec.task) && /ls-files --error-unmatch/.test(epicClose.spec.task), "epic export follows actual stealth-bd state");
   assert.equal(routes.count(K.finalClose), 0, "exactly-once: the merger's confirmed close means NO post-loop re-close");
   assert.equal(boundaries, 1, "exactly one boundary child: the sprint-2 refresh fires epic-closed, nothing else launches");
 });
@@ -1757,6 +1764,7 @@ T("toy-falcon bd-close post-loop: the last sprint's merge is closed before retur
   assert.ok(fin, "post-loop bd-close child launched: " + JSON.stringify(routes.keys()));
   assert.ok(/bd close fal-a -r /.test(fin.spec.task) && /merged/.test(fin.spec.task), "the last sprint's merged leaf is in the close list");
   assert.ok(/PART 2 - BD CLOSE/.test(fin.spec.task), "the post-loop child is the mechanical bd-close section");
+  assert.ok(/check-ignore/.test(fin.spec.task) && /export=stealth/.test(fin.spec.task), "PART 2 carries the stealth-bd guard: probe check-ignore/ls-files BEFORE export, skip add/commit when ignored or untracked");
   assert.ok(!/bd list --parent/.test(fin.spec.task), "post-loop close carries NO snapshot refresh");
   assert.ok(out.res.log.some((l) => /post-loop: bd-close closed 1\/1/.test(l)), "post-loop close logged: " + JSON.stringify(out.res.log));
   const lastRun = routes.events.filter((e) => e.t === "ok").pop();
@@ -3160,6 +3168,7 @@ T("wide wave unawaited-launch contract: 2 bd-epic leaves, one sprint, no deps - 
     { match: K.review, handle: ok(reviewOk(true), 2) },
     { match: K.merge, handle: ok(mergeOut({ bd_closed: true })) },
     { match: K.boundary, handle: ok({ cleaned: [], leaves: [falconLeaf("fal-a", { open: false }), falconLeaf("fal-b", { open: false })] }) },
+    { match: /^epic-close$/, handle: ok({ cleaned: [], closed: [{ id: "t-fal.1", closed: true }], leaves: [] }) },
   ];
   const { out, unawaited } = await runTrackedCampaign(baseArgs({
     taskSource: "bd-epic", bdEpic: "t-fal.1", doneWhen: "bd-epic-closed",
@@ -3173,7 +3182,8 @@ T("wide wave unawaited-launch contract: 2 bd-epic leaves, one sprint, no deps - 
   assert.equal(res.status, "completed");
   assert.ok(res.tasks.every((r) => r.verdict === "merged"), "both leaves merged: " + res.tasks.map((r) => r.verdict).join(", "));
   const starts = out.events.filter((e) => e.t === "start").map((e) => e.key);
-  assert.equal(starts.length, 9, "wave-4 child shape (report-schema writer + 2 work + 2 review + 2 merge + boundary + analytics): " + starts.join(", "));
+  assert.equal(starts.length, 10, "wave-4 child shape (report-schema writer + 2 work + 2 review + 2 merge + boundary + epic-close + analytics): " + starts.join(", "));
+  assert.ok(starts.includes("epic-close"), "engine explicitly closes completed bd epic");
   // Criterion (2): the analytics archiver is the LAST child - the retro write happens
   // only after every merge child completed, and its result is carried to the return.
   const analyticsAt = finishedOk(out.events, K.analytics);
@@ -3416,6 +3426,34 @@ T("mergeBranch clean fixture: deterministic CLI squashes after full test command
     assert.equal(git(main, "rev-list", "--count", "main~1..main"), "1");
     assert.equal(git(main, "status", "--porcelain"), "");
   } finally { fsSync.rmSync(root, { recursive: true, force: true }); }
+});
+
+T("mergeBranch ignored .beads is closed without an export commit", async () => {
+  if (process.platform === "win32") return; // spawnSync cannot execute a fake bd without shell on win32
+  const root = fsSync.mkdtempSync(pathMod.join(os.tmpdir(), "merge-branch-ignored-beads-"));
+  const main = pathMod.join(root, "repo"), wt = pathMod.join(root, "worker-wt"), bin = pathMod.join(root, "bin");
+  fsSync.mkdirSync(main); fsSync.mkdirSync(bin);
+  const git = (cwd, ...args) => {
+    const r = spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(r.status, 0, `git ${args.join(" ")}: ${r.stderr}`); return r.stdout.trim();
+  };
+  const oldPath = process.env.PATH;
+  try {
+    const bd = pathMod.join(bin, "bd");
+    fsSync.writeFileSync(bd, "#!/bin/sh\nexit 0\n");
+    fsSync.chmodSync(bd, 0o755);
+    process.env.PATH = `${bin}:${oldPath || ""}`;
+    git(main, "init", "-b", "main"); git(main, "config", "user.email", "test@example.com"); git(main, "config", "user.name", "Contract Test");
+    fsSync.writeFileSync(pathMod.join(main, ".gitignore"), ".beads/\n");
+    fsSync.writeFileSync(pathMod.join(main, "base.txt"), "base\n"); git(main, "add", "."); git(main, "commit", "-m", "base");
+    git(main, "switch", "-c", "worker"); fsSync.writeFileSync(pathMod.join(main, "new.txt"), "change\n"); git(main, "add", "."); git(main, "commit", "-m", "worker change");
+    const approvedSha = git(main, "rev-parse", "HEAD"); git(main, "switch", "main"); git(main, "worktree", "add", wt, "worker");
+    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "true", bdLeaf: "leaf-1" });
+    assert.equal(result.status, 0); assert.equal(result.data.merged, true);
+    assert.equal(result.data.bdClosed, true, "ignored .beads: close alone sets closed=true");
+    assert.equal(git(main, "rev-list", "--count", "main~1..main"), "1", "no chore(bd) export commit when .beads is ignored");
+    assert.equal(git(main, "status", "--porcelain"), "");
+  } finally { process.env.PATH = oldPath; fsSync.rmSync(root, { recursive: true, force: true }); }
 });
 
 T("mergeBranch bd spawn error is best-effort after committed merge", async () => {

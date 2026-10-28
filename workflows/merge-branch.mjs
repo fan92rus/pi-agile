@@ -112,12 +112,20 @@ export async function mergeBranch(options) {
       if (alreadyClosed) bdClosed = true;
       else {
         const close = run("bd", ["close", options.bdLeaf, "-r", `${options.bdLeaf}: merge ${mergeCommit} - merged`], { cwd: main });
-        if (close.status === 0 && run("bd", ["export"], { cwd: main }).status === 0) {
-          try {
-            git(main, ["add", ".beads/issues.jsonl"]);
-            git(main, ["commit", "-m", `chore(bd): auto-close done leaf (${options.bdLeaf})`]);
-            bdClosed = !git(main, ["status", "--porcelain", "--", ".beads/issues.jsonl"]).stdout.trim();
-          } catch { bdClosed = false; }
+        if (close.status === 0) {
+          // Some repos intentionally keep the bd database out of git. Determine that
+          // from the actual path state, not a project setting: ignored or untracked
+          // exports have nothing safe/useful to commit.
+          const ignored = git(main, ["check-ignore", "-q", ".beads/issues.jsonl"], false).status === 0;
+          const tracked = git(main, ["ls-files", "--error-unmatch", ".beads/issues.jsonl"], false).status === 0;
+          if (ignored || !tracked) bdClosed = true;
+          else if (run("bd", ["export"], { cwd: main }).status === 0) {
+            try {
+              git(main, ["add", ".beads/issues.jsonl"]);
+              git(main, ["commit", "-m", `chore(bd): auto-close done leaf (${options.bdLeaf})`]);
+              bdClosed = !git(main, ["status", "--porcelain", "--", ".beads/issues.jsonl"]).stdout.trim();
+            } catch { bdClosed = false; }
+          }
         }
       }
     } catch { bdClosed = false; }
