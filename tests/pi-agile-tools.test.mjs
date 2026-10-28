@@ -151,6 +151,25 @@ T("agile_run: leaf without a Файлы: line -> empty files_hint and a warning;
   assert.match(plan.warnings[0], /Файлы:/);
 });
 
+T("agile_run: rationale/acceptance over the limit -> warning with leaf id and length (no silent cut)", async () => {
+  const data = fixtureData();
+  const longDesc = "Файлы: extensions/pi-agile/launch.ts. review: lite\nAcceptance: " + "a".repeat(350);
+  data.issues.L1 = issue("L1", "open", longDesc);
+  data.issues.L2 = issue("L2", "open", "d".repeat(300), ["L1"]); // exactly at the limit: no warning
+  data.issues.L4 = issue("L4", "open", "c".repeat(310), ["L3"]); // rationale only, no acceptance marker
+  const plan = await planLaunch({ ...BASE, bundleScript: "C:/bundle.sh" }, { cwd: "/repo", run: mockBd(data) });
+
+  assert.deepEqual(plan.warnings.filter((w) => /truncated/.test(w)), [
+    `L1: rationale is ${longDesc.length} chars, truncated to 300`,
+    "L1: acceptance is 350 chars, truncated to 300",
+    "L4: rationale is 310 chars, truncated to 300",
+  ]);
+  const byId = (id) => plan.args.bdTasks.find((t) => t.id === id);
+  assert.equal(byId("L1").rationale.length, 300);
+  assert.equal(byId("L1").acceptance.length, 300);
+  assert.equal(byId("L2").rationale.length, 300);
+});
+
 T("agile_run: workModels overlapping reviewModels -> error string", async () => {
   await assert.rejects(
     planLaunch({ ...BASE, workModels: ["m-a", "m-b"], reviewModels: ["m-b"] }, { cwd: "/repo", run: mockBd(fixtureData()) }),

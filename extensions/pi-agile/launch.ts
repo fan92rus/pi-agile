@@ -90,16 +90,26 @@ function filesHint(desc: string): string {
   return value.slice(0, FILES_HINT_MAX).trim();
 }
 
-/** Maps a bd leaf to the engine snapshot. Deps on closed leaves are dropped: already satisfied. */
-function toEngineLeaf(issue: BdIssue, closedIds: Set<string>): EngineLeaf {
+/**
+ * Maps a bd leaf to the engine snapshot. Deps on closed leaves are dropped: already satisfied.
+ * Every text cut at a limit is reported into warnings (leaf id + original length): no silent truncation.
+ */
+function toEngineLeaf(issue: BdIssue, closedIds: Set<string>, warnings: string[]): EngineLeaf {
   const desc = issue.description;
   const acc = ACCEPTANCE_RE.exec(desc);
   const tier = REVIEW_RE.exec(desc);
+  const accText = acc ? desc.slice(acc.index + acc[0].length).trim() : "";
+  if (desc.length > RATIONALE_MAX) {
+    warnings.push(`${issue.id}: rationale is ${desc.length} chars, truncated to ${RATIONALE_MAX}`);
+  }
+  if (accText.length > ACCEPTANCE_MAX) {
+    warnings.push(`${issue.id}: acceptance is ${accText.length} chars, truncated to ${ACCEPTANCE_MAX}`);
+  }
   return {
     id: issue.id,
     title: issue.title,
     rationale: desc.slice(0, RATIONALE_MAX),
-    acceptance: acc ? desc.slice(acc.index + acc[0].length).trim().slice(0, ACCEPTANCE_MAX) : "",
+    acceptance: accText.slice(0, ACCEPTANCE_MAX),
     files_hint: filesHint(desc),
     deps: issue.dependencies
       .filter((d) => d.dependency_type === "blocks" && !closedIds.has(d.id))
@@ -148,7 +158,8 @@ export async function planLaunch(input: LaunchInput, opts: LaunchOptions): Promi
   const open = leaves.filter((l) => l.status !== "closed");
   if (open.length === 0) throw new Error(`epic ${epicId} has no open leaves (nothing to launch)`);
 
-  const bdTasks = open.map((l) => toEngineLeaf(l, closedIds));
+  const warnings: string[] = [];
+  const bdTasks = open.map((l) => toEngineLeaf(l, closedIds, warnings));
   const args: Record<string, unknown> = {
     description: `Close bd epic ${epicId} (${epic.title}): every open leaf merged and closed in bd`,
     testCommand,
@@ -165,7 +176,6 @@ export async function planLaunch(input: LaunchInput, opts: LaunchOptions): Promi
   if (reviewModels.length) args.reviewModels = reviewModels;
   if (bundleScript) args.bundleScript = bundleScript;
 
-  const warnings: string[] = [];
   if (!bundleScript) {
     warnings.push("bundleScript not set: the campaign runs without the STEP 0 context bundle (children discover context themselves)");
   }
