@@ -40,6 +40,9 @@
 //   maxParallel    (num, default 3, cap 4) max concurrently RUNNING tasks (rolling
 //                  shared work queue); a wave may hold MORE tasks than this.
 //                  1 = legacy sequential mode
+//   reviewReserveMs (num, ms, default 1200000 = 20 min) last part of the budget that admits no NEW
+//                  work child: landed work still gets its review. Work that landed but was not reviewed
+//                  before the deadline is reported in return.needsReview ({id, title, branch})
 //   maxPerModel    (num, default 2, cap 8) max LIVE children per model: the global
 //                  "<=2 live per model" rule as runtime enforcement at the two
 //                  scheduling points (work pool + post queue), so bursts of 429
@@ -238,6 +241,8 @@ function engineOf(t) {
 
 const budgetMs = Math.min(Math.max(Number(args.budgetMs) || 14400000, 600000), 86400000);
 const deadlineMs = Date.now() + budgetMs;
+// E1.4 review reserve: the last reviewReserveMs of the budget admit no new work child (slots go to review).
+const reviewReserveMs = (function () { const v = args.reviewReserveMs === undefined ? 1200000 : Number(args.reviewReserveMs); return Math.min(Math.max(Number.isFinite(v) ? v : 1200000, 0), budgetMs); })();
 
 let retriesTotal = 0;
 
@@ -1941,6 +1946,18 @@ function bucketWaves(taskArr) {
 // --- campaign-level state (declared BEFORE phase 0: the SDD catch writes stopReason)
 let continueCampaign = true;
 let stopReason = "";
+// E1.4: leaves whose work child returned (their review may still be pending or never started)
+const workLanded = [];
+function workWindowOpen() { return Date.now() + reviewReserveMs < deadlineMs; }
+function postWindowOpen() { return Date.now() < deadlineMs; }
+function budgetStop(t, why) {
+  if (!stopReason) stopReason = "budget exhausted";
+  log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": " + why);
+}
+function deferPost(t, rec) {
+  budgetStop(t, "review not started before the deadline - branch " + rec.branch + " left unreviewed (needsReview)");
+  return Promise.resolve();
+}
 
 // --- main-copy baseline (ISSUE-5): ONE probe before any engine child can write into main ---
 // Skipped on resume when the checkpoint already carries the baseline (the comparison must keep
@@ -2032,7 +2049,7 @@ if (sddOverride !== "off" && taskSource !== "bd-epic") {
 // --- main loop ---------------------------------------------------------------------
 
 while (sprint < maxSprints && continueCampaign && !stopReason) {
-  if (Date.now() + 600000 >= deadlineMs) { stopReason = "budget exhausted"; break; }
+  if (!workWindowOpen()) { stopReason = "budget exhausted"; break; } // review reserve: a sprint that cannot launch work is not started
   sprint++;
   log.push("sprint " + sprint + ": start");
 
@@ -2189,11 +2206,15 @@ while (sprint < maxSprints && continueCampaign && !stopReason) {
   for (let gi = 0; gi < tasks.length; gi++) tasks[gi]._idx = gi;
   const waves = bucketWaves(tasks);
   for (const wave of waves) {
+    if (stopReason) break; // budget stop: no further wave starts
     if (wave.tasks.length === 1) {
       const t = wave.tasks[0];
+      if (!workWindowOpen()) { budgetStop(t, "work not started (inside the review reserve)"); break; }
       const rec = issueRec(t); // П4: attempt continuation / unique slug per attempt
       const wOut = await workPhase(t, rec, false);
       log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": work " + (wOut.completed === true ? "ok" : "incomplete") + " (" + rec.iterations + " iter)");
+      workLanded.push(rec);
+      if (!postWindowOpen()) { deferPost(t, rec); break; }
       await postPhase(t, rec, wOut, false);
       taskResults.push(rec);
       recordCarry(rec);
@@ -2267,10 +2288,13 @@ while (sprint < maxSprints && continueCampaign && !stopReason) {
         const t = wave.tasks[idx];
         // Q2: per-model cap on the work-phase long pole (workModel load).
         return acquireModel(workModel || model).then(function () {
+          if (!workWindowOpen()) { releaseModel(workModel || model); budgetStop(t, "work not started (inside the review reserve)"); return undefined; }
           return workPhase(t, recs[idx], true).then(function (wOut) {
             releaseModel(workModel || model);
             log.push("sprint " + sprint + " task " + (idx + 1) + ": work " + (wOut.completed === true ? "ok" : "incomplete") + " (" + recs[idx].iterations + " iter, wave " + wave.wave + ")");
+            workLanded.push(recs[idx]);
             enqueuePost(function () {
+              if (!postWindowOpen()) return deferPost(t, recs[idx]);
               return postPhase(t, recs[idx], wOut, true).then(function () {
                 taskResults.push(recs[idx]);
                 recordCarry(recs[idx]);
@@ -2310,7 +2334,7 @@ while (sprint < maxSprints && continueCampaign && !stopReason) {
   if (taskSource === "bd-epic") {
     // Leftover janitor runs in the next sprint's boundary child (top of the loop).
     log.push("sprint " + sprint + ": retro skipped (bd-epic: stopping owned by doneWhen/maxSprints/budget)");
-  } else {
+  } else if (!stopReason) { // budget stop: no retro child spends the reserve
   const retroLines = [
     "You are the RETROSPECTIVE engine for sprint " + sprint + " of the campaign.",
     "Campaign goal: " + description,
@@ -2453,6 +2477,8 @@ if (stateOk) {
   Promise.resolve(state.set("nextReadyAction", { title: "agile campaign " + STATUS + ": " + stopReason, kind: STATUS === "completed" ? "done" : "attention" })).catch(function () {});
 }
 
+// E1.4: landed work with no verdict (review never started before the deadline) - the branch stays for the operator
+const needsReview = workLanded.filter(function (r) { return r.verdict === "unknown"; }).map(function (r) { return { id: r.id, title: r.title, branch: r.branch }; });
 // ISSUE-3: leaves held after identical merge failures - the operator's list, signatures included
 const needsAttention = Object.keys(escalations).filter(function (k) { return escalations[k].count >= ESCALATE_AFTER; }).map(function (k) {
   return { leaf: k, stage: escalations[k].stage, attempts: escalations[k].count, signatures: escalations[k].sigs.slice() };
@@ -2473,6 +2499,7 @@ return {
   analytics: analytics,
   mainIncidents: mainIncidents,
   needsAttention: needsAttention,
+  needsReview: needsReview,
   log: log
 };
 

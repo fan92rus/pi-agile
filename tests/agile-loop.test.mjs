@@ -1087,6 +1087,98 @@ T("postPhase backlog cap: reviews bounded by post slots; work queue never blocke
   assert.ok(t2mStart > t1mEnd, "merges still serialize on mergeChain");
 });
 
+// --- E1.4 (П7): review reserve, one slot per leaf, budget stop reports needsReview ----
+// The engine reads Date.now() directly: these tests move a fake clock instead of waiting 20 minutes.
+async function withFakeClock(body) {
+  const realNow = Date.now;
+  const clock = { t: realNow() };
+  Date.now = () => clock.t;
+  try { return await body(clock); } finally { Date.now = realNow; }
+}
+const BUDGET_3H = 10800000;
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+T("review reserve: no work child starts inside the last 20 min, landed work still gets its review", async () => {
+  await withFakeClock(async (clock) => {
+    const deadline = clock.t + BUDGET_3H;
+    const routes = happyRoutes({
+      curator: ok(curatorOut(true, [task(1), task(2), task(3)])),
+      work: async (spec, key) => {
+        // t1 lands 10 min before the deadline (inside the 20 min reserve) once t2 has started; t2 lands last
+        if (/s1-t1-work$/.test(key)) { await pause(10); clock.t = deadline - 600000; }
+        if (/s1-t2-work$/.test(key)) await pause(30);
+        return ok(workOut())();
+      },
+    });
+    const runs = makeRuns(routes);
+    const out = await runCampaign(baseArgs({ maxParallel: 2, budgetMs: BUDGET_3H }), runs);
+    assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+    assert.equal(runs.count(/s1-t3-work/), 0, "t3 never launches: its work slot opened inside the reserve");
+    assert.ok(started(out.events, /s1-t1-review$/) >= 0, "landed t1 is reviewed inside the reserve");
+    assert.ok(started(out.events, /s1-t2-review$/) >= 0, "landed t2 is reviewed inside the reserve");
+    assert.equal(out.res.stopReason, "budget exhausted");
+    assert.deepEqual(out.res.tasks.map((r) => r.verdict), ["merged", "merged"]);
+    assert.deepEqual(out.res.needsReview, [], "no landed work is left without a verdict");
+  });
+});
+
+T("one slot per leaf: a leaf never runs two children at once; the next leaf waits for a freed post slot", async () => {
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1), task(2), task(3)])),
+    work: ok(workOut(), 5),
+    review: async (spec, key) => {
+      await pause(10);
+      // t1 is rejected once: its rework runs inside the post slot it already holds
+      return ok(reviewOk(!/s1-t1-review$/.test(key)))();
+    },
+    rework: ok(workOut(), 5),
+    merge: ok(mergeOut(), 5),
+  });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs({ maxParallel: 2 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const { events, res } = out;
+  assert.equal(runs.count(/s1-t1-rework1$/), 1, "t1 went through rework inside its own slot");
+  for (const k of [1, 2, 3]) {
+    let live = 0;
+    let maxLive = 0;
+    for (const e of events) {
+      if (!new RegExp("^s1-t" + k + "-").test(e.key)) continue;
+      live += e.t === "start" ? 1 : -1;
+      maxLive = Math.max(maxLive, live);
+    }
+    assert.equal(maxLive, 1, "leaf t" + k + " holds one slot: never two live children");
+  }
+  const firstFreed = Math.min(finishedOk(events, /s1-t1-merge$/), finishedOk(events, /s1-t2-merge$/));
+  assert.ok(started(events, /s1-t3-review$/) > firstFreed, "t3 gets a post slot only after a sibling's post phase closed");
+  assert.equal(res.tasks.filter((r) => r.verdict === "merged").length, 3, "all tasks accounted");
+});
+
+T("budget stop reports needsReview: landed work without a verdict, with its branch", async () => {
+  await withFakeClock(async (clock) => {
+    const deadline = clock.t + BUDGET_3H;
+    const routes = happyRoutes({
+      curator: ok(curatorOut(true, [task(1), task(2), task(3)])),
+      work: ok(workOut()),
+      review: async (spec, key) => {
+        // t1's review runs past the deadline (after t2's post started); t2 outlives t1, so t3's post is still queued
+        if (/s1-t1-review$/.test(key)) { await pause(10); clock.t = deadline + 1000; }
+        if (/s1-t2-review$/.test(key)) await pause(20);
+        return ok(reviewOk(true))();
+      },
+    });
+    const runs = makeRuns(routes);
+    const out = await runCampaign(baseArgs({ maxParallel: 2, budgetMs: BUDGET_3H }), runs);
+    assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+    assert.equal(runs.count(/s1-t3-review/), 0, "t3 review never starts after the deadline");
+    assert.equal(out.res.stopReason, "budget exhausted");
+    assert.equal(out.res.needsReview.length, 1, "exactly the unreviewed leaf is named");
+    assert.equal(out.res.needsReview[0].title, "task 3");
+    assert.match(out.res.needsReview[0].branch, /task-3$/);
+    assert.equal(out.res.tasks.filter((r) => r.verdict === "merged").length, 2, "reviewed leaves still merged");
+  });
+});
+
 // --- paired waves (agents-6xp): disjoint work children run concurrently, merges land on main mid-flight.
 // The staged-index race ('Staged index changed after launch') died with withGate acceptance:false:
 // the host no longer snapshots main's index at child launch, and noStagedFiles is judged on the
