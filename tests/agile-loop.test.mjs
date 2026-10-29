@@ -293,7 +293,36 @@ T("arbiter merge-as-is: orchestrator merges via mergeChain (serialized), verdict
   assert.equal(launchedKeys(events, /-rework\d+$/).length, 0, "reworkLimit=0 -> no rework rounds");
 });
 
-T("one-more-round guard: at most ONE arbiter-granted extra round; a repeated request forces drop", async () => {
+// --- E2.1: no drop without the lead's decision -------------------------------------
+// A drop is only ever executed on an EXPLICIT drop-branch decision from the calling side.
+// The supervisor-unavailable fallback and a repeated one-more-round HOLD the branch as
+// needs-attention, and neither the sprint boundary nor the final janitor may touch a
+// held branch (the hold awaits the lead; destroying it destroys the decision evidence).
+
+T("supervisor-unavailable fallback: decision=needs-attention holds the branch (no drop, no pool walk)", async () => {
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    work: fail("required structured output was not produced"),
+    review: ok(reviewOk(false)),
+    arbiter: ok(arbOut("needs-attention", "supervisor unavailable - no drop without the lead's decision")),
+  });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs({ reworkLimit: 0 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const { res } = out;
+  assert.equal(runs.count(K.arbiter), 1, "needs-attention is a usable decision - no pool walk, no arbiter-failed");
+  assert.equal(runs.count(K.drop), 0, "no drop child: the fallback never drops");
+  assert.equal(runs.count(K.merge), 0, "nothing merges without the lead");
+  assert.equal(runs.count(K.rework), 0, "needs-attention grants no rework round");
+  assert.equal(res.tasks[0].verdict, "needs-attention");
+  assert.equal(res.counts.failed, 1, "needs-attention counts as failed");
+  assert.equal(runs.count(K.cleanup), 0, "no final cleanup child: the held branch is not garbage");
+  const arb = runs.spec(K.arbiter).spec.task;
+  assert.ok(/decision=needs-attention/.test(arb), "fallback brief instructs needs-attention");
+  assert.ok(!/defaulted to drop/.test(arb), "the drop default is gone from the arbiter brief");
+});
+
+T("one-more-round guard: at most ONE arbiter-granted extra round; a repeated request holds as needs-attention (no drop)", async () => {
   let reviewCalls = 0;
   let arbCalls = 0;
   const routes = happyRoutes({
@@ -313,8 +342,32 @@ T("one-more-round guard: at most ONE arbiter-granted extra round; a repeated req
   const { res } = out;
   assert.equal(arbCalls, 2, "arbiter asked exactly twice (guard stops the loop)");
   assert.equal(runs.count(K.rework), 1, "exactly one arbiter-granted extra round");
-  assert.ok(runs.spec(K.drop), "repeated one-more-round forced a drop");
-  assert.equal(res.tasks[0].verdict, "dropped");
+  assert.equal(runs.count(K.drop), 0, "repeated one-more-round never drops: no explicit lead decision");
+  assert.equal(runs.count(K.merge), 0);
+  assert.equal(res.tasks[0].verdict, "needs-attention");
+  assert.equal(runs.count(K.cleanup), 0, "final cleanup does not touch the held branch");
+});
+
+T("final cleanup: failed leftovers are janitored, needs-attention holds are NOT touched", async () => {
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1), task(2)])),
+    work: (spec, key) => (key.includes("t1-work") ? ok(workOut({ completed: false }))() : fail("required structured output was not produced")()),
+    review: ok(reviewOk(false)),
+    arbiter: ok(arbOut("needs-attention", "supervisor unavailable - no drop without the lead's decision")),
+  });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs({ reworkLimit: 0, maxParallel: 2 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const { res } = out;
+  const failedRec = res.tasks.find((x) => x.branch === "agile/task-1");
+  const heldRec = res.tasks.find((x) => x.branch === "agile/task-2");
+  assert.ok(failedRec && heldRec, "both outcomes landed: " + JSON.stringify(res.tasks.map((x) => [x.branch, x.verdict])));
+  assert.equal(failedRec.verdict, "failed", "completed=false work is a plain failed leftover");
+  assert.equal(heldRec.verdict, "needs-attention", "the supervisor-unavailable fallback holds the task");
+  assert.equal(runs.count(K.cleanup), 1, "final cleanup launches for the failed leftover");
+  const fc = runs.spec(K.cleanup).spec.task;
+  assert.ok(/branch "agile\/task-1"/.test(fc), "the failed leftover is janitored");
+  assert.ok(!/agile\/task-2/.test(fc), "the needs-attention branch never reaches the janitor brief");
 });
 
 // --- arbiter pool (E1.2): prefer a model that is NOT the author's; a 403/429 walks to the next pool model
@@ -1872,6 +1925,15 @@ T("ISSUE-3 escalation: two identical merge failures in a row -> the third merge 
   assert.deepEqual(na.signatures, ["merge: merged/checks_ok not confirmed | red gate: npm test exit <n> in test <n>", "merge: merged/checks_ok not confirmed | red gate: npm test exit <n> in test <n>"], "both normalized signatures are named");
   assert.ok(out.res.log.some((l) => /NEEDS-ATTENTION.*fal-e/.test(l)), "hold logged: " + JSON.stringify(out.res.log.filter((l) => /ATTENTION|ESCALATION/.test(l))));
   assert.equal(out.res.counts.failed, 3, "needs-attention counts as failed");
+});
+
+T("E2.1: a held leaf (needs-attention) survives final cleanup - the janitor never touches it", async () => {
+  const runs = mergeRoutes(ok(refused("red gate: npm test exit 1 in test 12")));
+  const out = await runCampaign(BD_MERGE_ARGS({ maxSprints: 3 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(out.res.tasks[2].verdict, "needs-attention", "the third attempt is held");
+  assert.equal(runs.count(K.cleanup), 0, "no final cleanup child: the held branch is not garbage");
+  assert.ok(!out.res.log.some((l) => /final cleanup/.test(l)), "nothing janitored at campaign end: " + JSON.stringify(out.res.log.filter((l) => /cleanup/.test(l))));
 });
 
 T("ISSUE-3 escalation: different merge errors in a row do not escalate - every merge runs", async () => {

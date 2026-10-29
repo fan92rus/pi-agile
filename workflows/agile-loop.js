@@ -1128,12 +1128,13 @@ const MERGE_SCHEMA = {
 };
 // Serialized to <journalDir>/report-schema.json at campaign start (report self-check source).
 const REPORT_SCHEMAS = { work: WORK_SCHEMA, merge: MERGE_SCHEMA };
-// Arbiter only DECIDES (merge/drop run through the shared mergeChain); a repeated
-// one-more-round is forced to drop by the orchestrator (max one arbiter fix round).
+// Arbiter only DECIDES (merge/drop run through the shared mergeChain). A drop needs an
+// explicit lead decision: a supervisor-unavailable fallback and a repeated one-more-round
+// (max one arbiter fix round) both HOLD the branch as needs-attention - nothing drops.
 const ARB_SCHEMA = {
   type: "object",
   properties: {
-    decision: { type: "string", enum: ["merge-as-is", "drop-branch", "one-more-round", "escalate-ledger"] },
+    decision: { type: "string", enum: ["merge-as-is", "drop-branch", "one-more-round", "escalate-ledger", "needs-attention"] },
     note: { type: "string" }
   },
   required: ["decision", "note"],
@@ -1190,12 +1191,21 @@ function leftoverEntries(recs) {
   // Executed-but-never-merged recs: their worktrees/branches are garbage by campaign
   // semantics (the gates rejected the work; retries must start collision-free - a
   // stale path makes the worker's STOP-on-collision contract fail the retry forever).
+  // needs-attention is NOT garbage (E2.1): the hold awaits the lead's decision - no
+  // drop without it. ANY attempt of a branch that landed as needs-attention protects
+  // the branch: neither the sprint boundary nor the final janitor may touch it, even
+  // if earlier attempts of the same branch failed their merge.
+  const held = {};
+  (recs || []).forEach(function (r) {
+    if (r && r.branch && r.verdict === "needs-attention") held[String(r.branch)] = true;
+  });
   const seen = {};
   const out = [];
   (recs || []).forEach(function (r) {
     if (!r || !r.branch || !r.wt) return;
-    if (r.verdict === "merged" || r.verdict === "merged-after-arbitration" || r.verdict === "unknown") return;
     const b = String(r.branch);
+    if (held[b]) return;
+    if (r.verdict === "merged" || r.verdict === "merged-after-arbitration" || r.verdict === "unknown") return;
     if (seen[b]) return;
     seen[b] = true;
     out.push({ branch: b, worktree: r.wt });
@@ -1622,7 +1632,8 @@ function postPhase(t, rec, wOut, parallel) {
     // Decision-only: the arbiter child NEVER mutates git. merge-as-is/drop-branch are
     // applied by the ORCHESTRATOR through the shared mergeChain (single main-writer,
     // same queue as ordinary merges); one-more-round becomes an orchestrator-driven
-    // rework round (at most one per task - a repeated request is forced to drop).
+    // rework round (at most one per task - a repeated request holds as needs-attention:
+    // no drop without the lead's decision, E2.1).
     const arbLines = [
       "You are the ARBITER. A task exhausted its rework budget without reviewer approval.",
       "Task: " + t.title + " | Branch: " + slug + " | Iterations: " + rec.iterations,
@@ -1631,10 +1642,10 @@ function postPhase(t, rec, wOut, parallel) {
       "",
       "READ-ONLY ROLE (hard): you do NOT run any git write commands and do NOT modify anything - you DECIDE; the orchestrator applies your decision.",
       "MANDATORY: ask the calling side via contact_supervisor (reason: \"task-rework-exhausted\") with the situation summary; options you offer: merge-as-is / drop-branch / one-more-round" + (escalateLedger && ledgerAvailable && !useLedger ? " / escalate-ledger (recommended when the task looks genuinely nontrivial and the gate is objective: one repair ledger-solve ceremony runs on the existing branch before merge/drop)" : "") + ".",
-      "(fallback) If contact_supervisor is unavailable after 2 attempts: decision=drop-branch, note='supervisor unavailable - defaulted to drop'.",
+      "(fallback) If contact_supervisor is unavailable after 2 attempts: decision=needs-attention, note='supervisor unavailable - no drop without the lead's decision'.",
       MAIN_BRANCH_NOTE,
       "", GIT_RULES, CMDS, FACTS, FINAL_MSG,
-      "Schema keys: decision (merge-as-is | drop-branch | one-more-round | escalate-ledger), note (= the caller's decision + 1 line why)."
+      "Schema keys: decision (merge-as-is | drop-branch | one-more-round | escalate-ledger | needs-attention), note (= the caller's decision + 1 line why)."
     ].filter(Boolean).join("\n");
     // Pool walk (arbiterPick): a 403/429 or an unusable answer moves to the next pool model;
     // pool exhausted -> arbiter-failed.
@@ -1659,7 +1670,7 @@ function postPhase(t, rec, wOut, parallel) {
         const decision = String(aOut.decision || "").trim().toLowerCase();
         const note = String(aOut.note || "");
         const escalatable = decision === "escalate-ledger" && escalateLedger && ledgerAvailable && !useLedger && rec.escalated !== true;
-        if (!escalatable && ["merge-as-is", "drop-branch", "one-more-round"].indexOf(decision) === -1) {
+        if (!escalatable && ["merge-as-is", "drop-branch", "one-more-round", "needs-attention"].indexOf(decision) === -1) {
           return arbiterRetry("returned no usable decision (" + (decision || "empty") + ")", "arbitration: no usable decision");
         }
         rec.arbRounds = (rec.arbRounds || 0) + 1;
@@ -1682,14 +1693,29 @@ function postPhase(t, rec, wOut, parallel) {
             return reviewRound(0, "", repOut);
           });
         }
+        // E2.1: no drop without an explicit lead decision. The arbiter's fallback answer
+        // (supervisor unreachable) and a repeated one-more-round (max one arbiter fix
+        // round) HOLD the branch as needs-attention - the branch stays for manual review
+        // and no janitor touches it (leftoverEntries).
+        if (decision === "needs-attention") {
+          rec.verdict = "needs-attention";
+          rec.stop = "arbitration: held for the lead (no drop without an explicit decision)";
+          log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": NEEDS-ATTENTION - supervisor unavailable, no drop without the lead's decision; branch " + slug + " left for manual review");
+          return;
+        }
         if (decision === "merge-as-is") {
           mergeChain = mergeChain.then(function () { return doMerge(); }).then(function () {
             if (rec.verdict === "merged") rec.verdict = "merged-after-arbitration";
           });
           return mergeChain;
         }
-        if (decision === "drop-branch" || (decision === "one-more-round" && rec.arbRounds > 1)) {
-          if (decision === "one-more-round") log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": arbiter repeated one-more-round; forcing drop (max one arbiter round)");
+        if (decision === "one-more-round" && rec.arbRounds > 1) {
+          rec.verdict = "needs-attention";
+          rec.stop = "arbitration: repeated one-more-round - held for the lead (no drop without an explicit decision)";
+          log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": arbiter repeated one-more-round; no drop without the lead's decision - branch " + slug + " left for manual review");
+          return;
+        }
+        if (decision === "drop-branch") {
           mergeChain = mergeChain.then(function () { return doDrop(); });
           return mergeChain;
         }
