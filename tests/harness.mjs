@@ -159,8 +159,8 @@ export const K = {
   arbiter: /-arbiter(~retry\d+)?$/,
   drop: /-drop$/,
   reportRepair: /-report-repair$/,
-  boundary: /-boundary(~retry\d+)?$/, // federation bd-epic mode: one sprint-boundary child (janitor + snapshot refresh)
-  cleanup: /^final-cleanup(~retry\d+)?$/, // campaign-end leftover worktree/branch janitor
+  boundary: /-boundary(~retry\d+)?$/, // federation bd-epic mode: one sprint-boundary child (snapshot refresh only; K1: deletes nothing)
+  cleanup: /^final-cleanup(~retry\d+)?$/, // K1 guard: must NEVER launch - unmerged work is kept for the lead (return.keptBranches)
   finalClose: /^final-bd-close(~retry\d+)?$/, // bd-epic post-loop bd-close of the last sprint's merges (any stopReason)
   reportSchema: /^report-schema(~retry\d+)?$/, // campaign-start writer of <journalDir>/report-schema.json (R1)
   mainStatus: /^main-baseline(~retry\d+)?$|-maincheck(~retry\d+)?$/, // ISSUE-5: main-copy porcelain probes (campaign baseline + pre-merge check)

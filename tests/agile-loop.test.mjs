@@ -348,7 +348,7 @@ T("one-more-round guard: at most ONE arbiter-granted extra round; a repeated req
   assert.equal(runs.count(K.cleanup), 0, "final cleanup does not touch the held branch");
 });
 
-T("final cleanup: failed leftovers are janitored, needs-attention holds are NOT touched", async () => {
+T("K1: failed leftovers and needs-attention holds are kept for the lead - NO final cleanup child, return.keptBranches names both", async () => {
   const routes = happyRoutes({
     curator: ok(curatorOut(true, [task(1), task(2)])),
     work: (spec, key) => (key.includes("t1-work") ? ok(workOut({ completed: false }))() : fail("required structured output was not produced")()),
@@ -364,10 +364,60 @@ T("final cleanup: failed leftovers are janitored, needs-attention holds are NOT 
   assert.ok(failedRec && heldRec, "both outcomes landed: " + JSON.stringify(res.tasks.map((x) => [x.branch, x.verdict])));
   assert.equal(failedRec.verdict, "failed", "completed=false work is a plain failed leftover");
   assert.equal(heldRec.verdict, "needs-attention", "the supervisor-unavailable fallback holds the task");
-  assert.equal(runs.count(K.cleanup), 1, "final cleanup launches for the failed leftover");
-  const fc = runs.spec(K.cleanup).spec.task;
-  assert.ok(/branch "agile\/task-1"/.test(fc), "the failed leftover is janitored");
-  assert.ok(!/agile\/task-2/.test(fc), "the needs-attention branch never reaches the janitor brief");
+  assert.equal(runs.count(K.cleanup), 0, "K1: the engine launches NO final cleanup child - unmerged work is never deleted");
+  assert.ok(!out.res.log.some((l) => /final cleanup/.test(l)), "no cleanup in the log");
+  const kf = out.res.keptBranches.find((k) => k.branch === "agile/task-1");
+  const kh = out.res.keptBranches.find((k) => k.branch === "agile/task-2");
+  assert.ok(kf && kf.verdict === "failed", "the failed leftover is kept: " + JSON.stringify(out.res.keptBranches));
+  assert.ok(kh && kh.verdict === "needs-attention", "the needs-attention hold is kept: " + JSON.stringify(out.res.keptBranches));
+  assert.ok(/task-1$/.test(kf.worktree), "the kept worktree path is reported: " + kf.worktree);
+});
+
+T("K1: merge-failed and failed leaves are kept - no cleanup child, both branches named in return.keptBranches", async () => {
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1), task(2)])),
+    work: (spec, key) => ok(workOut({ completed: !key.includes("t1-work") }))(),
+    review: ok(reviewOk(true)),
+    merge: ok(mergeOut({ merged: false, checks_ok: false, note: "conflict in src/a.txt" })),
+  });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs({ reworkLimit: 0, maxParallel: 2 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const { res } = out;
+  assert.equal(res.tasks.find((x) => x.branch === "agile/task-1").verdict, "failed", "completed=false work");
+  assert.equal(res.tasks.find((x) => x.branch === "agile/task-2").verdict, "merge-failed", "refused merge");
+  assert.equal(runs.count(K.cleanup), 0, "K1: no final cleanup child after failed/merge-failed work");
+  assert.ok(!res.log.some((l) => /final cleanup|janitor/.test(l)), "nothing is cleaned up: " + JSON.stringify(res.log.filter((l) => /cleanup|janitor/.test(l))));
+  const kept = res.keptBranches.map((k) => k.branch + "=" + k.verdict).sort();
+  assert.deepEqual(kept, ["agile/task-1=failed", "agile/task-2=merge-failed"], "both unmerged branches are handed to the lead: " + JSON.stringify(res.keptBranches));
+});
+
+T("K1: a main-copy incident (main-mutated) keeps the branch - no cleanup child, return.keptBranches names it", async () => {
+  const runs = makeRuns([
+    ...happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }),
+    mainProbe([], [" M src/a.txt"]),
+  ]);
+  const out = await runCampaign(baseArgs({ reworkLimit: 0 }), runs, makeState());
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(out.res.tasks[0].verdict, "main-mutated", "the incident refuses the merge");
+  assert.equal(runs.count(K.cleanup), 0, "K1: no final cleanup child after a main-copy incident");
+  assert.equal(runs.count(K.merge), 0, "the merge never starts over a mutated main");
+  assert.deepEqual(out.res.keptBranches.map((k) => [k.branch, k.verdict]), [["agile/task-1", "main-mutated"]], "the incident branch is kept for the lead");
+});
+
+T("K1: keptBranches excludes merged work and the explicit drop-branch decision (the only engine deletion) - the drop still executes", async () => {
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1), task(2)])),
+    review: async (spec, key) => ok(reviewOk(key.includes("t1-review")))(),
+    arbiter: ok(arbOut("drop-branch", "not worth keeping")),
+  });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs({ reworkLimit: 0, maxParallel: 2 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(out.res.tasks.find((x) => x.branch === "agile/task-1").verdict, "merged");
+  assert.equal(out.res.tasks.find((x) => x.branch === "agile/task-2").verdict, "dropped");
+  assert.equal(runs.count(K.drop), 1, "the explicit drop-branch decision still runs its drop executor");
+  assert.deepEqual(out.res.keptBranches, [], "merged and dropped branches are not kept");
 });
 
 // --- arbiter pool (E1.2): prefer a model that is NOT the author's; a 403/429 walks to the next pool model
@@ -1228,6 +1278,7 @@ T("budget stop reports needsReview: landed work without a verdict, with its bran
     assert.equal(out.res.needsReview.length, 1, "exactly the unreviewed leaf is named");
     assert.equal(out.res.needsReview[0].title, "task 3");
     assert.match(out.res.needsReview[0].branch, /task-3$/);
+    assert.ok(out.res.keptBranches.some((k) => k.branch === out.res.needsReview[0].branch && k.verdict === "unknown" && !!k.worktree), "the deferred unreviewed branch and worktree are kept for the lead");
     assert.equal(out.res.tasks.filter((r) => r.verdict === "merged").length, 2, "reviewed leaves still merged");
   });
 });
@@ -1740,11 +1791,11 @@ T("toy-falcon end-race: last leaf merged but snapshot lags -> epic-closed, one e
   assert.equal(out.res.stopReason, "epic-closed");
 });
 
-T("toy-falcon empty sprint: sprint 1 all failed -> sprint 2 boundary is janitor-only, NO snapshot refresh, reuses the snapshot", async () => {
+T("toy-falcon empty sprint: sprint 1 all failed -> NO sprint-2 boundary (no refresh, nothing janitored), the snapshot is reused, the failed leaf is retried and kept", async () => {
   const routes = makeRuns([
     { match: K.work, handle: ok(workOut({ completed: false })) },
-    { match: K.boundary, handle: ok({ cleaned: [{ branch: "agile/falcon-fal-a", worktree: "../wt-t1-falcon-fal-a", removed: true, note: "gone" }], leaves: [] }) },
-    { match: K.cleanup, handle: ok({ cleaned: [] }) },
+    { match: K.boundary, handle: ok({ leaves: [] }) },
+    { match: K.cleanup, handle: ok({ }) },
   ]);
   const out = await runCampaign(baseArgs({
     taskSource: "bd-epic", bdEpic: "t-fal.1", doneWhen: "bd-epic-closed",
@@ -1752,14 +1803,11 @@ T("toy-falcon empty sprint: sprint 1 all failed -> sprint 2 boundary is janitor-
     bdTasks: [falconLeaf("fal-a")],
   }), routes, makeState());
   assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
-  const bnd = routes.spec(/^s2-boundary$/);
-  assert.ok(bnd, "sprint 2 boundary child still runs: it janitors sprint 1's leftover");
-  assert.ok(!/bd list --parent/.test(bnd.spec.task), "0-merge sprint: boundary carries NO bd snapshot refresh");
-  assert.ok(/NOT requested at this boundary/.test(bnd.spec.task), "refresh explicitly off in the boundary brief");
-  assert.equal(routes.count(K.boundary), 1, "exactly one boundary child (sprint 2) - no cursor child of its own");
+  assert.equal(routes.count(K.boundary), 0, "K1: no boundary child - no snapshot refresh and nothing is janitored at the sprint-2 start");
+  assert.equal(routes.count(K.cleanup), 0, "K1: no final cleanup child");
   assert.equal(routes.count(/^s2-t1-work/), 1, "the failed leaf is retried in sprint 2 from the reused snapshot");
   assert.ok(out.res.log.some((l) => /bd-cursor: skipped/.test(l)), "skip is logged: " + JSON.stringify(out.res.log));
-  assert.ok(out.res.log.some((l) => /boundary cleanup removed 1\/1 leftover/.test(l)), "janitor result logged: " + JSON.stringify(out.res.log));
+  assert.ok(out.res.keptBranches.some((k) => k.branch === "agile/falcon-fal-a" && k.verdict === "failed"), "the unmerged leaf is kept for the lead: " + JSON.stringify(out.res.keptBranches));
 });
 
 T("toy-falcon merge: sprint 1 merged a leaf -> sprint 2 launches the bd-cursor refresh", async () => {
@@ -2027,16 +2075,15 @@ T("no stale PLANNED markers: agile-loop.js and SKILL.md describe only implemente
 // bd-close), arbiter, drop, boundary janitor+refresh, final-bd-close,
 // final-cleanup, analytics.
 
-T("no `|| true` on ANY git command in ANY generated brief; bd-close/janitor git failures are explicit", async () => {
+T("no `|| true` on ANY git command in ANY generated brief; bd-close git failures are explicit", async () => {
   const routes = makeRuns([
     { match: /^s1-t1-review/, handle: ok(reviewOk(true)) },
     { match: /-review$/, handle: ok(reviewOk(false)) },
     { match: /-arbiter$/, handle: ok(arbOut("drop-branch", "not worth keeping")) },
     { match: /^s1-t1-merge$/, handle: ok(mergeOut({ merge_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", bd_closed: false, note: "bd export commit failed: .beads/issues.jsonl still dirty" })) },
     { match: /-drop$/, handle: ok(dropOut()) },
-    { match: /^s\d-boundary$/, handle: ok({ cleaned: [], leaves: [falconLeaf("fal-c")] }) },
-    { match: /^final-bd-close/, handle: ok({ cleaned: [], closed: [{ id: "fal-a", closed: true, note: "closed" }], leaves: [] }) },
-    { match: /^final-cleanup/, handle: ok({ cleaned: [] }) },
+    { match: /^s\d-boundary$/, handle: ok({ leaves: [falconLeaf("fal-c")] }) },
+    { match: /^final-bd-close/, handle: ok({ closed: [{ id: "fal-a", closed: true, note: "closed" }], leaves: [] }) },
     { match: /-work/, handle: ok(workOut()) },
   ]);
   const out = await runCampaign(baseArgs({
@@ -2048,9 +2095,9 @@ T("no `|| true` on ANY git command in ANY generated brief; bd-close/janitor git 
   // every brief family is actually generated by this campaign
   assert.ok(routes.spec(/^s1-t1-merge$/), "merge child launched");
   assert.ok(routes.spec(/-drop$/), "drop child launched");
-  assert.ok(routes.spec(/^s\d-boundary$/), "boundary child launched (janitor + refresh)");
+  assert.ok(routes.spec(/^s\d-boundary$/), "boundary child launched (snapshot refresh)");
   assert.ok(routes.spec(/^final-bd-close/), "post-loop bd-close launched (merger's close was unconfirmed)");
-  assert.ok(routes.spec(/^final-cleanup/), "final cleanup launched (dropped leftovers)");
+  assert.equal(routes.count(K.cleanup), 0, "K1: no final cleanup child - the dropped/unmerged leftovers are never deleted by the engine");
   for (const [key, spec] of routes.specs) {
     if (spec && typeof spec.task === "string") {
       assert.ok(!GIT_MUTATION_SILENT.test(spec.task), "brief " + key + " hides a git mutation behind `|| true`");
@@ -2067,11 +2114,9 @@ T("no `|| true` on ANY git command in ANY generated brief; bd-close/janitor git 
   // post-loop close: same explicit-failure contract
   const fb = routes.spec(/^final-bd-close/).spec.task;
   assert.ok(/every closed\[\] entry of this run gets closed=false with note='export commit failed: \.beads\/issues\.jsonl still dirty'/.test(fb), "post-loop close reports a failed export commit explicitly");
-  // janitor briefs (boundary + final cleanup): bare commands, failure must surface
+  // K1: the boundary brief deletes nothing (no worktree removal, no branch deletion)
   const bnd = routes.spec(/^s\d-boundary$/).spec.task;
-  assert.ok(/git worktree remove --force "<worktree>"/.test(bnd) && /ALREADY GONE/.test(bnd) && /FULL error text in note/.test(bnd), "boundary janitor: bare commands, missing target = fine, real failure surfaces in note");
-  const fc = routes.spec(/^final-cleanup/).spec.task;
-  assert.ok(/ALREADY GONE/.test(fc) && /FULL error text in note/.test(fc), "final cleanup carries the same explicit-failure contract");
+  assert.ok(!/worktree remove|branch -D/.test(bnd), "boundary brief carries no deletion command (K1)");
 });
 
 // --- stale doc-vs-code markers ----------------------------------------------------
@@ -2137,7 +2182,7 @@ T("toy-falcon bd-close: the MERGER closes the merged leaf in bd (close steps in 
   const bnd = routes.spec(/^s2-boundary$/);
   assert.ok(bnd, "sprint-2 boundary still launches (snapshot refresh after a merge)");
   assert.ok(!/bd close /.test(bnd.spec.task), "boundary spec contains NO bd-close");
-  assert.ok(!/PART 2 - BD CLOSE/.test(bnd.spec.task), "boundary brief has no BD CLOSE section");
+  assert.ok(!/PART 1 - BD CLOSE/.test(bnd.spec.task), "boundary brief has no BD CLOSE section");
   assert.ok(out.res.log.some((l) => /bd epic-close confirmed t-fal\.1/.test(l)), "engine confirms epic closure after leaf closure");
   const epicClose = routes.spec(/^epic-close$/);
   assert.ok(epicClose && /bd close t-fal\.1/.test(epicClose.spec.task), "epic-closed scenario invokes bd close for the epic");
@@ -2175,13 +2220,11 @@ T("toy-falcon bd-close: exactly-once across a multi-merge campaign - each merger
   assert.ok(out.res.log.some((l) => /merge bd-close closed fal-a/.test(l)) && out.res.log.some((l) => /merge bd-close closed fal-b/.test(l)), "both closes recorded in the log");
 });
 
-T("toy-falcon bd-close: failed leaf is never closed - boundary runs as janitor only, NO close section", async () => {
-  // the leaf was rejected - bd must NOT be closed by us; the boundary
-  // child still runs (janitor for the leftover) but carries NO close section.
+T("toy-falcon bd-close: failed leaf is never closed - NO boundary child (no refresh), no close section, the leaf is kept", async () => {
+  // the leaf was rejected - bd must NOT be closed by us; the failed leaf is kept for the lead (K1).
   const routesF = makeRuns([
     { match: K.work, handle: ok(workOut({ completed: false })) },
-    { match: K.boundary, handle: ok({ cleaned: [{ branch: "agile/falcon-fal-a", worktree: "../wt-t1-falcon-fal-a", removed: true, note: "gone" }], leaves: [] }) },
-    { match: K.cleanup, handle: ok({ cleaned: [] }) },
+    { match: K.boundary, handle: ok({ leaves: [] }) },
   ]);
   const outF = await runCampaign(baseArgs({
     taskSource: "bd-epic", bdEpic: "t-fal.1", doneWhen: "bd-epic-closed",
@@ -2189,11 +2232,12 @@ T("toy-falcon bd-close: failed leaf is never closed - boundary runs as janitor o
     bdTasks: [falconLeaf("fal-a")],
   }), routesF, makeState());
   assert.ok(!outF.err, "workflow threw: " + (outF.err && outF.message));
-  const bndF = routesF.spec(/^s2-boundary$/);
-  assert.ok(bndF, "failed leaf: boundary runs as the janitor");
-  assert.ok(!/PART 2 - BD CLOSE/.test(bndF.spec.task), "failed verdict: NO bd-close section");
-  assert.ok(!/bd close /.test(bndF.spec.task), "failed verdict is never closed in bd");
+  assert.equal(routesF.count(K.boundary), 0, "failed leaf: no sprint-2 boundary child - nothing refreshed, nothing janitored");
+  for (const [key, spec] of routesF.specs) {
+    if (spec && typeof spec.task === "string") assert.ok(!/bd close /.test(spec.task), "failed verdict is never closed in bd (brief " + key + ")");
+  }
   assert.equal(outF.res.tasks.find((r) => r.id === "fal-a").verdict, "failed");
+  assert.ok(outF.res.keptBranches.some((k) => k.id === "fal-a" && k.verdict === "failed"), "the failed leaf is kept for the lead");
 });
 
 T("toy-falcon bd-close: merger bd-close failure does not sink the merge - verdict merged stands, failure logged, the post-loop child retries", async () => {
@@ -2241,8 +2285,8 @@ T("toy-falcon bd-close post-loop: the last sprint's merge is closed before retur
   const fin = routes.spec(K.finalClose);
   assert.ok(fin, "post-loop bd-close child launched: " + JSON.stringify(routes.keys()));
   assert.ok(/bd close fal-a -r /.test(fin.spec.task) && /merged/.test(fin.spec.task), "the last sprint's merged leaf is in the close list");
-  assert.ok(/PART 2 - BD CLOSE/.test(fin.spec.task), "the post-loop child is the mechanical bd-close section");
-  assert.ok(/check-ignore/.test(fin.spec.task) && /export=stealth/.test(fin.spec.task), "PART 2 carries the stealth-bd guard: probe check-ignore/ls-files BEFORE export, skip add/commit when ignored or untracked");
+  assert.ok(/PART 1 - BD CLOSE/.test(fin.spec.task), "the post-loop child is the mechanical bd-close section");
+  assert.ok(/check-ignore/.test(fin.spec.task) && /export=stealth/.test(fin.spec.task), "PART 1 carries the stealth-bd guard: probe check-ignore/ls-files BEFORE export, skip add/commit when ignored or untracked");
   assert.ok(!/bd list --parent/.test(fin.spec.task), "post-loop close carries NO snapshot refresh");
   assert.ok(out.res.log.some((l) => /post-loop: bd-close closed 1\/1/.test(l)), "post-loop close logged: " + JSON.stringify(out.res.log));
   const lastRun = routes.events.filter((e) => e.t === "ok").pop();
@@ -2573,14 +2617,13 @@ T("modelLadder duplicates collapse: [m-b, m-b] behaves like [m-b]", async () => 
   assert.ok(retry && retry.spec.model === "m-b", "the single deduped fallback carries the ladder model");
 });
 
-T("toy-falcon cleanup: failed leaf -> boundary janitor removes worktree+branch, retry starts clean", async () => {
+T("K1: failed leaf -> NO boundary janitor and NO cleanup child: the branch and worktree are kept, return.keptBranches names them", async () => {
   const routes = makeRuns([
     { match: K.work, handle: ok(workOut({ completed: false, what_done: "STOP: could not verify" })) },
     { match: K.review, handle: ok(reviewOk(false)) },
     { match: K.merge, handle: ok(mergeOut()) },
     { match: K.drop, handle: ok(dropOut()) },
-    { match: K.boundary, handle: ok({ cleaned: [{ branch: "agile/falcon-fal-a", worktree: "../wt-t1-falcon-fal-a", removed: true, note: "gone" }], leaves: [] }) },
-    { match: K.cleanup, handle: ok({ cleaned: [] }) },
+    { match: K.boundary, handle: ok({ leaves: [] }) },
   ]);
   const out = await runCampaign(baseArgs({
     taskSource: "bd-epic", bdEpic: "t-fal.2", doneWhen: "bd-epic-closed",
@@ -2588,29 +2631,25 @@ T("toy-falcon cleanup: failed leaf -> boundary janitor removes worktree+branch, 
     bdTasks: [falconLeaf("fal-a")],
   }), routes, makeState());
   assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
-  const jan = routes.spec(/^s2-boundary$/);
-  assert.ok(jan, "sprint-2 boundary child launched after a failed sprint leaf");
-  assert.equal(routes.count(/-bd-cleanup/), 0, "no separate cleanup child at the sprint end any more");
-  assert.ok(jan.spec.task.includes("agile/falcon-fal-a"), "brief names the exact branch");
-  assert.ok(jan.spec.task.includes("worktree remove --force") && jan.spec.task.includes("git branch -D"), "brief prescribes both janitor commands");
-  assert.equal(routes.count(K.boundary), 1, "one boundary child for the sprint-1 leftover");
-  assert.equal(routes.count(K.cleanup), 1, "final cleanup still fires at campaign end");
-  assert.ok(out.res.log.some((l) => /cleanup removed 1\/1 leftover/.test(l)), "cleanup result logged");
-  const finalJan = routes.spec(/^final-cleanup/);
-  assert.ok(finalJan, "final-cleanup runs at campaign end (no garbage left behind)");
+  assert.equal(routes.count(K.boundary), 0, "K1: no sprint-2 boundary child - nothing is janitored");
+  assert.equal(routes.count(K.cleanup), 0, "K1: no final cleanup child");
+  assert.equal(routes.count(K.drop), 0, "a completed=false leaf never reaches the arbiter, so no drop child");
+  assert.ok(!out.res.log.some((l) => /janitor|boundary cleanup|final cleanup/.test(l)), "no cleanup line in the log");
+  const kept = out.res.keptBranches.find((k) => k.branch === "agile/falcon-fal-a");
+  assert.ok(kept, "the failed leaf's branch is kept for the lead: " + JSON.stringify(out.res.keptBranches));
+  assert.equal(kept.verdict, "failed");
+  assert.equal(kept.worktree, "../wt-t1-falcon-fal-a", "the kept worktree path is reported");
 });
 
-T("boundary merge: sprint 1 merged one leaf AND left one failed -> ONE s2-boundary does janitor + snapshot refresh", async () => {
+T("boundary merge: sprint 1 merged one leaf AND left one failed -> ONE s2-boundary refreshes the snapshot; the failed branch is kept, NOT janitored", async () => {
   const routes = makeRuns([
-    { match: K.finalClose, handle: ok({ cleaned: [], closed: [], leaves: [] }) },
+    { match: K.finalClose, handle: ok({ closed: [], leaves: [] }) },
     { match: K.work, handle: async (spec, key) => ({ ok: true, structuredOutput: workOut({ completed: key === "s1-t1-work" }) }) },
     { match: K.review, handle: ok(reviewOk()) },
     { match: K.merge, handle: ok(mergeOut()) },
     { match: K.boundary, handle: ok({
-        cleaned: [{ branch: "agile/falcon-fal-c", worktree: "../wt-t2-falcon-fal-c", removed: true, note: "gone" }],
         leaves: [falconLeaf("fal-a", { open: false }), falconLeaf("fal-c"), falconLeaf("fal-d")],
       }) },
-    { match: K.cleanup, handle: ok({ cleaned: [] }) },
   ]);
   const out = await runCampaign(baseArgs({
     taskSource: "bd-epic", bdEpic: "t-fal.1", doneWhen: "bd-epic-closed",
@@ -2621,28 +2660,31 @@ T("boundary merge: sprint 1 merged one leaf AND left one failed -> ONE s2-bounda
   assert.equal(routes.count(K.boundary), 1, "exactly one boundary child at the sprint-1/2 boundary");
   assert.equal(routes.count(/-bd-cleanup|-bd-cursor/), 0, "no separate cleanup or cursor child exists any more");
   const b = routes.spec(/^s2-boundary$/).spec.task;
-  assert.ok(b.includes("agile/falcon-fal-c") && b.includes("git worktree remove --force") && b.includes("git branch -D"), "janitor part names the leftover");
+  assert.ok(!/git worktree remove|git branch -D/.test(b), "K1: the boundary brief deletes nothing - the failed leaf's branch is kept");
   assert.ok(b.includes("bd list --parent t-fal.1") && b.includes("bd show"), "refresh part carries the exact bd commands");
-  assert.ok(out.res.log.some((l) => /boundary cleanup removed 1\/1 leftover/.test(l)), "janitor result logged: " + JSON.stringify(out.res.log));
+  assert.ok(!out.res.log.some((l) => /boundary cleanup/.test(l)), "no boundary cleanup is logged: " + JSON.stringify(out.res.log));
+  assert.ok(out.res.keptBranches.some((k) => k.branch === "agile/falcon-fal-c"), "the unmerged branch is kept for the lead: " + JSON.stringify(out.res.keptBranches));
+  assert.ok(!out.res.keptBranches.some((k) => k.branch === "agile/falcon-fal-a"), "the merged branch is integrated, not kept");
   assert.ok(out.res.log.some((l) => /snapshot refreshed \(2 open \/ 3 leaves\)/.test(l)), "refresh applied: " + JSON.stringify(out.res.log));
   assert.equal(out.res.tasks.find((r) => r.id === "fal-d").sprint, 2, "leaf that arrives with the refresh runs in sprint 2");
 });
 
-T("boundary child dies: sprint-2 janitor+refresh failure is logged, leftovers remain, campaign continues", async () => {
+T("boundary child dies at a snapshot refresh: failure is logged, sprint 2 runs on the previous snapshot, nothing is cleaned up", async () => {
   const routes = makeRuns([
-    { match: K.work, handle: ok(workOut({ completed: false })) },
+    { match: K.work, handle: async (spec, key) => ({ ok: true, structuredOutput: workOut({ completed: key.startsWith("s1") }) }) },
+    { match: K.review, handle: ok(reviewOk()) },
+    { match: K.merge, handle: ok(mergeOut()) },
     { match: K.boundary, handle: boom("transport down") },
-    { match: K.cleanup, handle: ok({ cleaned: [] }) },
   ]);
   const out = await runCampaign(baseArgs({
     taskSource: "bd-epic", bdEpic: "t-fal.1", doneWhen: "bd-epic-closed",
     sprintTasks: 1, maxSprints: 2,
-    bdTasks: [falconLeaf("fal-a")],
+    bdTasks: [falconLeaf("fal-a"), falconLeaf("fal-b")],
   }), routes, makeState());
   assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
-  assert.ok(out.res.log.some((l) => /sprint 2: boundary child failed .*leftovers remain/.test(l)), "failure logged with leftovers: " + JSON.stringify(out.res.log));
+  assert.ok(out.res.log.some((l) => /sprint 2: boundary child failed .*continuing on the previous snapshot/.test(l)), "failure logged: " + JSON.stringify(out.res.log));
   assert.equal(routes.count(/^s2-t1-work/), 1, "sprint 2 still runs from the previous snapshot");
-  assert.equal(routes.count(K.cleanup), 1, "campaign-end cleanup still sweeps the leftovers");
+  assert.equal(routes.count(K.cleanup), 0, "K1: no campaign-end cleanup child");
 });
 
 T("rotation: workModels round-robin glm->haiku->glm across tasks", async () => {

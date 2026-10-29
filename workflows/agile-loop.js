@@ -43,6 +43,8 @@
 //   reviewReserveMs (num, ms, default 1200000 = 20 min) last part of the budget that admits no NEW
 //                  work child: landed work still gets its review. Work that landed but was not reviewed
 //                  before the deadline is reported in return.needsReview ({id, title, branch})
+//                  Unmerged branches/worktrees are NEVER deleted by the engine (K1): they are
+//                  reported in return.keptBranches ({id, title, sprint, verdict, branch, worktree})
 //   maxPerModel    (num, default 2, cap 8) max LIVE children per model: the global
 //                  "<=2 live per model" rule as runtime enforcement at the two
 //                  scheduling points (work pool + post queue), so bursts of 429
@@ -745,7 +747,7 @@ const bundleScript = typeof args.bundleScript === "string" && args.bundleScript.
 // executor, the driver (goal-x / operator) owns bd writes and relaunches stages.
 // taskSource "curator" (default) = 1:1 legacy behavior. "bd-epic": discovery and
 // curator children are SKIPPED; tasks come from the leaf snapshot (args.bdTasks on
-// sprint 1, then ONE mechanical boundary child per sprint boundary (janitor + snapshot
+// sprint 1, then ONE mechanical boundary child per sprint boundary (snapshot
 // refresh: picks up mid-flight growth; bd-close is NOT a boundary duty anymore - each
 // MERGE child closes the leaf it just merged, best-effort; after the loop ONE post-loop
 // child closes whatever is still pending - unconfirmed closes - whatever the
@@ -1184,33 +1186,32 @@ function wtPathFor(t, rec) {
 function wtBaseName(t, rec) {
   return wtPathFor(t, rec).replace(/^\.\.[\\/]/, "");
 }
-const CLEANUP_SCHEMA = { type: "object", properties: { cleaned: { type: "array", items: { type: "object", properties: { branch: { type: "string" }, worktree: { type: "string" }, removed: { type: "boolean" }, note: { type: "string" } }, required: ["branch", "removed"] } } }, required: ["cleaned"] };
-const BOUNDARY_SCHEMA = { type: "object", properties: { cleaned: CLEANUP_SCHEMA.properties.cleaned, closed: { type: "array", items: { type: "object", properties: { id: { type: "string" }, closed: { type: "boolean" }, note: { type: "string" } }, required: ["id", "closed"], additionalProperties: false } }, leaves: CURSOR_SCHEMA.properties.leaves }, required: ["cleaned", "leaves"], additionalProperties: false };
+const BOUNDARY_SCHEMA = { type: "object", properties: { closed: { type: "array", items: { type: "object", properties: { id: { type: "string" }, closed: { type: "boolean" }, note: { type: "string" } }, required: ["id", "closed"], additionalProperties: false } }, leaves: CURSOR_SCHEMA.properties.leaves }, required: ["leaves"], additionalProperties: false };
 const ANALYTICS_SCHEMA = { type: "object", properties: { runid: { type: "string" }, skipped: { type: "boolean" }, reason: { type: "string" }, wallMs: {}, children: {}, totalTokens: {}, failureClasses: {}, summaryLine: { type: "string" }, files: { type: "array", items: { type: "string" } } }, required: ["runid", "summaryLine"] };
-function leftoverEntries(recs) {
-  // Executed-but-never-merged recs: their worktrees/branches are garbage by campaign
-  // semantics (the gates rejected the work; retries must start collision-free - a
-  // stale path makes the worker's STOP-on-collision contract fail the retry forever).
-  // needs-attention is NOT garbage (E2.1): the hold awaits the lead's decision - no
-  // drop without it. ANY attempt of a branch that landed as needs-attention protects
-  // the branch: neither the sprint boundary nor the final janitor may touch it, even
-  // if earlier attempts of the same branch failed their merge.
-  const held = {};
+function keptBranchEntries(recs) {
+  // K1: the engine NEVER deletes an unmerged branch or worktree (no sprint-boundary janitor,
+  // no final cleanup, no cleanup after failed/arbiter-failed/merge-failed/main-mutated). Every
+  // branch that did not merge is handed to the lead in return.keptBranches. A branch with ANY
+  // merged attempt is integrated (not kept); a branch whose LAST attempt was dropped is gone
+  // (the explicit drop-branch decision of the calling side). Otherwise the last attempt's
+  // verdict is reported (needs-attention holds, unknown = unreviewed, failed, merge-failed...).
+  const merged = {};
   (recs || []).forEach(function (r) {
-    if (r && r.branch && r.verdict === "needs-attention") held[String(r.branch)] = true;
+    if (r && r.branch && (r.verdict === "merged" || r.verdict === "merged-after-arbitration")) merged[String(r.branch)] = true;
   });
-  const seen = {};
-  const out = [];
+  const last = {};
+  const order = [];
   (recs || []).forEach(function (r) {
     if (!r || !r.branch || !r.wt) return;
     const b = String(r.branch);
-    if (held[b]) return;
-    if (r.verdict === "merged" || r.verdict === "merged-after-arbitration" || r.verdict === "unknown") return;
-    if (seen[b]) return;
-    seen[b] = true;
-    out.push({ branch: b, worktree: r.wt });
+    if (merged[b]) return;
+    if (!Object.prototype.hasOwnProperty.call(last, b)) order.push(b);
+    last[b] = r;
   });
-  return out;
+  return order.filter(function (b) { return last[b].verdict !== "dropped"; }).map(function (b) {
+    const r = last[b];
+    return { id: String(r.id || ""), title: String(r.title || ""), sprint: r.sprint, verdict: String(r.verdict || "unknown"), branch: b, worktree: String(r.wt) };
+  });
 }
 // bd-epic auto-close: leaves carrying a FINAL done verdict of THIS campaign -
 // merged/merged-after-arbitration (merge commit recorded by the merger). Everything else
@@ -1226,20 +1227,6 @@ function bdCloseEntries(recs) {
   });
   return out;
 }
-function cleanupBrief(entries) {
-  return [
-    "You are the CLEANUP CREW - a mechanical janitor, NOT a reviewer. Remove LEFTOVER worktrees and branches of tasks that were executed but NEVER merged: the campaign gates rejected that work, and stale paths make any retry fail its STOP-on-collision contract.",
-    "For EACH entry below run BOTH commands from the MAIN working copy, piped stdin, WITHOUT `|| true` - a failed git command must SURFACE in the report, never be swallowed:",
-    "   git worktree remove --force \"<worktree>\"",
-    "   git branch -D \"<branch>\"",
-    "Interpret each failure honestly: 'not a working tree' / 'not found' style error = the target is ALREADY GONE - fine, report removed=false with that reason in note; ANY OTHER failure (locked, permission, hook) = report removed=false with the FULL error text in note - do NOT retry and never swallow the error.",
-    "NEVER touch the main working copy contents, the integration branch, or anything NOT listed here. Do NOT run tests, do NOT inspect diffs, do NOT create or commit anything.",
-    "ENTRIES:",
-    entries.map(function (e) { return "- branch " + JSON.stringify(e.branch) + ", worktree " + JSON.stringify(e.worktree); }).join("\n"),
-    FACTS, FINAL_MSG,
-    "Schema keys: cleaned[{branch, worktree, removed (boolean), note}]."
-  ].join("\n");
-}
 function analyticsBrief() {
   return [
     "You are the CAMPAIGN ANALYTICS archiver - a mechanical script-runner, NOT a reviewer. The campaign is over; preserve its evidence next to the sprint journal (the runtime copies in the pi-subagents temp root are retention-ephemeral - without this copy past campaigns are unreanalyzable).",
@@ -1252,24 +1239,14 @@ function analyticsBrief() {
     "Schema keys: runid, skipped, reason, wallMs, children, totalTokens, failureClasses, summaryLine, files[]."
   ].join("\n");
 }
-// ONE boundary child per sprint boundary (bd-epic): PART 1 janitors the previous sprint's
-// never-merged leftovers, PART 3 refreshes the bd snapshot only when it can have changed.
-// PART 2 (bd-close) now fires ONLY through the post-loop child: at a sprint boundary
+// ONE boundary child per sprint boundary (bd-epic): PART 2 refreshes the bd snapshot only
+// when it can have changed. The boundary child deletes NOTHING (K1: unmerged work is kept for
+// the lead). PART 1 (bd-close) now fires ONLY through the post-loop child: at a sprint boundary
 // `closables` is never passed - the close moved into the MERGE child (perf: boundary
 // children burned 1.5-4 min per boundary on it).
-function boundaryBrief(entries, refresh, closables) {
-  const janitor = entries.length ? [
-    "PART 1 - JANITOR. Remove LEFTOVER worktrees and branches of tasks that were executed but NEVER merged: the campaign gates rejected that work, and stale paths make the retry fail its STOP-on-collision contract.",
-    "For EACH entry below run BOTH commands from the MAIN working copy, piped stdin, WITHOUT `|| true` - a failed git command must SURFACE in the report, never be swallowed:",
-    "   git worktree remove --force \"<worktree>\"",
-    "   git branch -D \"<branch>\"",
-    "Interpret each failure honestly: 'not a working tree' / 'not found' style error = the target is ALREADY GONE - fine, report removed=false with that reason in note; ANY OTHER failure (locked, permission, hook) = report removed=false with the FULL error text in note - do NOT retry and never swallow the error.",
-    "NEVER touch the main working copy contents, the integration branch, or anything NOT listed here. Do NOT inspect diffs, do NOT run tests, do NOT create or commit anything.",
-    "ENTRIES:",
-    entries.map(function (e) { return "- branch " + JSON.stringify(e.branch) + ", worktree " + JSON.stringify(e.worktree); }).join("\n")
-  ] : ["PART 1 - JANITOR: no leftovers at this boundary - cleaned=[]."];
+function boundaryBrief(refresh, closables) {
   const bdClose = (closables || []).length ? [
-    "PART 2 - BD CLOSE (mechanical bookkeeping, NOT a judgment call): the leaves below carry a FINAL done verdict from this campaign (merged / merged-after-arbitration) but bd may still show them open - close EACH of them so bd catches up with the merges (a headless campaign must reach bd-epic-closed on its own).",
+    "PART 1 - BD CLOSE (mechanical bookkeeping, NOT a judgment call): the leaves below carry a FINAL done verdict from this campaign (merged / merged-after-arbitration) but bd may still show them open - close EACH of them so bd catches up with the merges (a headless campaign must reach bd-epic-closed on its own).",
     "Run each command line below from the MAIN working copy, piped stdin, VERBATIM (the grep pre-check skips an already-closed leaf without error - a driver's close is never overwritten):",
     ...closables.map(function (e) {
       return "  bd show " + e.id + " --json </dev/null | grep -q '\"status\": *\"closed\"' || bd close " + e.id + " -r \"" + e.id + ": merge " + (e.commit || "no-commit") + " - " + e.verdict + "\" </dev/null";
@@ -1284,7 +1261,7 @@ function boundaryBrief(entries, refresh, closables) {
     "Report each listed leaf: closed=true ONLY when the leaf is closed in bd and (tracked export commit landed clean OR note identifies export=stealth); false otherwise, with the reason in note."
   ] : [];
   const snapshot = refresh ? [
-    "PART 3 - BD SNAPSHOT (read-only). Report EVERY leaf of bd epic " + JSON.stringify(bdEpic) + " (children with no children of their own).",
+    "PART 2 - BD SNAPSHOT (read-only). Report EVERY leaf of bd epic " + JSON.stringify(bdEpic) + " (children with no children of their own).",
     "Run these commands with piped stdin (read-only; do NOT create, close or modify anything in bd):",
     "  (a) bd list --parent " + bdEpic + " --all -n 0 --json </dev/null   - the epic's children (JSON array: id, title, status)",
     "  (b) bd show <ALL child ids from (a), space-separated> --json </dev/null   - ONE call, JSON array with description and dependencies[]",
@@ -1298,14 +1275,13 @@ function boundaryBrief(entries, refresh, closables) {
     "  deps = ids of dependencies[] entries whose dependency_type is \"blocks\" (parent-child entries are NOT deps), [] if none;",
     "  review = the tier word full|lite|none that the description states for the task; missing or unknown -> \"full\".",
     "Return only leaves shown by (a)-(c); NEVER invent ids."
-  ] : ["PART 3 - BD SNAPSHOT: NOT requested at this boundary (the snapshot did not change) - run NO bd command; leaves=[]."];
+  ] : ["PART 2 - BD SNAPSHOT: NOT requested at this boundary (the snapshot did not change) - run NO bd command; leaves=[]."];
   return [
-    "You are the SPRINT BOUNDARY crew - ONE mechanical child, NOT a planner and NOT an implementer. Do exactly the parts below and nothing else.",
-    ...janitor,
+    "You are the SPRINT BOUNDARY crew - ONE mechanical child, NOT a planner and NOT an implementer. Do exactly the parts below and nothing else. Do NOT remove any worktree or branch.",
     ...bdClose,
     ...snapshot,
     FINAL_MSG,
-    "Schema keys: cleaned[{branch, worktree, removed (boolean), note}], closed[{id, closed (boolean), note}] (omit when there is no BD CLOSE section), leaves[{id, title, rationale, acceptance, files_hint, measure, deps, open, review}]."
+    "Schema keys: closed[{id, closed (boolean), note}] (omit when there is no BD CLOSE section), leaves[{id, title, rationale, acceptance, files_hint, measure, deps, open, review}]."
   ].join("\n");
 }
 function salvageReport(ctx, fromLabel) {
@@ -1683,11 +1659,11 @@ function postPhase(t, rec, wOut, parallel) {
             // ceremony's own rejection - a fresh review child would only re-reject it
             // and burn a review round (and the arbiter ladder) on a doomed candidate.
             // Verdict failed WITHOUT a review child; the campaign moves on and the
-            // branch goes to the boundary janitor.
+            // branch is kept for the lead (K1).
             if (!repOut || repOut.completed !== true) {
               rec.verdict = "failed";
               rec.stop = "ledger repair: completed=false";
-              log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": ledger repair completed=" + String((repOut || {}).completed) + " - rejected work is not reviewed, verdict failed (branch " + slug + " left for cleanup)");
+              log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": ledger repair completed=" + String((repOut || {}).completed) + " - rejected work is not reviewed, verdict failed (branch " + slug + " kept for the lead, K1)");
               return Promise.resolve();
             }
             return reviewRound(0, "", repOut);
@@ -1696,7 +1672,7 @@ function postPhase(t, rec, wOut, parallel) {
         // E2.1: no drop without an explicit lead decision. The arbiter's fallback answer
         // (supervisor unreachable) and a repeated one-more-round (max one arbiter fix
         // round) HOLD the branch as needs-attention - the branch stays for manual review
-        // and no janitor touches it (leftoverEntries).
+        // and the engine never deletes it (K1).
         if (decision === "needs-attention") {
           rec.verdict = "needs-attention";
           rec.stop = "arbitration: held for the lead (no drop without an explicit decision)";
@@ -1780,7 +1756,7 @@ function postPhase(t, rec, wOut, parallel) {
     if (preMismatch) {
       rec.verdict = "failed";
       rec.stop = "contract pre-check: " + preMismatch;
-      log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": contract pre-check mismatch (" + preMismatch + ") - review child skipped, verdict failed (branch " + slug + " left for cleanup)");
+      log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": contract pre-check mismatch (" + preMismatch + ") - review child skipped, verdict failed (branch " + slug + " kept for the lead, K1)");
       return Promise.resolve();
     }
     const revLines = [
@@ -1833,7 +1809,7 @@ function postPhase(t, rec, wOut, parallel) {
           rec.verdict = "failed";
           rec.failClass = "review-schema-miss";
           rec.stop = "review-schema-miss: reviewer produced no structured_output after one re-run";
-          log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": review-schema-miss after one re-run - no rework, verdict failed (branch " + slug + " left for cleanup)");
+          log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": review-schema-miss after one re-run - no rework, verdict failed (branch " + slug + " kept for the lead, K1)");
           return Promise.resolve();
         }
         // reviewer child failed after retries -> synthesize not-approved, same flow
@@ -1893,11 +1869,11 @@ function postPhase(t, rec, wOut, parallel) {
         // Same rule as postPhase: a completed=false rework report is the worker's own
         // rejection - a fresh review child would only re-reject it and burn the
         // arbiter/drop ladder. Verdict failed WITHOUT a review child; the campaign
-        // moves on and the branch goes to the boundary janitor.
+        // moves on and the branch is kept for the lead (K1).
         if (!o2 || o2.completed !== true) {
           rec.verdict = "failed";
           rec.stop = "rework " + (r + 1) + ": completed=false";
-          log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": rework " + (r + 1) + " completed=" + String((o2 || {}).completed) + " - rejected work is not reviewed, verdict failed (branch " + slug + " left for cleanup)");
+          log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": rework " + (r + 1) + " completed=" + String((o2 || {}).completed) + " - rejected work is not reviewed, verdict failed (branch " + slug + " kept for the lead, K1)");
           return Promise.resolve();
         }
         return reviewRound(r + 1, notes, o2);
@@ -1912,7 +1888,7 @@ function postPhase(t, rec, wOut, parallel) {
           // a review child (same rule as the completed=false gates above).
           rec.verdict = "failed";
           rec.stop = "rework " + (r + 1) + ": acceptance-rejected (report-repair already used)";
-          log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": rework " + (r + 1) + " rejected by acceptance after report-repair was already used - rejected work is not reviewed, verdict failed (branch " + slug + " left for cleanup)");
+          log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": rework " + (r + 1) + " rejected by acceptance after report-repair was already used - rejected work is not reviewed, verdict failed (branch " + slug + " kept for the lead, K1)");
           return Promise.resolve();
         }
         return salvageReport({ t: t, rec: rec, slug: slug, wt: wt, parallel: parallel, testCommand: testCommand, testCommandQuick: testCommandQuick, useLedger: useLedger, sprint: sprint }, "rework" + (r + 1)).then(function (o3) {
@@ -1922,7 +1898,7 @@ function postPhase(t, rec, wOut, parallel) {
           if (!o3 || o3.completed !== true) {
             rec.verdict = "failed";
             rec.stop = "rework " + (r + 1) + ": report-repair completed=false";
-            log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": rework " + (r + 1) + " report-repair completed=" + String((o3 || {}).completed) + " - rejected work is not reviewed, verdict failed (branch " + slug + " left for cleanup)");
+            log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": rework " + (r + 1) + " report-repair completed=" + String((o3 || {}).completed) + " - rejected work is not reviewed, verdict failed (branch " + slug + " kept for the lead, K1)");
             return Promise.resolve();
           }
           if (o3.head) rec.head = String(o3.head); // re-review verifies the (unchanged) branch head
@@ -1935,13 +1911,13 @@ function postPhase(t, rec, wOut, parallel) {
   // a failed work/rework/repair round) marks a doomed candidate - eager review would
   // only burn a review child (and the rework ladder) on the worker's own rejection.
   // Verdict failed WITHOUT a review child; the campaign moves on and the branch goes
-  // to the boundary janitor. (rp-schema: every validated report carries a 40-hex head,
+  // to the lead, never deleted (K1). (rp-schema: every validated report carries a 40-hex head,
   // so the rec.head below is always fresh; the no-head-reported merge gate stays as
   // defense-in-depth only.)
   if (!wOut || wOut.completed !== true) {
     rec.verdict = "failed";
     rec.stop = "work: completed=false";
-    log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": work completed=" + String((wOut || {}).completed) + " - rejected work is not reviewed, verdict failed (branch " + slug + " left for cleanup)");
+    log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": work completed=" + String((wOut || {}).completed) + " - rejected work is not reviewed, verdict failed (branch " + slug + " kept for the lead, K1)");
     return Promise.resolve();
   }
   return reviewRound(0, "", wOut);
@@ -2092,31 +2068,24 @@ while (sprint < maxSprints && continueCampaign && !stopReason) {
     // The snapshot changes only through this campaign's merges (driver closes follow merges),
     // so after a completed sprint with 0 merged leaves the previous snapshot is reused and no
     // refresh runs. An empty snapshot (launch or failed refresh) always refreshes.
-    // ONE boundary child serves both jobs: the janitor for the previous sprint's never-merged
-    // leftovers (they must be gone before this sprint's retries start) and, when the snapshot
-    // can have changed, the mechanical refresh that picks up mid-flight growth.
+    // ONE boundary child serves the mechanical snapshot refresh when the snapshot can have changed.
     const prevMerged = taskResults.filter(function (r) {
       return r.sprint === sprint - 1 && (r.verdict === "merged" || r.verdict === "merged-after-arbitration");
     }).length;
     const refresh = bdSnapshot.length === 0 || (sprint > 1 && prevMerged > 0);
-    const prevLeft = leftoverEntries(taskResults.filter(function (r) { return r.sprint === sprint - 1; }));
     // bd-close is NOT a boundary duty anymore (perf: it burned 1.5-4 min per boundary):
-    // each MERGE child closes the leaf it just merged (best-effort); the boundary child
-    // is janitor + cursor only. Sprints without merges and without leftovers still skip it.
-    if (refresh || prevLeft.length) {
+    // each MERGE child closes the leaf it just merged (best-effort); the boundary child is
+    // cursor only (K1: it never deletes leftovers). Sprints without a snapshot change skip it.
+    if (refresh) {
       try {
-        const bd = await runChild("s" + sprint + "-boundary", childOpts({ task: boundaryBrief(prevLeft, refresh), outputSchema: BOUNDARY_SCHEMA, acceptance: false }));
+        const bd = await runChild("s" + sprint + "-boundary", childOpts({ task: boundaryBrief(refresh), outputSchema: BOUNDARY_SCHEMA, acceptance: false }));
         const bo = outOf(bd);
-        if (prevLeft.length) {
-          const cleanedN = (bo.cleaned || []).filter(function (c) { return c.removed === true; }).length;
-          log.push("sprint " + sprint + ": boundary cleanup removed " + cleanedN + "/" + prevLeft.length + " leftover(s)");
-        }
         if (refresh && Array.isArray(bo.leaves) && bo.leaves.length) {
           bdSnapshot = bo.leaves.map(normalizeLeaf);
           log.push("bd-cursor: snapshot refreshed (" + bdSnapshot.filter(function (l) { return l.open; }).length + " open / " + bdSnapshot.length + " leaves)");
         }
       } catch (e) {
-        log.push("sprint " + sprint + ": boundary child failed (" + String(e).slice(0, 120) + ")" + (refresh ? "; continuing on the previous snapshot" : "") + (prevLeft.length ? "; leftovers remain" : ""));
+        log.push("sprint " + sprint + ": boundary child failed (" + String(e).slice(0, 120) + ")" + (refresh ? "; continuing on the previous snapshot" : ""));
       }
     }
     if (refresh) {
@@ -2358,7 +2327,6 @@ while (sprint < maxSprints && continueCampaign && !stopReason) {
   // decision belongs to doneWhen/maxSprints/budget - an LLM retro must not veto a
   // stage that bd still shows open.
   if (taskSource === "bd-epic") {
-    // Leftover janitor runs in the next sprint's boundary child (top of the loop).
     log.push("sprint " + sprint + ": retro skipped (bd-epic: stopping owned by doneWhen/maxSprints/budget)");
   } else if (!stopReason) { // budget stop: no retro child spends the reserve
   const retroLines = [
@@ -2402,7 +2370,7 @@ if (taskSource === "bd-epic") {
   const finalClosables = bdCloseEntries(taskResults).filter(function (e) { return !bdClosedIds.has(e.id); });
   if (finalClosables.length) {
     try {
-      const fb = await runChild("final-bd-close", childOpts({ task: boundaryBrief([], false, finalClosables), outputSchema: BOUNDARY_SCHEMA, acceptance: false }));
+      const fb = await runChild("final-bd-close", childOpts({ task: boundaryBrief(false, finalClosables), outputSchema: BOUNDARY_SCHEMA, acceptance: false }));
       const fbClosed = (outOf(fb).closed || []).filter(function (c) { return c && c.closed === true; }).length;
       log.push("post-loop: bd-close closed " + fbClosed + "/" + finalClosables.length + " done leaf(s) in bd" + (fbClosed < finalClosables.length ? " (rest stays open in bd)" : ""));
     } catch (e) {
@@ -2428,19 +2396,10 @@ if (taskSource === "bd-epic" && doneWhen === "bd-epic-closed" && stopReason === 
     log.push("post-loop: bd epic-close failed (" + String(e).slice(0, 120) + ")");
   }
 }
-// Final cleanup (ALL modes): no leftover worktrees/branches of never-merged work.
-// Best-effort by design - a cleanup failure must not corrupt the campaign result.
-const finalLeft = leftoverEntries(taskResults);
-if (finalLeft.length) {
-  try {
-    const cm = nextWorkModel();
-    const fcl = await runChild("final-cleanup", childOpts(Object.assign({ task: cleanupBrief(finalLeft), outputSchema: CLEANUP_SCHEMA, acceptance: false }, cm ? { model: cm } : {}), "work"));
-    const fn2 = (outOf(fcl).cleaned || []).filter(function (c) { return c.removed === true; }).length;
-    log.push("final cleanup: removed " + fn2 + "/" + finalLeft.length + " leftover worktree(s)/branch(es)");
-  } catch (e) {
-    log.push("final cleanup failed (" + String(e).slice(0, 120) + "); leftovers remain");
-  }
-}
+// K1: NO final cleanup. Unmerged branches and worktrees are never deleted by the engine; they
+// are handed to the lead in return.keptBranches (the lead decides what to remove).
+const keptBranches = keptBranchEntries(taskResults.concat(workLanded));
+if (keptBranches.length) log.push("требует решения ведущего: " + keptBranches.length + " unmerged branch(es) NOT removed by the engine (return.keptBranches)");
 // Campaign analytics (auto, best-effort, ALL modes): one mechanical child archives the runtime
 // artifacts next to the journal and computes metrics.json + retro markdown (wall clock, failure
 // classes, tokens). Evidence, never a gate: a failure is logged and the campaign result stands.
@@ -2526,6 +2485,7 @@ return {
   mainIncidents: mainIncidents,
   needsAttention: needsAttention,
   needsReview: needsReview,
+  keptBranches: keptBranches,
   log: log
 };
 
