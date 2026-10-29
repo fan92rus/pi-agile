@@ -3954,3 +3954,55 @@ T("mergeBranch gate failure keeps the resume: retry with the same approvedSha co
     assert.equal(fsSync.existsSync(statePath), false, "resume state is deleted after the merge commit");
   } finally { fsSync.rmSync(fx.root, { recursive: true, force: true }); }
 });
+
+// --- E0.2: known flakes in the gate (only the named flakes are retried) -----------------------
+// Fixture: a node test file whose named tests fail on their FIRST run only (marker file), so a
+// retry turns them green. Returns the gate command the way the project runs node tests.
+// A "bystander" passes on its first run and fails on every later run: only a TARGETED rerun
+// (one that skips it) can turn the gate green.
+function flakeGateCommand(fx, names) {
+  const file = pathMod.join(fx.root, "flaky-gate.test.mjs");
+  const tests = names.map((name, i) => {
+    const marker = JSON.stringify(pathMod.join(fx.root, `marker-${i}`));
+    return `test(${JSON.stringify(name)}, () => { if (!fs.existsSync(${marker})) { fs.writeFileSync(${marker}, "1"); throw new Error("first run"); } });`;
+  });
+  const bystander = JSON.stringify(pathMod.join(fx.root, "bystander"));
+  tests.push(`test("bystander", () => { if (fs.existsSync(${bystander})) throw new Error("re-run"); fs.writeFileSync(${bystander}, "1"); });`);
+  fsSync.writeFileSync(file, `import { test } from "node:test";\nimport fs from "node:fs";\n${tests.join("\n")}\n`);
+  return `"${process.execPath}" --test "${file}"`;
+}
+// node --test exports NODE_TEST_CONTEXT to the tests it runs: a gate `node --test` spawned from
+// inside a test then prints no TAP and exits 0 without running anything, so the fixture gates
+// run with it removed (restored right after).
+async function withoutNodeTestContext(fn) {
+  const saved = process.env.NODE_TEST_CONTEXT;
+  delete process.env.NODE_TEST_CONTEXT;
+  try { return await fn(); } finally { if (saved !== undefined) process.env.NODE_TEST_CONTEXT = saved; }
+}
+
+T("E0.2 known flake: gate red only on a --known-flakes name, targeted retry green -> merged and flakeRetried names it", async () => {
+  const fx = gateFixture("merge-known-flake-");
+  try {
+    const journal = pathMod.join(fx.root, "journal.jsonl");
+    const result = await withoutNodeTestContext(() => mergeBranch({ mainDir: fx.main, mainBranch: "main", worktree: fx.wt, branch: "worker", approvedSha: fx.approvedSha, testCommand: flakeGateCommand(fx, ["known flake"]), knownFlakes: "^known flake$", journalFile: journal }));
+    assert.equal(result.status, 0); assert.equal(result.data.merged, true);
+    assert.deepEqual(result.data.flakeRetried, ["known flake"]);
+    assert.deepEqual(JSON.parse(fsSync.readFileSync(journal, "utf8").trim()).flakeRetried, ["known flake"], "journal records the retried flake");
+  } finally { fsSync.rmSync(fx.root, { recursive: true, force: true }); }
+});
+
+T("E0.2 unlisted failure: one failing name outside --known-flakes refuses the merge with reset --hard, even if it would pass on retry", async () => {
+  const fx = gateFixture("merge-unlisted-flake-");
+  const git = (cwd, ...args) => {
+    const r = spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(r.status, 0, `git ${args.join(" ")}: ${r.stderr}`); return r.stdout.trim();
+  };
+  try {
+    const mainBefore = git(fx.main, "rev-parse", "HEAD");
+    const journal = pathMod.join(fx.root, "journal.jsonl");
+    await assert.rejects(withoutNodeTestContext(() => mergeBranch({ mainDir: fx.main, mainBranch: "main", worktree: fx.wt, branch: "worker", approvedSha: fx.approvedSha, testCommand: flakeGateCommand(fx, ["known flake", "unlisted regression"]), knownFlakes: "^known flake$", journalFile: journal })), /testCommand failed/);
+    assert.equal(git(fx.main, "rev-parse", "HEAD"), mainBefore, "integration HEAD untouched");
+    assert.equal(git(fx.main, "status", "--porcelain"), "", "reset --hard cleared the squash");
+    assert.equal(fsSync.existsSync(journal), false, "a refused merge writes no journal entry");
+  } finally { fsSync.rmSync(fx.root, { recursive: true, force: true }); }
+});

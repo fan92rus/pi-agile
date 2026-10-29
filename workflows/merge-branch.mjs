@@ -37,6 +37,55 @@ function parseArgs(argv) {
 }
 function output(status, data) { process.stdout.write(JSON.stringify(data) + "\n"); process.exitCode = status; }
 
+// Known flakes (--known-flakes REGEX): a red gate is retried only when EVERY failing test name
+// matches. Names come from TAP (node --test prints TAP when stdout is piped): a failing test is
+// "not ok N - NAME" followed by a YAML block; a suite whose subtests failed carries
+// failureType 'subtestsFailed' and is not a failing test itself.
+function failedTestNames(output) {
+  const lines = output.split(/\r?\n/);
+  const names = [];
+  lines.forEach((line, i) => {
+    const m = /^(\s*)not ok \d+ - (.*)$/.exec(line);
+    if (!m) return;
+    const yamlEnd = `${m[1]}  ...`;
+    let suiteFailure = false;
+    for (let j = i + 1; j < lines.length && lines[j] !== yamlEnd && !/^\s*(not )?ok \d+ - /.test(lines[j]); j++) {
+      if (lines[j].includes("failureType: 'subtestsFailed'")) suiteFailure = true;
+    }
+    if (!suiteFailure) names.push(m[2]);
+  });
+  return [...new Set(names)];
+}
+function passedTestNames(output) {
+  return output.split(/\r?\n/).map((line) => /^\s*ok \d+ - (.*)$/.exec(line)?.[1]).filter(Boolean);
+}
+// node --test reads --test-name-pattern only BEFORE its file list (after it, every test runs).
+// A non-node gate has no per-test rerun: it is repeated whole (null here).
+function nodeNamePatternCommand(testCommand, names) {
+  const re = /\bnode(?:\.exe)?"?\s+--test(?=\s|$)/;
+  if (!re.test(testCommand)) return null;
+  const pattern = names.map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  return testCommand.replace(re, (m) => `${m} --test-name-pattern="${pattern}"`);
+}
+// Runs the suite gate. A red gate whose failing tests ALL match knownFlakes gets one retry:
+// targeted (node runner: only those tests) or a full repeat of the gate. Returns the final
+// result and the retried names (empty unless the retry is green).
+function runGate(testCommand, cwd, knownFlakes) {
+  const opts = { cwd, shell: true, env: gateEnv() };
+  const first = run(testCommand, [], opts);
+  if (first.status === 0 || !knownFlakes) return { suite: first, flakeRetried: [] };
+  const failed = failedTestNames(`${first.stdout}\n${first.stderr}`);
+  if (!failed.length || !failed.every((name) => knownFlakes.test(name))) return { suite: first, flakeRetried: [] };
+  const targeted = nodeNamePatternCommand(testCommand, failed);
+  const retry = run(targeted ?? testCommand, [], opts);
+  // A targeted rerun that matches no test exits 0 without running anything: green only when
+  // every named flake actually passed.
+  if (retry.status === 0 && targeted !== null && !failed.every((name) => passedTestNames(`${retry.stdout}\n${retry.stderr}`).includes(name))) {
+    return { suite: { ...retry, status: 1, stderr: `targeted rerun did not run: ${failed.join(", ")}` }, flakeRetried: [] };
+  }
+  return { suite: retry, flakeRetried: retry.status === 0 ? failed : [] };
+}
+
 export async function mergeBranch(options) {
   const main = path.resolve(options.mainDir || process.cwd());
   const worktree = path.resolve(options.worktree || "");
@@ -44,6 +93,8 @@ export async function mergeBranch(options) {
   const mainBranch = options.mainBranch || git(main, ["branch", "--show-current"]).stdout.trim();
   const approvedSha = options.approvedSha;
   if (!worktree || !branch || !mainBranch || !approvedSha || !options.testCommand) throw new Error("required: --worktree --branch --approved-sha --test-command (integration branch must be checked out)");
+  // Compiled before the squash: an invalid regex must not leave a staged squash behind.
+  const knownFlakes = options.knownFlakes ? new RegExp(options.knownFlakes) : null;
   // Only the tracked bd export is an allowed pre-flight dirt exception.
   const dirty = git(main, ["status", "--porcelain", "--untracked-files=no"]).stdout.trim().split("\n").filter(Boolean);
   if (dirty.length) {
@@ -141,7 +192,7 @@ export async function mergeBranch(options) {
       git(main, ["add", options.sddFile]);
     }
   }
-  const suite = run(options.testCommand, [], { cwd: main, shell: true, env: gateEnv() });
+  const { suite, flakeRetried } = runGate(options.testCommand, main, knownFlakes);
   if (suite.status !== 0) { git(main, ["reset", "--hard", "HEAD"]); throw new Error(`testCommand failed (${suite.status}): ${suite.stderr || suite.stdout}`); }
   git(main, ["commit", "-m", options.message || `feat: ${branch}`]);
   const mergeCommit = git(main, ["rev-parse", "HEAD"]).stdout.trim();
@@ -152,7 +203,7 @@ export async function mergeBranch(options) {
   if (options.journalFile) {
     const journal = path.resolve(main, options.journalFile);
     fs.mkdirSync(path.dirname(journal), { recursive: true });
-    fs.appendFileSync(journal, JSON.stringify({ task: options.taskTitle || branch, verdict: "merged", branch, head: approvedSha, note: "deterministic CLI merge" }) + "\n");
+    fs.appendFileSync(journal, JSON.stringify({ task: options.taskTitle || branch, verdict: "merged", branch, head: approvedSha, note: "deterministic CLI merge", ...(flakeRetried.length ? { flakeRetried } : {}) }) + "\n");
     journalWritten = true;
   }
   let bdClosed = false;
@@ -185,15 +236,15 @@ export async function mergeBranch(options) {
     } catch { bdClosed = false; }
   }
   git(main, ["worktree", "remove", worktree]);
-  return { status: 0, data: { merged: true, checksOk: true, journalWritten, mergeCommit, bdClosed, phantomDirtCleared, note: "" } };
+  return { status: 0, data: { merged: true, checksOk: true, journalWritten, mergeCommit, bdClosed, phantomDirtCleared, flakeRetried, note: "" } };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
   try {
     const args = parseArgs(process.argv.slice(2));
-    if (args.help) { console.log("merge-branch --main-dir DIR --main-branch NAME --worktree DIR --branch NAME --approved-sha SHA --test-command COMMAND [--bd-leaf ID]"); }
+    if (args.help) { console.log("merge-branch --main-dir DIR --main-branch NAME --worktree DIR --branch NAME --approved-sha SHA --test-command COMMAND [--bd-leaf ID] [--known-flakes REGEX]"); }
     else {
-      const result = await mergeBranch({ mainDir: args["main-dir"], mainBranch: args["main-branch"], worktree: args.worktree, branch: args.branch, approvedSha: args["approved-sha"], testCommand: args["test-command"], bdLeaf: args["bd-leaf"], message: args.message, journalFile: args["journal-file"], taskTitle: args["task-title"], sddFile: args["sdd-file"], sddItem: args["sdd-item"] });
+      const result = await mergeBranch({ mainDir: args["main-dir"], mainBranch: args["main-branch"], worktree: args.worktree, branch: args.branch, approvedSha: args["approved-sha"], testCommand: args["test-command"], bdLeaf: args["bd-leaf"], message: args.message, journalFile: args["journal-file"], taskTitle: args["task-title"], sddFile: args["sdd-file"], sddItem: args["sdd-item"], knownFlakes: args["known-flakes"] });
       output(result.status, result.data);
     }
   } catch (error) { output(1, { error: error.message }); }
