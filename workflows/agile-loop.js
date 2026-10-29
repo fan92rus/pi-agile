@@ -186,6 +186,25 @@ function nextReviewModel(avoid) {
   log.push("cross-model degraded: reviewer on '" + cand + "' (every review model is cooling or tripped)");
   return cand;
 }
+// ARBITER pool (E1.2): the union of workModels and reviewModels, de-duplicated (reviewModels
+// first). Preference: a model that is NOT the author's (avoid = rec.wm) and healthy (neither
+// tripped nor cooling); the author's model only when nothing else is left (it is never refused);
+// unhealthy models last. `tried` holds the models already used by this arbitration: a 403/429
+// or an unusable answer walks to the next pool model. Returns undefined when the pool is empty or exhausted.
+function arbiterPick(avoid, tried) {
+  const seen = Object.create(null);
+  const pool = [];
+  reviewModels.concat(workModels).forEach(function (m) {
+    if (m && !seen[m]) { seen[m] = true; pool.push(m); }
+  });
+  let best, bestRank = Infinity;
+  pool.forEach(function (m) {
+    if (tried[m]) return;
+    const rank = (m === avoid ? 1 : 0) + (tripped(m) || cooling(m) ? 2 : 0);
+    if (rank < bestRank) { best = m; bestRank = rank; }
+  });
+  return best;
+}
 // SDD task-engine: unset = auto (setup child classifies), true = force, false = legacy
 const sddOverride = args.sdd === true ? "on" : args.sdd === false ? "off" : "auto";
 const sddDir = String(args.sddDir || ".ai/sdd");
@@ -1579,7 +1598,9 @@ function postPhase(t, rec, wOut, parallel) {
       log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": merger failed (" + msg + ")");
     });
   }
-  function doArbitrate(reworkNotes, curWOut) {
+  function doArbitrate(reworkNotes, curWOut, tried, n) {
+    tried = tried || Object.create(null); // E1.2: arbiter pool models already used by this arbitration
+    n = n || 0;
     // Decision-only: the arbiter child NEVER mutates git. merge-as-is/drop-branch are
     // applied by the ORCHESTRATOR through the shared mergeChain (single main-writer,
     // same queue as ordinary merges); one-more-round becomes an orchestrator-driven
@@ -1597,16 +1618,34 @@ function postPhase(t, rec, wOut, parallel) {
       "", GIT_RULES, CMDS, FACTS, FINAL_MSG,
       "Schema keys: decision (merge-as-is | drop-branch | one-more-round | escalate-ledger), note (= the caller's decision + 1 line why)."
     ].filter(Boolean).join("\n");
+    // Pool walk (arbiterPick): a 403/429 or an unusable answer moves to the next pool model;
+    // pool exhausted -> arbiter-failed.
+    function arbiterRetry(why, stop) {
+      if (arbiterPick(rec.wm, tried) === undefined) {
+        rec.verdict = "arbiter-failed";
+        rec.stop = stop;
+        log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": arbiter " + why + " - pool exhausted, branch " + slug + " left for manual review");
+        return Promise.resolve();
+      }
+      log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": arbiter " + why + " - retrying on the next pool model");
+      return doArbitrate(reworkNotes, curWOut, tried, n + 1);
+    }
+    const avm = arbiterPick(rec.wm, tried);
+    if (avm !== undefined) tried[avm] = true;
     const arbSpec = { task: arbLines, outputSchema: ARB_SCHEMA };
-    const avm = nextReviewModel(rec.wm);
     if (avm) arbSpec.model = avm;
-    return runChild(taskKey(t, "arbiter"), childOpts(arbSpec, "review")).then(
+    if (avm && avm === rec.wm) log.push("cross-model degraded: arbiter on '" + avm + "' (the author's model - no other arbiter candidate available)");
+    return runChild(taskKey(t, n === 0 ? "arbiter" : "p" + (n + 1) + "-arbiter"), childOpts(arbSpec, "review")).then(
       function (ab) {
         const aOut = outOf(ab);
         const decision = String(aOut.decision || "").trim().toLowerCase();
         const note = String(aOut.note || "");
+        const escalatable = decision === "escalate-ledger" && escalateLedger && ledgerAvailable && !useLedger && rec.escalated !== true;
+        if (!escalatable && ["merge-as-is", "drop-branch", "one-more-round"].indexOf(decision) === -1) {
+          return arbiterRetry("returned no usable decision (" + (decision || "empty") + ")", "arbitration: no usable decision");
+        }
         rec.arbRounds = (rec.arbRounds || 0) + 1;
-        if (decision === "escalate-ledger" && escalateLedger && ledgerAvailable && !useLedger && rec.escalated !== true) {
+        if (escalatable) {
           rec.escalated = true;
           log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": escalating to ledger engine (repair ceremony on branch " + slug + ")");
           return ledgerRepair(t, rec, parallel, note).then(function (repOut) {
@@ -1641,11 +1680,10 @@ function postPhase(t, rec, wOut, parallel) {
           log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": arbiter granted one more round");
           return doRework((reworkNotes ? reworkNotes + " | " : "") + note, reworkLimit, curWOut);
         }
-        rec.verdict = "arbiter-failed";
-        rec.stop = "arbitration: no usable decision";
-        log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": arbiter returned no usable decision (" + (decision || "empty") + ") - branch " + slug + " left for manual review");
       },
       function (e) {
+        const msg = String((e && e.message) || e);
+        if (OVERLOAD_RE.test(msg)) return arbiterRetry("failed (" + String(e).slice(0, 120) + ")", "arbitration: arbiter child failed");
         rec.verdict = "arbiter-failed";
         rec.stop = "arbitration: arbiter child failed";
         log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": arbiter failed (" + String(e).slice(0, 120) + ") - branch " + slug + " left for manual review");

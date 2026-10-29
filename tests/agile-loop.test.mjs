@@ -317,6 +317,67 @@ T("one-more-round guard: at most ONE arbiter-granted extra round; a repeated req
   assert.equal(res.tasks[0].verdict, "dropped");
 });
 
+// --- arbiter pool (E1.2): prefer a model that is NOT the author's; a 403/429 walks to the next pool model
+
+T("arbiter pool: author glm with an alternative in the pool -> the arbiter is NOT the author's model", async () => {
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    review: ok(reviewOk(false)),
+    arbiter: ok(arbOut("drop-branch", "not worth keeping")),
+  });
+  const runs = makeRuns(routes);
+  // the author's model leads the pool order: a plain pool walk would pick it first
+  const out = await runCampaign(baseArgs({ workModels: ["m-glm"], reviewModels: ["m-glm", "m-luna"], reworkLimit: 0 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(runs.spec(K.work).spec.model, "m-glm", "the task's author is glm");
+  assert.equal(runs.spec(K.arbiter).spec.model, "m-luna", "arbiter picked the non-author pool model, got: " + runs.spec(K.arbiter).spec.model);
+  assert.equal(out.res.tasks[0].verdict, "dropped", "arbiter decision applied");
+});
+
+T("arbiter pool: a single model in the pool is the arbiter - no error, no block", async () => {
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    review: ok(reviewOk(false)),
+    arbiter: ok(arbOut("drop-branch", "not worth keeping")),
+  });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs({ workModels: ["m-solo"], reviewModels: ["m-solo"], reworkLimit: 0 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(runs.count(K.arbiter), 1, "arbiter launched exactly once");
+  assert.equal(runs.spec(K.arbiter).spec.model, "m-solo", "the only pool model arbitrates (author's model allowed)");
+  assert.equal(out.res.tasks[0].verdict, "dropped", "no arbiter-failed without an alternative");
+  assert.ok(out.res.log.some((l) => /cross-model degraded: arbiter on 'm-solo'/.test(l)), "degradation logged: " + JSON.stringify(out.res.log));
+});
+
+T("arbiter pool: 403 on the first arbiter -> the second arbiter call goes to the next pool model", async () => {
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    review: ok(reviewOk(false)),
+    arbiter: (spec) => (spec.model === "m-luna" ? boom("HTTP 403 Forbidden: access to this model is denied")() : ok(arbOut("drop-branch", "not worth keeping"))()),
+  });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs({ workModels: ["m-glm", "m-haiku"], reviewModels: ["m-luna"], reworkLimit: 0 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(runs.spec(/s1-t1-arbiter$/).spec.model, "m-luna", "first arbiter on the non-author reviewer model");
+  assert.equal(runs.count(K.arbiter), 2, "exactly one retry after the 403");
+  assert.equal(runs.spec(/s1-t1-p2-arbiter$/).spec.model, "m-haiku", "second arbiter on the next pool model (the author's m-glm is last)");
+  assert.equal(out.res.tasks[0].verdict, "dropped", "second arbiter decision applied");
+});
+
+T("arbiter pool exhausted: every pool model overloaded -> verdict arbiter-failed (as before)", async () => {
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    review: ok(reviewOk(false)),
+    arbiter: boom("HTTP 429 Too many requests, provider overloaded"),
+  });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs({ workModels: ["m-glm"], reviewModels: ["m-luna"], reworkLimit: 0 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(runs.count(K.arbiter), 2, "one attempt per pool model (m-luna, then the author's m-glm), then the pool is exhausted");
+  assert.equal(runs.count(K.drop), 0, "nothing decided -> no drop child");
+  assert.equal(out.res.tasks[0].verdict, "arbiter-failed", "pool exhausted -> arbiter-failed");
+});
+
 T("escalate-ledger: repair ceremony updates the approved head; merge uses the repair head", async () => {
   let reviewCalls = 0;
   const routes = happyRoutes({
