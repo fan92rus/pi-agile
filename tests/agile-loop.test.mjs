@@ -4006,3 +4006,47 @@ T("E0.2 unlisted failure: one failing name outside --known-flakes refuses the me
     assert.equal(fsSync.existsSync(journal), false, "a refused merge writes no journal entry");
   } finally { fsSync.rmSync(fx.root, { recursive: true, force: true }); }
 });
+
+// --- П4: re-issue continues the saved attempt instead of a new worktree -------------
+
+T("П4 re-issue with a saved attempt: CONTINUATION brief continues the branch per fix_list, no git worktree add", async () => {
+  const fixList = [{ file: "workflows/agile-loop.js", fix: "narrow the guard to the saved attempt branch" }];
+  const st = makeState({ "agile-cp": { phase: "completed", generation: 1, carry: { "agile/task-1": {
+    sprint: 1, branch: "agile/task-1", worktree: "../wt-t2-task-1",
+    head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    lastVerdict: "failed", fixList,
+    files: ["workflows/agile-loop.js"], filesTotal: 1, stop: "verdict failed",
+  } } } });
+  const routes = happyRoutes({ curator: ok(curatorOut(true, [task(1)])) });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs(), runs, st);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(out.res.tasks[0].verdict, "merged", "continued attempt flows through the normal merge path");
+  const work = runs.spec(K.work);
+  assert.ok(work, "work child launched");
+  assert.match(work.spec.task, /CONTINUATION \(attempt saved at sprint 1, last verdict: failed\)/, "brief is a CONTINUATION of the saved attempt");
+  assert.match(work.spec.task, /branch agile\/task-1 at HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/, "continuation names the saved branch and HEAD");
+  assert.match(work.spec.task, /SAVED FIX LIST[\s\S]*narrow the guard to the saved attempt branch/, "brief carries the saved fix_list");
+  assert.ok(!/git worktree add/.test(work.spec.task), "NO worktree creation on continuation");
+  assert.match(work.spec.task, /\.\.\/wt-t2-task-1/, "saved worktree path is honored");
+  const merge = runs.spec(K.merge);
+  assert.ok(merge.spec.task.includes("../wt-t2-task-1"), "merge derives the saved worktree without parsing reports");
+  const cp = st.store.get("agile-cp");
+  assert.ok(!cp.carry["agile/task-1"], "merge consumes the attempt: the carry entry is cleared");
+});
+
+T("П4 collision without attempt: STOP contract stays (no duplicate created), slug unique per attempt on a known collision", async () => {
+  // Legacy carry: the engine knows the branch but there is NO attempt record
+  // (no worktree/head/fixList) -> NO continuation, the STOP-on-collision contract stays.
+  const st = makeState({ "agile-cp": { carry: { "agile/task-1": { branch: "agile/task-1", files: ["src/a.txt"], filesTotal: 1, stop: "verdict failed" } } } });
+  const routes = happyRoutes({ curator: ok(curatorOut(true, [task(1), task(1)])) }); // duplicate titles: two attempts, one sprint
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs({ maxParallel: 2 }), runs, st);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  const briefs = [...runs.specs.entries()].filter(([k]) => /-work$/.test(k)).map(([, s]) => s.task);
+  assert.equal(briefs.length, 2, "both attempts launched");
+  assert.ok(briefs.some((b) => /-b "agile\/task-1"/.test(b)), "first attempt keeps the base slug");
+  assert.ok(briefs.some((b) => /-b "agile\/task-1-s1"/.test(b)), "second attempt gets a unique slug <base>-s<sprint> - no duplicate branch");
+  assert.ok(briefs.every((b) => /already exists: STOP and report completed=false/.test(b)), "every fresh brief still requires STOP on a path/branch collision");
+  assert.ok(briefs.every((b) => !/CONTINUATION/.test(b)), "a carry without attempt fields never becomes a CONTINUATION");
+});

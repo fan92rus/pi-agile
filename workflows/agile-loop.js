@@ -360,9 +360,20 @@ function noteFiles(rec, o) {
 }
 function recordCarry(rec) {
   if (!rec || !rec.branch) return;
-  if (rec.verdict === "merged" || rec.verdict === "merged-after-arbitration") return;
+  if (rec.verdict === "merged" || rec.verdict === "merged-after-arbitration") {
+    // П4: the merge CONSUMES the attempt - the branch is integrated (and removed by the
+    // merge CLI), so a later re-issue must NOT try to continue it.
+    delete carryByBranch[rec.branch];
+    cpWrite({ carry: Object.assign({}, carryByBranch) });
+    return;
+  }
   const files = Array.isArray(rec.filesChanged) ? rec.filesChanged : [];
-  rec.carry = { branch: String(rec.branch), files: files.slice(0, 10), filesTotal: files.length, stop: String(rec.stop || ("verdict " + rec.verdict)) };
+  // П4 attempt record: engine facts (sprint, branch, worktree, head, lastVerdict, fixList
+  // from the reviewer's verdict) that let a RE-ISSUE continue THIS branch instead of
+  // creating a new worktree. Flat on the carry record: one checkpoint entry serves both
+  // readers (carryLines reads files/stop; issueRec reads the attempt fields).
+  rec.attempt = { sprint: rec.sprint, branch: String(rec.branch), worktree: String(rec.wt || ""), head: rec.head ? String(rec.head) : "", lastVerdict: String(rec.verdict || "unknown"), fixList: Array.isArray(rec.fixList) ? rec.fixList : null };
+  rec.carry = Object.assign({ branch: String(rec.branch), files: files.slice(0, 10), filesTotal: files.length, stop: String(rec.stop || ("verdict " + rec.verdict)) }, rec.attempt);
   carryByBranch[rec.branch] = rec.carry;
   cpWrite({ carry: Object.assign({}, carryByBranch) }); // best-effort persist, like the overload strikes
 }
@@ -375,6 +386,48 @@ function carryLines(c) {
     "- files_changed: " + (c.filesTotal ? shown + " (" + c.filesTotal + " total)" : "none reported"),
     "- stopped at: " + c.stop
   ];
+}
+// П4 CONTINUATION brief: a re-issued leaf whose saved attempt carries a branch continues
+// THAT branch - no `git worktree add`, no new branch; the worker applies ONLY the saved
+// fix_list (from the last reviewer verdict) and never rewrites from scratch.
+function continuationBrief(a, wt, slug) {
+  const lines = [
+    "CONTINUATION (attempt saved at sprint " + String(a.sprint || "?") + ", last verdict: " + String(a.lastVerdict || "unknown") + "): the work already lies on branch " + slug + " at HEAD " + String(a.head || "unknown") + (a.worktree ? ", worktree \"" + a.worktree + "\"" : "") + ".",
+    "Do NOT create a worktree or a branch - the branch already exists; never touch the main working copy and never switch branches there.",
+    "cd into YOUR worktree (" + wt + ") - ALL further work, test runs and commits happen ONLY there; if package.json exists, reuse the existing node_modules install (bootstrap by lockfile only when missing or outdated).",
+    "Continue the EXISTING work: apply ONLY the fixes below; do NOT change the architecture; do NOT rewrite from scratch.",
+  ];
+  if (Array.isArray(a.fixList) && a.fixList.length) {
+    lines.push("SAVED FIX LIST (from the last reviewer verdict) - apply ONLY these fixes:");
+    lines.push(a.fixList.map(function (f, i) { return "FIX " + (i + 1) + " [" + f.file + "]: " + f.fix; }).join("\n"));
+    lines.push("Affected files (scope guard: touch ONLY these): " + a.fixList.map(function (f) { return f.file; }).filter(function (f, i, arr) { return arr.indexOf(f) === i; }).join(", "));
+  } else {
+    lines.push("No saved fix list: assess the branch state and complete the task minimally - no restart.");
+  }
+  return lines;
+}
+// П4 issue-time branch resolution: branch names assigned earlier in THIS run (a re-issued
+// title whose previous attempt merged, duplicate titles in one sprint) must not collide -
+// each attempt gets a unique slug <base>-s<sprint>. A saved ATTEMPT record (carry entry
+// with worktree/head/fixList - legacy carries lack them) CONTINUES instead. Collisions
+// with branches the engine has NO record of stay with the brief's STOP-on-collision
+// contract (an honest report, no duplicate worktree is created).
+const takenBranches = {};
+function issueRec(t) {
+  const base = branchPrefix + slugify(t.title);
+  const saved = carryByBranch[base];
+  const rec = { id: t.id || "", sprint: sprint, title: t.title, branch: base, iterations: 0, verdict: "unknown" };
+  if (saved && saved.branch && typeof saved.worktree === "string") {
+    rec.branch = String(saved.branch);
+    rec.attempt = { sprint: saved.sprint, branch: String(saved.branch), worktree: String(saved.worktree || ""), head: saved.head ? String(saved.head) : "", lastVerdict: String(saved.lastVerdict || "unknown"), fixList: Array.isArray(saved.fixList) ? saved.fixList : null };
+  } else if (takenBranches[base]) {
+    let cand = base + "-s" + sprint;
+    while (takenBranches[cand]) cand = cand + "-s" + sprint;
+    rec.branch = cand;
+  }
+  takenBranches[rec.branch] = true;
+  rec.wt = (rec.attempt && rec.attempt.worktree) ? rec.attempt.worktree : wtPathFor(t, rec);
+  return rec;
 }
 
 // --- repeated identical merge failures (ISSUE-3): escalation to needs-attention --------
@@ -1087,6 +1140,8 @@ function taskKey(t, suffix) {
 }
 function wtPathFor(t, rec) {
   // deterministic worktree path so rework/merge can derive it without parsing reports
+  // (a CONTINUATION rec carries the saved attempt's worktree - honored when set, П4)
+  if (rec && rec.wt) return rec.wt;
   return "../wt-t" + ((t._idx || 0) + 1) + "-" + rec.branch.replace(/^agile\//, "");
 }
 function wtBaseName(t, rec) {
@@ -1274,14 +1329,16 @@ function workPhase(t, rec, parallel) {
     ...carryLines(carryByBranch[rec.branch]),
     MAIN_BRANCH_NOTE,
     "",
-    (parallel ? "PARALLEL MODE: this task runs CONCURRENTLY with sibling tasks. " : "") +
-      "WORKTREE DISCIPLINE (mandatory for EVERY task - the main working copy is never switched or written):" +
-      " (1) in the MAIN working copy, as a one-off setup step only: verify `git status --porcelain --untracked-files=no` is EMPTY (untracked files such as the campaign journal are not dirt), then `git worktree add \"" + wt + "\" -b \"" + slug + "\"`" +
-      " (if the path or branch already exists: STOP and report completed=false with the reason); if git reports an index.lock contention, wait 3 seconds and retry the command once;" +
-      " (2) cd into YOUR worktree - ALL further work, test runs and commits happen ONLY there;" +
-      " (3) if package.json exists: run `npm ci --prefer-offline` ONLY when node_modules is missing or the lockfile is newer than node_modules - reuse the existing install otherwise (bootstrap by lockfile, not per task); `npm install` only as a last-resort fallback;" +
-      " (4) never touch the main working copy and never switch branches there;" +
-      " (5) report the ABSOLUTE worktree path in the worktree field of your result.",,
+    ...((rec.attempt ? continuationBrief(rec.attempt, wt, slug) : [
+      (parallel ? "PARALLEL MODE: this task runs CONCURRENTLY with sibling tasks. " : "") +
+        "WORKTREE DISCIPLINE (mandatory for EVERY task - the main working copy is never switched or written):" +
+        " (1) in the MAIN working copy, as a one-off setup step only: verify `git status --porcelain --untracked-files=no` is EMPTY (untracked files such as the campaign journal are not dirt), then `git worktree add \"" + wt + "\" -b \"" + slug + "\"`" +
+        " (if the path or branch already exists: STOP and report completed=false with the reason); if git reports an index.lock contention, wait 3 seconds and retry the command once;" +
+        " (2) cd into YOUR worktree - ALL further work, test runs and commits happen ONLY there;" +
+        " (3) if package.json exists: run `npm ci --prefer-offline` ONLY when node_modules is missing or the lockfile is newer than node_modules - reuse the existing install otherwise (bootstrap by lockfile, not per task); `npm install` only as a last-resort fallback;" +
+        " (4) never touch the main working copy and never switch branches there;" +
+        " (5) report the ABSOLUTE worktree path in the worktree field of your result."
+    ])),
     absPathRule(wt),
     "Verification command (must pass before you finish): " + (relayMode && testCommandQuick ? gateRun(testCommandQuick) + " (quick gate; the FULL suite runs again at merge)" : gateRun(testCommand)),
     "",
@@ -1701,9 +1758,11 @@ function postPhase(t, rec, wOut, parallel) {
       mergeChain = mergeChain.then(function () { return doMerge(); });
       return mergeChain;
     }
+    const fixList = fixListOf(vOut);
+    if (fixList) rec.fixList = fixList; // П4: the saved attempt continues by the LAST verdict's fix_list
     const notes = String((vOut && vOut.rework_reasons) || "").slice(0, 800) || prevNotes;
     if (r >= reworkLimit) return doArbitrate(notes, curWOut);
-    return doRework(notes, r, curWOut, fixListOf(vOut));
+    return doRework(notes, r, curWOut, fixList);
   }
   function doRework(notes, r, curWOut, fixList) {
     // FIX-ONLY rework (perf): a well-formed reviewer fix_list replaces the re-research -
@@ -2067,8 +2126,7 @@ while (sprint < maxSprints && continueCampaign && !stopReason) {
   for (const wave of waves) {
     if (wave.tasks.length === 1) {
       const t = wave.tasks[0];
-      const rec = { id: t.id || "", sprint: sprint, title: t.title, branch: branchPrefix + slugify(t.title), iterations: 0, verdict: "unknown" };
-      rec.wt = wtPathFor(t, rec);
+      const rec = issueRec(t); // П4: attempt continuation / unique slug per attempt
       const wOut = await workPhase(t, rec, false);
       log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": work " + (wOut.completed === true ? "ok" : "incomplete") + " (" + rec.iterations + " iter)");
       await postPhase(t, rec, wOut, false);
@@ -2078,9 +2136,7 @@ while (sprint < maxSprints && continueCampaign && !stopReason) {
     } else {
       log.push("sprint " + sprint + ": wave " + wave.wave + " rolling pool: [" + wave.tasks.map(function (t) { return "t" + ((t._idx || 0) + 1); }).join(", ") + "], " + Math.max(1, Math.min(maxParallel, wave.tasks.length)) + " work slot(s), shared queue + capped post queue)");
       const recs = wave.tasks.map(function (t) {
-        const r = { id: t.id || "", sprint: sprint, title: t.title, branch: branchPrefix + slugify(t.title), iterations: 0, verdict: "unknown" };
-        r.wt = wtPathFor(t, r);
-        return r;
+        return issueRec(t); // П4: attempt continuation / unique slug per attempt
       });
       // ROLLING POOL with a SHARED QUEUE (work-stealing): workers pull the NEXT
       // unfinished task of the wave the moment a slot frees - a short task never
