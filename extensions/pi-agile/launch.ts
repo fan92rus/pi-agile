@@ -40,6 +40,7 @@ export interface EngineLeaf {
   rationale: string;
   acceptance: string;
   files_hint: string;
+  measure: string;
   deps: string[];
   open: boolean;
   review: string;
@@ -62,7 +63,9 @@ export interface LaunchOptions {
 const RATIONALE_MAX = 300;
 const ACCEPTANCE_MAX = 300;
 const FILES_HINT_MAX = 200;
+const MEASURE_MAX = 200;
 const FILES_LINE_RE = /^[ \t]*Файлы[ \t]*:(.*)$/m;
+const MEASURE_LINE_RE = /^[ \t]*Метод измерения[ \t]*:(.*)$/m;
 const ACCEPTANCE_RE = /acceptance\s*:/i;
 const REVIEW_RE = /\breview\s*:\s*(full|lite|none)\b/i;
 
@@ -91,6 +94,17 @@ function filesHint(desc: string): string {
 }
 
 /**
+ * measure = the whole value of the "Метод измерения:" line (no sentence-end cut: a method
+ * legitimately holds dots, e.g. thresholds). No such line -> '' - the engine then withholds
+ * a visual-criterion leaf from work (П6: CRITERION-NOT-MEASURABLE).
+ */
+function measureHint(desc: string): string {
+  const line = MEASURE_LINE_RE.exec(desc);
+  if (!line) return "";
+  return line[1].trim();
+}
+
+/**
  * Maps a bd leaf to the engine snapshot. Deps on closed leaves are dropped: already satisfied.
  * Every text cut at a limit is reported into warnings (leaf id + original length): no silent truncation.
  */
@@ -105,12 +119,17 @@ function toEngineLeaf(issue: BdIssue, closedIds: Set<string>, warnings: string[]
   if (accText.length > ACCEPTANCE_MAX) {
     warnings.push(`${issue.id}: acceptance is ${accText.length} chars, truncated to ${ACCEPTANCE_MAX}`);
   }
+  const measure = measureHint(desc);
+  if (measure.length > MEASURE_MAX) {
+    warnings.push(`${issue.id}: measure is ${measure.length} chars, truncated to ${MEASURE_MAX}`);
+  }
   return {
     id: issue.id,
     title: issue.title,
     rationale: desc.slice(0, RATIONALE_MAX),
     acceptance: accText.slice(0, ACCEPTANCE_MAX),
     files_hint: filesHint(desc),
+    measure: measure.slice(0, MEASURE_MAX),
     deps: issue.dependencies
       .filter((d) => d.dependency_type === "blocks" && !closedIds.has(d.id))
       .map((d) => d.id),

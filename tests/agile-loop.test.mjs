@@ -1509,6 +1509,62 @@ T("toy-falcon stale cursor: merged leaves never re-run when snapshot lags the dr
   assert.equal(out.res.stopReason, "epic-closed");
 });
 
+// --- П6: неизмеримый критерий не выдаётся в работу ---------------------------------
+// A leaf whose acceptance demands a visual/pixel judgment (CR marker: совпад/не изменя/
+// pixel/макет/визуальн) is issued into work ONLY with a declared measurement method
+// (bd "Метод измерения:" line -> measure). Without one the reviewer could never evidence
+// the criterion from a diff or the gate - the leaf is withheld from the sprint and the
+// campaign report carries CRITERION-NOT-MEASURABLE with the leaf id.
+T("toy-falcon П6: visual-criterion leaf without measure is NOT issued (CRITERION-NOT-MEASURABLE in the report); plain leaf unchanged", async () => {
+  const routes = makeRuns([
+    { match: K.work, handle: ok(workOut()) },
+    { match: K.review, handle: ok(reviewOk()) },
+    { match: K.merge, handle: ok(mergeOut()) },
+  ]);
+  const out = await runCampaign(baseArgs({
+    taskSource: "bd-epic", bdEpic: "t-fal.1", doneWhen: "bd-epic-closed",
+    sprintTasks: 2, maxSprints: 1,
+    bdTasks: [
+      falconLeaf("fal-px", { acceptance: "баннер визуально совпадает с макетом" }),
+      falconLeaf("fal-a"),
+    ],
+  }), routes, makeState());
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.deepEqual(out.res.tasks.map((r) => r.id), ["fal-a"], "only the leaf without CR markers is issued into work");
+  assert.equal(routes.count(K.work), 1, "fal-px never launches a work child");
+  assert.ok(!routes.spec(K.work).spec.task.includes("fal-px"), "no work brief ever mentions the withheld leaf");
+  const crLine = out.res.log.find((l) => l.includes("CRITERION-NOT-MEASURABLE"));
+  assert.ok(crLine, "report names the reason: " + JSON.stringify(out.res.log));
+  assert.ok(crLine.includes("fal-px"), "the reason names the withheld leaf id");
+  assert.equal(out.res.counts.merged, 1);
+  assert.equal(out.res.status, "completed");
+});
+
+T("toy-falcon П6: visual-criterion leaf WITH measure is issued; the reviewer brief carries the measurement method", async () => {
+  const routes = makeRuns([
+    { match: K.work, handle: ok(workOut()) },
+    { match: K.review, handle: ok(reviewOk()) },
+    { match: K.merge, handle: ok(mergeOut()) },
+  ]);
+  const out = await runCampaign(baseArgs({
+    taskSource: "bd-epic", bdEpic: "t-fal.1", doneWhen: "bd-epic-closed",
+    sprintTasks: 2, maxSprints: 1,
+    bdTasks: [
+      falconLeaf("fal-m", { acceptance: "баннер визуально совпадает с макетом", measure: "попиксельное сравнение с design/banner.png, порог 0.02" }),
+      falconLeaf("fal-a"),
+    ],
+  }), routes, makeState());
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.deepEqual(out.res.tasks.map((r) => r.id).sort(), ["fal-a", "fal-m"], "a marker leaf with measure issues exactly like a plain leaf");
+  const revM = routes.spec(/^s1-t1-review$/).spec.task;
+  assert.ok(revM.includes("попиксельное сравнение с design/banner.png"), "reviewer brief carries the declared measurement method");
+  assert.ok(revM.includes("MEASUREMENT METHOD"), "method line is labeled");
+  assert.ok(revM.includes("CRITERION-NOT-MEASURABLE"), "reviewer names the unmeasurable-refusal marker");
+  assert.ok(!routes.spec(/^s1-t2-review$/).spec.task.includes("MEASUREMENT METHOD"), "the plain leaf's reviewer brief carries no method line");
+  assert.equal(out.res.counts.merged, 2);
+  assert.equal(out.res.status, "completed");
+});
+
 T("toy-falcon end-race: last leaf merged but snapshot lags -> epic-closed, one extra cursor child", async () => {
   let cursorCalls = 0;
   const routes = makeRuns([

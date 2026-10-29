@@ -774,10 +774,21 @@ function normalizeLeaf(l) {
   return {
     id: String(l.id || ""), title: String(l.title || ""), rationale: String(l.rationale || ""),
     acceptance: String(l.acceptance || ""), files_hint: String(l.files_hint || ""),
+    measure: String(l.measure || ""),
     deps: Array.isArray(l.deps) ? l.deps.map(String) : [],
     open: l.open !== false,
     review: reviewTierOf(l.review)
   };
+}
+// П6 (CR marker): an acceptance criterion that demands a visual/pixel judgment
+// (совпад / не изменя / pixel / макет / визуальн) is evidenceable ONLY through the leaf's
+// declared measurement method (measure <- the bd "Метод измерения:" line): a git diff and
+// the test gate prove nothing about pixels. A marker leaf WITHOUT measure is never issued
+// into work - the campaign report names CRITERION-NOT-MEASURABLE; leaves without markers
+// (or with one plus a measure) issue exactly as before.
+const CR_RE = /совпад|не изменя|pixel|макет|визуальн/i;
+function unmeasurable(l) {
+  return CR_RE.test(String(l.acceptance || "")) && !String(l.measure || "").trim();
 }
 let bdSnapshot = (Array.isArray(args.bdTasks) ? args.bdTasks : []).map(normalizeLeaf).filter(function (l) { return l.id; });
 // ids whose bd close is CONFIRMED done (the merger reported bd_closed=true, or the
@@ -957,6 +968,7 @@ const CURSOR_SCHEMA = {
     leaves: { type: "array", items: { type: "object", properties: {
       id: { type: "string" }, title: { type: "string" }, rationale: { type: "string" },
       acceptance: { type: "string" }, files_hint: { type: "string" },
+      measure: { type: "string" },
       deps: { type: "array", items: { type: "string" } }, open: { type: "boolean" },
       review: { type: "string", enum: REVIEW_TIERS }
     }, required: ["id", "title", "open", "review"], additionalProperties: false } }
@@ -1267,6 +1279,7 @@ function boundaryBrief(entries, refresh, closables) {
     "  rationale = description, first 300 chars;",
     "  acceptance = the test/contract clause of the description (the sentence that states the tests or contract), first 300 chars, '' if none;",
     "  files_hint = the first file path named in the description, first 200 chars, '' if none;",
+    "  measure = the value of the \"Метод измерения:\" line of the description (the whole line after the colon, first 200 chars), '' if the line is absent - the engine needs it to issue a visual-criterion leaf into work (П6);",
     "  deps = ids of dependencies[] entries whose dependency_type is \"blocks\" (parent-child entries are NOT deps), [] if none;",
     "  review = the tier word full|lite|none that the description states for the task; missing or unknown -> \"full\".",
     "Return only leaves shown by (a)-(c); NEVER invent ids."
@@ -1277,7 +1290,7 @@ function boundaryBrief(entries, refresh, closables) {
     ...bdClose,
     ...snapshot,
     FINAL_MSG,
-    "Schema keys: cleaned[{branch, worktree, removed (boolean), note}], closed[{id, closed (boolean), note}] (omit when there is no BD CLOSE section), leaves[{id, title, rationale, acceptance, files_hint, deps, open, review}]."
+    "Schema keys: cleaned[{branch, worktree, removed (boolean), note}], closed[{id, closed (boolean), note}] (omit when there is no BD CLOSE section), leaves[{id, title, rationale, acceptance, files_hint, measure, deps, open, review}]."
   ].join("\n");
 }
 function salvageReport(ctx, fromLabel) {
@@ -1763,6 +1776,12 @@ function postPhase(t, rec, wOut, parallel) {
       // in production. Harness-green is NOT production evidence for runtime-boundary
       // assumptions - the reviewer must verify them against the REAL launch path.
       "RUNTIME-BOUNDARY RULE: if the change depends on runtime primitives (host channels like runs.host, launch mode, env, host limits), you MUST verify their availability in the REAL launch path (host/launcher sources or docs), NOT only in the test harness; 'harness-green' is NOT production evidence for such changes - an unverifiable runtime assumption -> approved=false with the unverified boundary named in rework_reasons.",
+      // П6: a visual criterion is judgeable only through its declared measurement method.
+      // The engine issues a marker leaf only WITH measure; a marker criterion that still
+      // slips through (curator-crafted acceptance) is refused with the same marker the
+      // campaign report carries for a withheld leaf.
+      (t.measure ? "MEASUREMENT METHOD: the acceptance carries a visual criterion - judge it ONLY by the declared measurement method: " + t.measure : ""),
+      "UNMEASURABLE RULE: a visual/pixel acceptance criterion (совпад/не изменя/pixel/макет/визуальн) with NO declared measurement method is not evidenceable by a diff or the gate -> approved=false with reason CRITERION-NOT-MEASURABLE.",
       EDIT_FAILURE_RULE,
       "approved=false requires concrete, actionable rework_reasons.",
       "approved=false with CONCRETE per-file fixes -> also emit fix_list: [{\"file\": \"<path>\", \"fix\": \"<the exact edit>\"}] - the rework child then applies ONLY these fixes without re-researching the task; omit fix_list for design-level or exploratory rework.",
@@ -2073,7 +2092,15 @@ while (sprint < maxSprints && continueCampaign && !stopReason) {
     const ready = bdSnapshot.filter(function (l) {
       return l.open && !doneIds.has(String(l.id)) && l.deps.every(function (d) { return doneIds.has(String(d)); });
     });
-    tasks = ready.slice(0, sprintTasks);
+    // П6: an unmeasurable visual criterion never reaches a worker. The leaf stays open in
+    // the snapshot (the epic cannot close until bd carries its "Метод измерения:" line),
+    // and the report carries CRITERION-NOT-MEASURABLE per withheld leaf id.
+    const withheld = ready.filter(unmeasurable);
+    withheld.forEach(function (l) {
+      log.push("sprint " + sprint + ": leaf " + l.id + " NOT issued: CRITERION-NOT-MEASURABLE (visual criterion marker in acceptance, no measure)");
+    });
+    const issued = ready.filter(function (l) { return withheld.indexOf(l) === -1; });
+    tasks = issued.slice(0, sprintTasks);
     tasks.forEach(function (t) { t.wave = 1; }); // deps live OUTSIDE this sprint -> picked tasks are mutually independent
     plannedTotal += tasks.length;
     log.push("bd-epic: " + ready.length + " ready / " + bdSnapshot.filter(function (l) { return l.open; }).length + " open; taking " + tasks.length + " (driver pre-approved)");

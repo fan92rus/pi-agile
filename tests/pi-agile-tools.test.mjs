@@ -96,6 +96,7 @@ T("agile_run: bd-epic launch plan from a mocked bd (open leaves, engine shape, d
       rationale: "Add parser (old notes in tests/old.mjs). review: lite\nФайлы: extensions/pi-agile/bd.ts\nAcceptance: (1) node --test passes (2) exit 0",
       acceptance: "(1) node --test passes (2) exit 0",
       files_hint: "extensions/pi-agile/bd.ts",
+      measure: "",
       deps: [], open: true, review: "lite",
     },
     {
@@ -103,12 +104,14 @@ T("agile_run: bd-epic launch plan from a mocked bd (open leaves, engine shape, d
       rationale: "Wire launch in docs/old.md\nФайлы: extensions/pi-agile/launch.ts",
       acceptance: "",
       files_hint: "extensions/pi-agile/launch.ts",
+      measure: "",
       deps: ["L1"], open: true, review: "full",
     },
     {
       id: "L4", title: "title L4",
       rationale: "Docs only\nФайлы: README.md",
       acceptance: "", files_hint: "README.md",
+      measure: "",
       deps: [], open: true, review: "full",
     },
   ]);
@@ -153,6 +156,26 @@ T("agile_run: leaf without a Файлы: line -> empty files_hint and a warning;
   assert.equal(plan.warnings.length, 1);
   assert.match(plan.warnings[0], /L2/);
   assert.match(plan.warnings[0], /Файлы:/);
+});
+
+T("agile_run: Метод измерения: line -> measure (whole line, capped); absent -> measure stays '' (leaf unchanged)", async () => {
+  const data = fixtureData();
+  // L4: the line rides after Acceptance: (inside the acceptance text) and holds dots/thresholds -
+  // no sentence-end cut. L2: no such line -> measure stays '' and nothing else moves.
+  data.issues.L4.description = "Docs only\nФайлы: README.md\nAcceptance: баннер визуально совпадает с макетом\nМетод измерения:  попиксельное сравнение с design/banner.png, порог 0.02";
+  data.issues.L2.description = "Wire launch\nФайлы: extensions/pi-agile/launch.ts\nAcceptance: gate green";
+  const longMeasure = "М".repeat(250);
+  data.issues.L1.description = "Add parser\nФайлы: extensions/pi-agile/bd.ts\nAcceptance: совпадение с макетом\nМетод измерения: " + longMeasure;
+  const plan = await planLaunch({ ...BASE, bundleScript: "C:/bundle.sh" }, { cwd: "/repo", run: mockBd(data) });
+  const byId = Object.fromEntries(plan.args.bdTasks.map((t) => [t.id, t]));
+  assert.equal(byId.L4.measure, "попиксельное сравнение с design/banner.png, порог 0.02");
+  assert.ok(byId.L4.acceptance.includes("Метод измерения:"), "acceptance text is untouched by the measure extraction");
+  assert.equal(byId.L2.measure, "");
+  assert.equal(byId.L2.acceptance, "gate green");
+  assert.equal(byId.L1.measure, longMeasure.slice(0, 200));
+  assert.deepEqual(plan.warnings.filter((w) => /measure/.test(w)), [
+    `L1: measure is 250 chars, truncated to 200`,
+  ]);
 });
 
 T("agile_run: rationale/acceptance over the limit -> warning with leaf id and length (no silent cut)", async () => {
