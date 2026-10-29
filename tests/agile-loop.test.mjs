@@ -420,6 +420,18 @@ T("K1: keptBranches excludes merged work and the explicit drop-branch decision (
   assert.deepEqual(out.res.keptBranches, [], "merged and dropped branches are not kept");
 });
 
+T("K2: a merged branch the merger did not delete (branch_deleted=false) stays in return.keptBranches with verdict merged - the merge stands", async () => {
+  const routes = happyRoutes({
+    curator: ok(curatorOut(true, [task(1)])),
+    merge: ok(mergeOut({ branch_deleted: false })),
+  });
+  const runs = makeRuns(routes);
+  const out = await runCampaign(baseArgs({ reworkLimit: 0 }), runs);
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(out.res.tasks[0].verdict, "merged", "the merge itself stands");
+  assert.deepEqual(out.res.keptBranches.map((k) => [k.branch, k.verdict]), [["agile/task-1", "merged"]], "the undeleted branch is handed to the lead: " + JSON.stringify(out.res.keptBranches));
+});
+
 // --- arbiter pool (E1.2): prefer a model that is NOT the author's; a 403/429 walks to the next pool model
 
 T("arbiter pool: author glm with an alternative in the pool -> the arbiter is NOT the author's model", async () => {
@@ -1523,6 +1535,20 @@ T("no-code analysis leaf (marker in rationale, artifact in ignored path): work+r
   assert.match(merge, /bd_closed/);
   assert.ok(out.res.log.some((l) => /merge bd-close closed analysis-a in bd/.test(l)), "bd close confirmed: " + JSON.stringify(out.res.log));
   assert.equal(runs.count(K.merge), 1, "exactly one no-code merge child");
+});
+
+T("K2: no-code merged deletes its own branch - brief gates on git cherry and git branch -D; a deleted branch is not kept", async () => {
+  const runs = tierRuns({ merge: ok(mergeOut({ merged: true, checks_ok: true, journal_written: true, merge_commit: "", bd_closed: true, branch_deleted: true })) });
+  const out = await runCampaign(tierArgs([analysisLeaf("analysis-k2")]), runs, makeState());
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.equal(out.res.tasks[0].verdict, "merged");
+  const merge = runs.spec(K.merge).spec.task;
+  const slug = (/Branch: (\S+) \|/.exec(merge) || [])[1];
+  assert.ok(slug && slug.startsWith("agile/"), "the no-code brief names the campaign branch: " + slug);
+  assert.ok(merge.includes("git cherry ") && merge.includes(" " + slug + "` prints NO line starting with '+'"), "no-code brief gates the delete on git cherry");
+  assert.ok(merge.includes("git branch -D " + slug), "no-code brief deletes the own branch");
+  assert.ok(merge.indexOf("git worktree remove") < merge.indexOf("git branch -D " + slug), "the worktree is removed before the branch delete");
+  assert.ok(out.res.keptBranches.every((k) => k.branch !== slug), "a deleted no-code branch is not kept: " + JSON.stringify(out.res.keptBranches));
 });
 
 T("no-code analysis: a missing artifact is rejected by the reviewer and the no-code merge never runs", async () => {
@@ -4004,6 +4030,53 @@ T("mergeBranch bd spawn error is best-effort after committed merge", async () =>
     assert.equal(git(main, "rev-list", "--count", "main~1..main"), "1", "squash commit remains on main");
     assert.equal(git(main, "status", "--porcelain"), "");
   } finally { process.env.PATH = oldPath; fsSync.rmSync(root, { recursive: true, force: true }); }
+});
+
+T("K2: mergeBranch deletes the merged campaign branch after git cherry; a foreign feat/* branch is never touched", async () => {
+  const root = fsSync.mkdtempSync(pathMod.join(os.tmpdir(), "merge-branch-k2-delete-"));
+  const main = pathMod.join(root, "repo"), wt = pathMod.join(root, "worker-wt");
+  fsSync.mkdirSync(main);
+  const git = (cwd, ...args) => {
+    const r = spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(r.status, 0, `git ${args.join(" ")}: ${r.stderr}`); return r.stdout.trim();
+  };
+  try {
+    git(main, "init", "-b", "main"); git(main, "config", "user.email", "test@example.com"); git(main, "config", "user.name", "Contract Test");
+    fsSync.writeFileSync(pathMod.join(main, "base.txt"), "base\n"); git(main, "add", "."); git(main, "commit", "-m", "base");
+    git(main, "switch", "-c", "feat/foreign"); fsSync.writeFileSync(pathMod.join(main, "foreign.txt"), "foreign\n"); git(main, "add", "."); git(main, "commit", "-m", "foreign work");
+    git(main, "switch", "main");
+    git(main, "switch", "-c", "agile/k2-merged"); fsSync.writeFileSync(pathMod.join(main, "new.txt"), "change\n"); git(main, "add", "."); git(main, "commit", "-m", "campaign work");
+    const approvedSha = git(main, "rev-parse", "HEAD"); git(main, "switch", "main"); git(main, "worktree", "add", wt, "agile/k2-merged");
+    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "agile/k2-merged", approvedSha, testCommand: "true", campaignBranch: "agile/k2-merged" });
+    assert.equal(result.status, 0); assert.equal(result.data.merged, true);
+    assert.equal(result.data.branchDeleted, true, "the merged campaign branch is deleted");
+    assert.equal(git(main, "branch", "--list", "agile/k2-merged"), "", "campaign branch is gone");
+    assert.match(git(main, "branch", "--list", "feat/foreign"), /feat\/foreign/, "foreign feat/* branch is kept");
+    assert.equal(git(main, "rev-list", "--count", "main~1..main"), "1", "the squash commit landed on main");
+  } finally { fsSync.rmSync(root, { recursive: true, force: true }); }
+});
+
+T("K2: a campaign branch whose git cherry shows a '+' line is kept (branchDeleted=false) and the merge still stands", async () => {
+  const root = fsSync.mkdtempSync(pathMod.join(os.tmpdir(), "merge-branch-k2-cherry-"));
+  const main = pathMod.join(root, "repo"), wt = pathMod.join(root, "worker-wt");
+  fsSync.mkdirSync(main);
+  const git = (cwd, ...args) => {
+    const r = spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(r.status, 0, `git ${args.join(" ")}: ${r.stderr}`); return r.stdout.trim();
+  };
+  try {
+    git(main, "init", "-b", "main"); git(main, "config", "user.email", "test@example.com"); git(main, "config", "user.name", "Contract Test");
+    fsSync.writeFileSync(pathMod.join(main, "base.txt"), "base\n"); fsSync.writeFileSync(pathMod.join(main, "tasks.md"), "- [ ] item one\n");
+    git(main, "add", "."); git(main, "commit", "-m", "base");
+    git(main, "switch", "-c", "agile/k2-cherry"); fsSync.writeFileSync(pathMod.join(main, "new.txt"), "change\n"); git(main, "add", "."); git(main, "commit", "-m", "campaign work");
+    const approvedSha = git(main, "rev-parse", "HEAD"); git(main, "switch", "main"); git(main, "worktree", "add", wt, "agile/k2-cherry");
+    // The sdd checkbox ticks on main INSIDE the squash commit, so the squash is not patch-equivalent to the branch commit.
+    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "agile/k2-cherry", approvedSha, testCommand: "true", campaignBranch: "agile/k2-cherry", sddFile: "tasks.md", sddItem: "- [x] item one" });
+    assert.equal(result.status, 0); assert.equal(result.data.merged, true, "the merge stands");
+    assert.equal(result.data.branchDeleted, false, "git cherry '+' keeps the branch");
+    assert.match(git(main, "cherry", "main", "agile/k2-cherry"), /^\+ /m, "git cherry reports a non-equivalent commit");
+    assert.match(git(main, "branch", "--list", "agile/k2-cherry"), /agile\/k2-cherry/, "the kept branch still exists");
+  } finally { fsSync.rmSync(root, { recursive: true, force: true }); }
 });
 
 // --- ISSUE-7: gate environment (a worker's PI_SUBAGENT_* must not poison the merge gate) ---

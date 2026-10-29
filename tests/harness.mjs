@@ -68,7 +68,8 @@ export const reviewOk = (approved = true, extra = {}) =>
 export const mergeOut = (over = {}) =>
   // bd_closed: true = a competent merger closed the leaf it just merged (bd-epic mode);
   // tests override it to false to simulate a failed best-effort close.
-  Object.assign({ merged: true, checks_ok: true, journal_written: true, bd_closed: true, note: "" }, over);
+  // branch_deleted: true = the merger deleted the campaign's merged branch (K2); false keeps it in keptBranches.
+  Object.assign({ merged: true, checks_ok: true, journal_written: true, bd_closed: true, branch_deleted: true, note: "" }, over);
 export const dropOut = (over = {}) =>
   Object.assign({ dropped: true, journal_written: true, note: "dropped" }, over);
 export const arbOut = (decision, note = "") => ({ decision, note });

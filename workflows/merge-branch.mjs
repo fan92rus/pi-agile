@@ -86,6 +86,19 @@ function runGate(testCommand, cwd, knownFlakes) {
   return { suite: retry, flakeRetried: retry.status === 0 ? failed : [] };
 }
 
+// K2: the campaign's own branch is deleted after its squash landed on main. Best-effort: a
+// failed delete never fails the merge. Only the branch this campaign created (campaignBranch,
+// under its prefix) and only when git cherry lists NO '+' line, i.e. every branch commit is
+// patch-equivalent on the integration branch. Anything else stays and is reported as kept.
+function deleteCampaignBranch(main, mainBranch, branch, options) {
+  if (!options.campaignBranch || options.campaignBranch !== branch || !branch.startsWith(options.branchPrefix || "agile/")) return false;
+  try {
+    const cherry = git(main, ["cherry", mainBranch, branch], false);
+    if (cherry.status !== 0 || cherry.stdout.split(/\r?\n/).some((line) => line.startsWith("+"))) return false;
+    return git(main, ["branch", "-D", branch], false).status === 0;
+  } catch { return false; }
+}
+
 export async function mergeBranch(options) {
   const main = path.resolve(options.mainDir || process.cwd());
   const worktree = path.resolve(options.worktree || "");
@@ -236,15 +249,16 @@ export async function mergeBranch(options) {
     } catch { bdClosed = false; }
   }
   git(main, ["worktree", "remove", worktree]);
-  return { status: 0, data: { merged: true, checksOk: true, journalWritten, mergeCommit, bdClosed, phantomDirtCleared, flakeRetried, note: "" } };
+  const branchDeleted = deleteCampaignBranch(main, mainBranch, branch, options);
+  return { status: 0, data: { merged: true, checksOk: true, journalWritten, mergeCommit, bdClosed, branchDeleted, phantomDirtCleared, flakeRetried, note: "" } };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
   try {
     const args = parseArgs(process.argv.slice(2));
-    if (args.help) { console.log("merge-branch --main-dir DIR --main-branch NAME --worktree DIR --branch NAME --approved-sha SHA --test-command COMMAND [--bd-leaf ID] [--known-flakes REGEX]"); }
+    if (args.help) { console.log("merge-branch --main-dir DIR --main-branch NAME --worktree DIR --branch NAME --approved-sha SHA --test-command COMMAND [--bd-leaf ID] [--known-flakes REGEX] [--branch-prefix PREFIX] [--campaign-branch NAME]"); }
     else {
-      const result = await mergeBranch({ mainDir: args["main-dir"], mainBranch: args["main-branch"], worktree: args.worktree, branch: args.branch, approvedSha: args["approved-sha"], testCommand: args["test-command"], bdLeaf: args["bd-leaf"], message: args.message, journalFile: args["journal-file"], taskTitle: args["task-title"], sddFile: args["sdd-file"], sddItem: args["sdd-item"], knownFlakes: args["known-flakes"] });
+      const result = await mergeBranch({ mainDir: args["main-dir"], mainBranch: args["main-branch"], worktree: args.worktree, branch: args.branch, approvedSha: args["approved-sha"], testCommand: args["test-command"], bdLeaf: args["bd-leaf"], message: args.message, journalFile: args["journal-file"], taskTitle: args["task-title"], sddFile: args["sdd-file"], sddItem: args["sdd-item"], knownFlakes: args["known-flakes"], branchPrefix: args["branch-prefix"], campaignBranch: args["campaign-branch"] });
       output(result.status, result.data);
     }
   } catch (error) { output(1, { error: error.message }); }

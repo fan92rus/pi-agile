@@ -1123,6 +1123,9 @@ const MERGE_SCHEMA = {
     // when no bd-close step ran). false/absent NEVER fails the merge; the unconfirmed
     // id stays out of bdClosedIds and is retried by the post-loop child or the driver.
     bd_closed: { type: "boolean" },
+    // K2: the campaign's own merged branch was deleted. false/absent keeps the branch listed
+    // in return.keptBranches (git cherry '+' or a foreign branch name): the merge still stands.
+    branch_deleted: { type: "boolean" },
     note: { type: "string" }
   },
   required: ["merged", "checks_ok", "journal_written", "merge_commit", "note"],
@@ -1195,9 +1198,11 @@ function keptBranchEntries(recs) {
   // merged attempt is integrated (not kept); a branch whose LAST attempt was dropped is gone
   // (the explicit drop-branch decision of the calling side). Otherwise the last attempt's
   // verdict is reported (needs-attention holds, unknown = unreviewed, failed, merge-failed...).
+  // K2: a merged branch the merger did not delete (branchKept) is NOT integrated-and-gone: it
+  // stays in the list with its merged verdict.
   const merged = {};
   (recs || []).forEach(function (r) {
-    if (r && r.branch && (r.verdict === "merged" || r.verdict === "merged-after-arbitration")) merged[String(r.branch)] = true;
+    if (r && r.branch && (r.verdict === "merged" || r.verdict === "merged-after-arbitration") && !r.branchKept) merged[String(r.branch)] = true;
   });
   const last = {};
   const order = [];
@@ -1527,7 +1532,7 @@ function postPhase(t, rec, wOut, parallel) {
   }
   function doMergeChild() {
     const closedAtStart = doneSet().has(String(t.id || ""));
-    const cliArgs = ["node", "workflows/merge-branch.mjs", "--main-dir", JSON.stringify("."), ...(mainBranch ? ["--main-branch", JSON.stringify(mainBranch)] : []), "--worktree", JSON.stringify(wt), "--branch", JSON.stringify(slug), "--approved-sha", JSON.stringify(rec.head), "--test-command", JSON.stringify(testCommand), "--journal-file", JSON.stringify(journalDir + "/sprint-" + sprint + ".jsonl"), "--task-title", JSON.stringify(t.title), ...(sddActive && t.sdd_item ? ["--sdd-file", JSON.stringify(sddTasksFile), "--sdd-item", JSON.stringify(String(t.sdd_item))] : []), ...(bdEpic && t.id && !closedAtStart ? ["--bd-leaf", JSON.stringify(t.id)] : [])].join(" ");
+    const cliArgs = ["node", "workflows/merge-branch.mjs", "--main-dir", JSON.stringify("."), ...(mainBranch ? ["--main-branch", JSON.stringify(mainBranch)] : []), "--worktree", JSON.stringify(wt), "--branch", JSON.stringify(slug), "--approved-sha", JSON.stringify(rec.head), "--test-command", JSON.stringify(testCommand), "--journal-file", JSON.stringify(journalDir + "/sprint-" + sprint + ".jsonl"), "--task-title", JSON.stringify(t.title), ...(sddActive && t.sdd_item ? ["--sdd-file", JSON.stringify(sddTasksFile), "--sdd-item", JSON.stringify(String(t.sdd_item))] : []), ...(bdEpic && t.id && !closedAtStart ? ["--bd-leaf", JSON.stringify(t.id)] : []), "--branch-prefix", JSON.stringify(branchPrefix), "--campaign-branch", JSON.stringify(slug)].join(" ");
     // NO-CODE ANALYSIS merge: nothing lands on the integration branch, so the merge CLI (which
     // squashes commits) is not run. The merger closes the leaf, journals it and removes the worktree.
     const noCode = isAnalysisLeaf(t);
@@ -1539,8 +1544,9 @@ function postPhase(t, rec, wOut, parallel) {
       "2) no-code check: `git rev-parse " + slug + "` must equal the approved SHA and `git rev-list --count " + (mainBranch || "main") + ".." + slug + "` must print 0; otherwise merged=false with the reason and stop.",
       bdLeafClose ? "3) bd close: `bd close " + t.id + " -r " + JSON.stringify(t.id + ": no-code analysis deliverable - merged") + " </dev/null`; bd_closed = exit 0; a failed close does not fail the merge." : "3) bd close: not applicable (no open bd leaf to close).",
       "4) journal: mkdir -p " + journalDir + " and append ONE json line to " + journalDir + "/sprint-" + sprint + ".jsonl: {\"task\": " + JSON.stringify(t.title) + ", \"verdict\": \"merged\", \"branch\": " + JSON.stringify(slug) + ", \"head\": " + JSON.stringify(rec.head) + ", \"note\": \"no-code analysis deliverable at " + String(t.files_hint || "").replace(/["\\]/g, "") + "; no git commit\"}; journal_written = true only when the append succeeded.",
-      "5) worktree: `git worktree remove --force " + wt + "` (the branch " + slug + " is left as it is).",
-      "6) report: merged=true, checks_ok=true (steps 1-2 passed), journal_written, merge_commit='' (no git commit exists), bd_closed when step 3 applies, note='no-code analysis deliverable'."
+      "5) worktree: `git worktree remove --force " + wt + "`.",
+      "6) branch (K2): delete the campaign's own branch " + slug + " ONLY when its name starts with " + JSON.stringify(branchPrefix) + " AND `git cherry " + (mainBranch || "main") + " " + slug + "` prints NO line starting with '+' (empty output is fine): run `git branch -D " + slug + "`. branch_deleted = true only when that delete exited 0; otherwise branch_deleted=false and the branch is kept (not a failure).",
+      "7) report: merged=true, checks_ok=true (steps 1-2 passed), journal_written, merge_commit='' (no git commit exists), bd_closed when step 3 applies, branch_deleted from step 6, note='no-code analysis deliverable'."
     ];
     const mergeLines = [
       noCode ? "You are the MERGER for a NO-CODE ANALYSIS deliverable. Follow the no-code steps exactly; do not run any merge CLI." : "You are the MERGER. Run the deterministic merge CLI; do not perform deterministic git, test, bd, or cleanup steps yourself.",
@@ -1550,11 +1556,11 @@ function postPhase(t, rec, wOut, parallel) {
         "Before running the CLI, perform the merge approval gate from the repository root: show `git diff --stat " + mainBranch + "..." + slug + "` and run the full checks with `" + testCommand + " </dev/null`. Present the diff stat and exact check result to the calling side via contact_supervisor (reason: \"merge approval\"). If refused, abort without running the merge CLI or changing either tree. Proceed only after explicit approval.",
       ] : []),
       ...(noCode ? [] : [
-        "CLI exit 0: report its JSON facts as merged=true, checks_ok=true, journal_written=<journalWritten>, merge_commit=<mergeCommit>, bd_closed=<bdClosed when applicable>; do not alter the result.",
+        "CLI exit 0: report its JSON facts as merged=true, checks_ok=true, journal_written=<journalWritten>, merge_commit=<mergeCommit>, bd_closed=<bdClosed when applicable>, branch_deleted=<branchDeleted>; do not alter the result.",
         "CLI exit 2: its JSON lists conflictFiles and worktree. Resolve only those conflicts in that worktree as a sibling-aware editor: read sibling branches' diffs to preserve both intents, with ours being the new base during rebase; stage resolved files, run `git rebase --continue` there, then rerun the exact CLI command. No main-tree write occurs on exit 2.",
         "Any other exit or invalid JSON: report merged=false and the CLI error; make no manual integration changes.",
       ]),
-      noCode ? "Only report bd_closed when step 3 closed the leaf; already-closed leaves skip it. Schema keys: merged, checks_ok, journal_written, merge_commit, note" + (bdLeafClose ? ", bd_closed" : "") + "." : "Only report bd_closed when the CLI returns it; already-closed leaves omit --bd-leaf. Schema keys: merged, checks_ok, journal_written, merge_commit, note" + (bdLeafClose ? ", bd_closed" : "") + "."
+      noCode ? "Only report bd_closed when step 3 closed the leaf; already-closed leaves skip it. Schema keys: merged, checks_ok, journal_written, merge_commit, note, branch_deleted" + (bdLeafClose ? ", bd_closed" : "") + "." : "Only report bd_closed when the CLI returns it; already-closed leaves omit --bd-leaf. Schema keys: merged, checks_ok, journal_written, merge_commit, note, branch_deleted" + (bdLeafClose ? ", bd_closed" : "") + "."
     ].join("\n");
     return runChild(taskKey(t, "merge"), childOpts({ task: [mergeLines, selfCheckLine("merge")].join("\n"), outputSchema: MERGE_SCHEMA })).then(
       function (mg) {
@@ -1565,6 +1571,11 @@ function postPhase(t, rec, wOut, parallel) {
         if (rec.verdict === "merge-failed") { rec.stop = "merge: merged/checks_ok not confirmed"; rec.failText = String(mOut.note || ""); }
         // Merge commit lands on main - the bd-close comment carries it as evidence.
         if (rec.verdict === "merged" && mOut.merge_commit) rec.mergeCommit = String(mOut.merge_commit);
+        // K2: the merge stands either way; a branch the merger did not confirm deleted stays kept.
+        if (rec.verdict === "merged" && mOut.branch_deleted !== true) {
+          rec.branchKept = true;
+          log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": merged, branch " + slug + " kept (not deleted: " + (mOut.branch_deleted === false ? "git cherry '+' or foreign branch" : "no deletion confirmed") + ") - listed in keptBranches");
+        }
         // MERGER bd-close (perf: boundary children burned 1.5-4 min per boundary on it):
         // the merger closes the leaf it just merged - best-effort. Only a CONFIRMED close
         // marks bdClosedIds (exactly-once); an unconfirmed one stays unmarked and is
