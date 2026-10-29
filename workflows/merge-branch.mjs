@@ -55,23 +55,65 @@ export async function mergeBranch(options) {
   }
   const statePath = path.resolve(worktree, git(worktree, ["rev-parse", "--git-path", "merge-branch-resume.json"]).stdout.trim());
   let resuming = false;
+  let resumeState = null;
+  const phantomDirtCleared = [];
   if (fs.existsSync(statePath)) {
-    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
-    if (state.approvedSha !== approvedSha || state.branch !== branch || state.mainBranch !== mainBranch) throw new Error("resume state does not match this merge request");
+    resumeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    if (resumeState.approvedSha !== approvedSha || resumeState.branch !== branch || resumeState.mainBranch !== mainBranch) throw new Error("resume state does not match this merge request");
     const rebaseMerge = path.resolve(worktree, git(worktree, ["rev-parse", "--git-path", "rebase-merge"]).stdout.trim());
     const rebaseApply = path.resolve(worktree, git(worktree, ["rev-parse", "--git-path", "rebase-apply"]).stdout.trim());
     if (git(worktree, ["status", "--porcelain"]).stdout.trim() || fs.existsSync(rebaseMerge) || fs.existsSync(rebaseApply)) throw new Error("rebase is not finished; resolve conflicts and run git rebase --continue");
-    const current = git(worktree, ["rev-parse", "HEAD"]).stdout.trim();
-    if (current === state.collapsedSha || git(worktree, ["rev-list", "--count", `${mainBranch}..HEAD`]).stdout.trim() !== "1") throw new Error("resume requires the completed rebased branch commit");
-    resuming = true;
-  } else {
+    const count = git(worktree, ["rev-list", "--count", `${mainBranch}..HEAD`]).stdout.trim();
+    if (resumeState.phase === "gated") {
+      // The gated state is written right after the collapse, BEFORE the rebase: a
+      // fast-forward rebase leaves collapsedSha itself as HEAD, so sha equality cannot
+      // tell "rebase done". The gate is resumable exactly when the branch already sits
+      // on mainBranch's tip; otherwise the pending rebase still has to run.
+      if (count !== "1") throw new Error("resume requires one collapsed branch commit");
+      resuming = git(worktree, ["rev-parse", mainBranch]).stdout.trim() === git(worktree, ["merge-base", mainBranch, "HEAD"]).stdout.trim();
+    } else {
+      const current = git(worktree, ["rev-parse", "HEAD"]).stdout.trim();
+      if (current === resumeState.collapsedSha || count !== "1") throw new Error("resume requires the completed rebased branch commit");
+      resuming = true;
+    }
+  }
+  if (!resuming) {
     const sha = git(main, ["rev-parse", branch]).stdout.trim();
-    if (sha !== approvedSha) throw new Error(`branch moved after review: ${sha}`);
+    // A retry after a gate failure may legitimately find the branch at the collapsed
+    // head recorded in the gated resume state (its rebase may still be pending).
+    const resumedCollapsed = resumeState && resumeState.phase === "gated" ? resumeState.collapsedSha : null;
+    if (sha !== approvedSha && sha !== resumedCollapsed) throw new Error(`branch moved after review: ${sha}`);
+    // Phantom dirt: stat-level entries (porcelain lists tracked files whose unstaged
+    // content diff is empty) must not block the collapse/rebase. Refresh the index
+    // first, then clear ONLY the phantom paths - never `checkout -- .`; real dirt
+    // (content differs) keeps blocking downstream as before.
+    git(worktree, ["update-index", "-q", "--refresh"], false);
+    const wtStatus = git(worktree, ["status", "--porcelain"], false).stdout;
+    if (wtStatus.trim() && git(worktree, ["diff", "--quiet"], false).status === 0) {
+      const phantomPaths = wtStatus.split("\n").filter((l) => l && !l.startsWith("??")).map((l) => l.slice(3));
+      if (phantomPaths.length) {
+        git(worktree, ["checkout", "--", ...phantomPaths], false);
+        phantomDirtCleared.push(...phantomPaths);
+      }
+    }
     const base = git(worktree, ["merge-base", mainBranch, branch]).stdout.trim();
     git(worktree, ["reset", "--soft", base]);
     git(worktree, ["commit", "-m", options.message || `feat: ${branch}`]);
+    // The resume state is written IMMEDIATELY after the successful collapse (phase
+    // gated): a later gate failure then resumes from the gate instead of dying on
+    // "branch moved after review".
+    fs.writeFileSync(statePath, JSON.stringify({ approvedSha, branch, mainBranch, phase: "gated", collapsedSha: git(worktree, ["rev-parse", "HEAD"]).stdout.trim() }));
   }
-  const rebased = resuming ? { status: 0 } : git(worktree, ["rebase", mainBranch], false);
+  // The rebase runs with conversion pinned off so it cannot silently rewrite line
+  // endings between the collapse and the squash. A worktree smudged by core.autocrlf
+  // is "dirty" only under that pin: when the repo's own view of the worktree is clean
+  // (no unstaged and no staged content), the pin would refuse a clean merge, so the
+  // rebase falls back to the repo config. Real dirt fails the pinned rebase as before.
+  let rebased = resuming ? { status: 0 } : git(worktree, ["-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "rebase", mainBranch], false);
+  if (!resuming && rebased.status !== 0 && /unstaged changes/.test(rebased.stderr)
+    && git(worktree, ["diff", "--quiet"], false).status === 0 && git(worktree, ["diff", "--cached", "--quiet"], false).status === 0) {
+    rebased = git(worktree, ["rebase", mainBranch], false);
+  }
   if (rebased.status !== 0) {
     const conflicts = git(worktree, ["diff", "--name-only", "--diff-filter=U"], false).stdout.trim().split("\n").filter(Boolean);
     if (conflicts.length) {
@@ -81,7 +123,6 @@ export async function mergeBranch(options) {
     }
     throw new Error(rebased.stderr.trim() || "rebase failed without conflicts");
   }
-  if (resuming) fs.rmSync(statePath, { force: true });
   const worktreeStatus = git(worktree, ["status", "--porcelain"]).stdout.trim();
   const pending = git(worktree, ["rebase", "--show-current-patch"], false);
   if (worktreeStatus || pending.status === 0) throw new Error("worktree is not clean after rebase");
@@ -104,6 +145,9 @@ export async function mergeBranch(options) {
   if (suite.status !== 0) { git(main, ["reset", "--hard", "HEAD"]); throw new Error(`testCommand failed (${suite.status}): ${suite.stderr || suite.stdout}`); }
   git(main, ["commit", "-m", options.message || `feat: ${branch}`]);
   const mergeCommit = git(main, ["rev-parse", "HEAD"]).stdout.trim();
+  // The resume state is deleted only after the merge commit has landed: a gate failure
+  // above must keep it so the retry resumes from the gate instead of "branch moved".
+  fs.rmSync(statePath, { force: true });
   let journalWritten = false;
   if (options.journalFile) {
     const journal = path.resolve(main, options.journalFile);
@@ -141,7 +185,7 @@ export async function mergeBranch(options) {
     } catch { bdClosed = false; }
   }
   git(main, ["worktree", "remove", worktree]);
-  return { status: 0, data: { merged: true, checksOk: true, journalWritten, mergeCommit, bdClosed, note: "" } };
+  return { status: 0, data: { merged: true, checksOk: true, journalWritten, mergeCommit, bdClosed, phantomDirtCleared, note: "" } };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {

@@ -3896,3 +3896,61 @@ T("main-copy isolation: rework and report-repair specs carry the worktree cwd; w
     assert.ok(runs.spec(k).spec.task.includes(wt) || k === K.work, "brief names the worktree for " + k);
   }
 });
+
+// --- E0.1: phantom dirt + resume-before-gate ------------------------------------------------
+// Fixture poison: porcelain lists 3 tracked files while the unstaged content diff
+// (`git diff --quiet`) is empty - the phantom signature the merger clears per-path.
+function stagedDirtFixture(prefix) {
+  const fx = gateFixture(prefix);
+  const git = (cwd, ...args) => {
+    const r = spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(r.status, 0, `git ${args.join(" ")}: ${r.stderr}`); return r.stdout.trim();
+  };
+  fsSync.writeFileSync(pathMod.join(fx.wt, "base.txt"), "phantom base\n");
+  fsSync.writeFileSync(pathMod.join(fx.wt, "new.txt"), "phantom new\n");
+  fsSync.writeFileSync(pathMod.join(fx.wt, "third.txt"), "phantom third\n");
+  git(fx.wt, "add", "base.txt", "new.txt", "third.txt");
+  assert.ok(git(fx.wt, "status", "--porcelain"), "fixture: worktree is porcelain-dirty");
+  const quiet = spawnSync("git", ["diff", "--quiet"], { cwd: fx.wt, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  assert.equal(quiet.status, 0, "fixture: unstaged diff is quiet (phantom signature)");
+  return fx;
+}
+
+T("mergeBranch phantom dirt: porcelain-dirty worktree with quiet unstaged diff merges, phantomDirtCleared names all three files", async () => {
+  const fx = stagedDirtFixture("merge-phantom-dirt-");
+  try {
+    const result = await mergeBranch({ mainDir: fx.main, mainBranch: "main", worktree: fx.wt, branch: "worker", approvedSha: fx.approvedSha, testCommand: "true" });
+    assert.equal(result.status, 0, "merge proceeds over phantom dirt");
+    assert.equal(result.data.merged, true);
+    assert.equal(result.data.phantomDirtCleared.length, 3, "all three phantom files are reported: " + JSON.stringify(result.data.phantomDirtCleared));
+  } finally { fsSync.rmSync(fx.root, { recursive: true, force: true }); }
+});
+
+T("mergeBranch gate failure keeps the resume: retry with the same approvedSha continues from the gate, not branch moved", async () => {
+  const fx = gateFixture("merge-gate-resume-");
+  const git = (cwd, ...args) => {
+    const r = spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.equal(r.status, 0, `git ${args.join(" ")}: ${r.stderr}`); return r.stdout.trim();
+  };
+  const statePath = pathMod.resolve(fx.wt, git(fx.wt, "rev-parse", "--git-path", "merge-branch-resume.json"));
+  const mainBefore = git(fx.main, "rev-parse", "HEAD");
+  try {
+    let gateError = null;
+    try {
+      await mergeBranch({ mainDir: fx.main, mainBranch: "main", worktree: fx.wt, branch: "worker", approvedSha: fx.approvedSha, testCommand: "false" });
+    } catch (error) { gateError = error; }
+    assert.ok(gateError, "a failing gate surfaces as an error");
+    assert.match(String(gateError.message), /testCommand failed/, "the first attempt dies at the gate, not earlier");
+    assert.equal(git(fx.main, "rev-parse", "HEAD"), mainBefore, "gate rollback leaves integration HEAD untouched");
+    assert.ok(fsSync.existsSync(statePath), "the resume state survives the gate failure");
+    const state = JSON.parse(fsSync.readFileSync(statePath, "utf8"));
+    assert.equal(state.phase, "gated", "resume state is phase gated");
+    assert.equal(state.approvedSha, fx.approvedSha, "resume state binds the approved SHA");
+    assert.ok(/^[0-9a-f]{40}$/.test(state.collapsedSha), "resume state records the collapsed SHA");
+    const retry = await mergeBranch({ mainDir: fx.main, mainBranch: "main", worktree: fx.wt, branch: "worker", approvedSha: fx.approvedSha, testCommand: "true" });
+    assert.equal(retry.status, 0, "retry with the same approvedSha merges (no branch-moved rejection)");
+    assert.equal(retry.data.merged, true);
+    assert.equal(git(fx.main, "rev-list", "--count", "main~1..main"), "1", "exactly the squash merge commit landed");
+    assert.equal(fsSync.existsSync(statePath), false, "resume state is deleted after the merge commit");
+  } finally { fsSync.rmSync(fx.root, { recursive: true, force: true }); }
+});
