@@ -1,6 +1,7 @@
 {
   "name": "agile-leaf-pilot",
   "description": "One bd-free agile leaf through a declarative DAG: script gates, parallel reviews, deterministic score gates, script merge, early report",
+  "budget": { "maxUSD": 0.5, "maxTokens": 2000000 },
   "concurrency": 2,
   "strictInterpolation": true,
   "phases": [
@@ -14,7 +15,7 @@
     {
       "id": "baseline-test",
       "type": "script",
-      "run": "set PATH=C:\\Users\\user\\bin;%PATH% && npm test",
+      "run": "npm test",
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 300000,
       "dependsOn": ["base", "report-stub"]
@@ -44,8 +45,8 @@
       "model": "opencode-go/hy4-flash-free",
       "tools": ["read", "grep", "find", "ls", "edit", "write"],
       "cwd": "D:/tmp/tf-pilot-repo",
-      "timeout": 900000,
-      "idleTimeout": 300000,
+      "timeout": 600000,
+      "idleTimeout": 180000,
       "idempotent": false,
       "output": "json",
       "expect": {
@@ -58,15 +59,37 @@
         }
       },
       "dependsOn": ["branch"],
-      "task": "Implement the verbatim contract in Appendix A of docs/plans/taskflow-pilot/PLAN.md (read that file). HARD RULES: you have NO shell tool; do not call bd, do not touch any repository outside this cwd, do not commit, do not edit files outside workflows/agile-loop.js and tests/agile-loop.test.mjs. Tests are run by a deterministic script phase, not by you. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else."
+      "task": "Implement the verbatim contract in Appendix A of docs/plans/taskflow-pilot/PLAN.md (read that file). HARD RULES: finish in at most 15 turns; read only the two target files and the plan appendix; do not call bd, do not touch any repository outside this cwd, do not commit, do not edit files outside workflows/agile-loop.js and tests/agile-loop.test.mjs. If branch tf-pilot/8en already exists, REUSE it and keep existing edits; never recreate or reset it. Tests are run by deterministic script phases, not by you; write only assertions whose expected text actually exists in the engine source. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else."
+    },
+    {
+      "id": "contract-check",
+      "type": "script",
+      "run": ["node", "-e", "const fs=require('fs');const e=fs.readFileSync('workflows/agile-loop.js','utf8');const t=fs.readFileSync('tests/agile-loop.test.mjs','utf8');const n=(e.match(/BD_WRITE_BAN/g)||[]).length;const r=/bd reopen/.test(e);const b=/bd write ban/i.test(t);const q=/reopen/i.test(t);console.log(n>=5&&r&&b&&q?'CONTRACT PASS':'CONTRACT FAIL n='+n+' reopen='+r+' tests='+b+' q='+q);"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "dependsOn": ["work"]
+    },
+    {
+      "id": "gate-contract",
+      "type": "gate",
+      "dependsOn": ["work", "contract-check"],
+      "onBlock": "retry",
+      "retry": { "max": 1, "backoffMs": 0 },
+      "score": {
+        "target": "{steps.contract-check.output}",
+        "scorers": [
+          { "type": "contains", "name": "contract-pass", "value": "CONTRACT PASS" }
+        ],
+        "combine": "all"
+      }
     },
     {
       "id": "verify",
       "type": "script",
-      "run": "set PATH=C:\\Users\\user\\bin;%PATH% && npm test",
+      "run": "npm test",
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 300000,
-      "dependsOn": ["work"]
+      "dependsOn": ["gate-contract"]
     },
     {
       "id": "diff-stat",
@@ -91,8 +114,8 @@
       "model": "openai-codex/gpt-6-luna",
       "tools": ["read", "grep", "find", "ls"],
       "cwd": "D:/tmp/tf-pilot-repo",
-      "timeout": 900000,
-      "idleTimeout": 300000,
+      "timeout": 600000,
+      "idleTimeout": 180000,
       "output": "json",
       "expect": {
         "type": "object",
@@ -105,18 +128,19 @@
         }
       },
       "retry": { "max": 1 },
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["git:HEAD", "file:workflows/agile-loop.js", "file:tests/agile-loop.test.mjs"] },
       "dependsOn": ["base", "diff-stat", "diff-full", "verify"],
       "task": "Fresh adversarial review from a clean context; you did not write this code. Work in the current cwd and read ONLY: docs/plans/taskflow-pilot/PLAN.md (Appendix A), workflows/agile-loop.js, tests/agile-loop.test.mjs with your read/grep tools. Base SHA: {steps.base.output}. Try to refute every acceptance item with file:line evidence. You have NO shell tool; do not call bd. VERDICT pass only if both acceptance items are implemented; the green suite is verified by a separate deterministic script phase. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
     },
     {
       "id": "review-guardrails",
       "type": "agent",
-      "agent": "fusion-reviewer",
-      "model": "openai-codex/gpt-6-luna",
+      "agent": "reviewer",
+      "model": "opencode-go/hy4-flash-free",
       "tools": ["read", "grep", "find", "ls"],
       "cwd": "D:/tmp/tf-pilot-repo",
-      "timeout": 900000,
-      "idleTimeout": 300000,
+      "timeout": 600000,
+      "idleTimeout": 180000,
       "output": "json",
       "expect": {
         "type": "object",
@@ -129,6 +153,7 @@
         }
       },
       "retry": { "max": 1 },
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["git:HEAD", "file:workflows/agile-loop.js", "file:tests/agile-loop.test.mjs"] },
       "dependsOn": ["base", "diff-stat", "diff-full", "verify"],
       "task": "Fresh guardrail review in parallel with the correctness reviewer; you did not write this code. Work in the current cwd and read ONLY workflows/agile-loop.js and tests/agile-loop.test.mjs with your read/grep tools. Check ONLY: (1) work/rework/repair/report-repair briefs contain an explicit ban on bd close/create/update; (2) a post-loop reconciliation reopens a falsely closed failed leaf and records an incident; (3) tests cover both; (4) no bd executable call was added. Base SHA: {steps.base.output}. You have NO shell tool; do not call bd. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
     },
@@ -190,7 +215,7 @@
     {
       "id": "merge",
       "type": "script",
-      "run": "set PATH=C:\\Users\\user\\bin;%PATH% && git checkout main && git merge --ff-only tf-pilot/8en && npm test",
+      "run": "git checkout main && git merge --ff-only tf-pilot/8en && npm test",
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 300000,
       "idempotent": false,
@@ -203,6 +228,15 @@
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 30000,
       "dependsOn": ["merge"],
+      "final": false
+    },
+    {
+      "id": "metrics",
+      "type": "script",
+      "run": ["node", "docs/plans/taskflow-pilot/metrics.mjs"],
+      "cwd": "D:/Documents/Repositories/pi-agile",
+      "timeout": 30000,
+      "dependsOn": ["post"],
       "final": true
     }
   ]

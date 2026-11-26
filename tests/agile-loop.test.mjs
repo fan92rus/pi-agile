@@ -3940,7 +3940,7 @@ T("mergeBranch conflict fixture: exit 2 reports conflicts and leaves integration
     fsSync.writeFileSync(pathMod.join(main, "same.txt"), "main\n"); git(main, "commit", "-am", "main change");
     git(main, "worktree", "add", wt, "worker");
     const mainBefore = git(main, "rev-parse", "HEAD");
-    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "true" });
+    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "node -e 0" });
     assert.equal(result.status, 2);
     assert.deepEqual(result.data.conflictFiles, ["same.txt"]);
     assert.equal(git(main, "rev-parse", "HEAD"), mainBefore, "conflict path made no integration commit");
@@ -3949,7 +3949,7 @@ T("mergeBranch conflict fixture: exit 2 reports conflicts and leaves integration
     git(wt, "add", "same.txt");
     const continued = spawnSync("git", ["-c", "core.editor=true", "rebase", "--continue"], { cwd: wt, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
     assert.equal(continued.status, 0, `rebase --continue: ${continued.stderr}`);
-    const resumed = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "true" });
+    const resumed = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "node -e 0" });
     assert.equal(resumed.status, 0, "same CLI request resumes completed rebase");
     assert.equal(resumed.data.merged, true);
   } finally { fsSync.rmSync(root, { recursive: true, force: true }); }
@@ -3968,7 +3968,7 @@ T("mergeBranch clean fixture: deterministic CLI squashes after full test command
     fsSync.writeFileSync(pathMod.join(main, "base.txt"), "base\n"); git(main, "add", "."); git(main, "commit", "-m", "base");
     git(main, "switch", "-c", "worker"); fsSync.writeFileSync(pathMod.join(main, "new.txt"), "change\n"); git(main, "add", "."); git(main, "commit", "-m", "worker change");
     const approvedSha = git(main, "rev-parse", "HEAD"); git(main, "switch", "main"); git(main, "worktree", "add", wt, "worker");
-    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "true" });
+    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "node -e 0" });
     assert.equal(result.status, 0); assert.equal(result.data.merged, true);
     assert.equal(result.data.bdClosed, false, "without --bd-leaf the CLI skips bd operations");
     assert.equal(git(main, "rev-list", "--count", "main~1..main"), "1");
@@ -3996,7 +3996,7 @@ T("mergeBranch ignored .beads is closed without an export commit", async () => {
     fsSync.writeFileSync(pathMod.join(main, "base.txt"), "base\n"); git(main, "add", "."); git(main, "commit", "-m", "base");
     git(main, "switch", "-c", "worker"); fsSync.writeFileSync(pathMod.join(main, "new.txt"), "change\n"); git(main, "add", "."); git(main, "commit", "-m", "worker change");
     const approvedSha = git(main, "rev-parse", "HEAD"); git(main, "switch", "main"); git(main, "worktree", "add", wt, "worker");
-    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "true", bdLeaf: "leaf-1" });
+    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "node -e 0", bdLeaf: "leaf-1" });
     assert.equal(result.status, 0); assert.equal(result.data.merged, true);
     assert.equal(result.data.bdClosed, true, "ignored .beads: close alone sets closed=true");
     assert.equal(git(main, "rev-list", "--count", "main~1..main"), "1", "no chore(bd) export commit when .beads is ignored");
@@ -4023,7 +4023,7 @@ T("mergeBranch bd spawn error is best-effort after committed merge", async () =>
     fsSync.writeFileSync(pathMod.join(main, "base.txt"), "base\n"); git(main, "add", "."); git(main, "commit", "-m", "base");
     git(main, "switch", "-c", "worker"); fsSync.writeFileSync(pathMod.join(main, "new.txt"), "change\n"); git(main, "add", "."); git(main, "commit", "-m", "worker change");
     const approvedSha = git(main, "rev-parse", "HEAD"); git(main, "switch", "main"); git(main, "worktree", "add", wt, "worker");
-    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "true", bdLeaf: "leaf-1" });
+    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "worker", approvedSha, testCommand: "node -e 0", bdLeaf: "leaf-1" });
     assert.equal(result.status, 0, "bd spawn error does not change merge success");
     assert.equal(result.data.merged, true);
     assert.equal(result.data.bdClosed, false);
@@ -4047,7 +4047,7 @@ T("K2: mergeBranch deletes the merged campaign branch after git cherry; a foreig
     git(main, "switch", "main");
     git(main, "switch", "-c", "agile/k2-merged"); fsSync.writeFileSync(pathMod.join(main, "new.txt"), "change\n"); git(main, "add", "."); git(main, "commit", "-m", "campaign work");
     const approvedSha = git(main, "rev-parse", "HEAD"); git(main, "switch", "main"); git(main, "worktree", "add", wt, "agile/k2-merged");
-    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "agile/k2-merged", approvedSha, testCommand: "true", campaignBranch: "agile/k2-merged" });
+    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "agile/k2-merged", approvedSha, testCommand: "node -e 0", campaignBranch: "agile/k2-merged" });
     assert.equal(result.status, 0); assert.equal(result.data.merged, true);
     assert.equal(result.data.branchDeleted, true, "the merged campaign branch is deleted");
     assert.equal(git(main, "branch", "--list", "agile/k2-merged"), "", "campaign branch is gone");
@@ -4071,7 +4071,7 @@ T("K2: a campaign branch whose git cherry shows a '+' line is kept (branchDelete
     git(main, "switch", "-c", "agile/k2-cherry"); fsSync.writeFileSync(pathMod.join(main, "new.txt"), "change\n"); git(main, "add", "."); git(main, "commit", "-m", "campaign work");
     const approvedSha = git(main, "rev-parse", "HEAD"); git(main, "switch", "main"); git(main, "worktree", "add", wt, "agile/k2-cherry");
     // The sdd checkbox ticks on main INSIDE the squash commit, so the squash is not patch-equivalent to the branch commit.
-    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "agile/k2-cherry", approvedSha, testCommand: "true", campaignBranch: "agile/k2-cherry", sddFile: "tasks.md", sddItem: "- [x] item one" });
+    const result = await mergeBranch({ mainDir: main, mainBranch: "main", worktree: wt, branch: "agile/k2-cherry", approvedSha, testCommand: "node -e 0", campaignBranch: "agile/k2-cherry", sddFile: "tasks.md", sddItem: "- [x] item one" });
     assert.equal(result.status, 0); assert.equal(result.data.merged, true, "the merge stands");
     assert.equal(result.data.branchDeleted, false, "git cherry '+' keeps the branch");
     assert.match(git(main, "cherry", "main", "agile/k2-cherry"), /^\+ /m, "git cherry reports a non-equivalent commit");
@@ -4305,7 +4305,7 @@ function stagedDirtFixture(prefix) {
 T("mergeBranch phantom dirt: porcelain-dirty worktree with quiet unstaged diff merges, phantomDirtCleared names all three files", async () => {
   const fx = stagedDirtFixture("merge-phantom-dirt-");
   try {
-    const result = await mergeBranch({ mainDir: fx.main, mainBranch: "main", worktree: fx.wt, branch: "worker", approvedSha: fx.approvedSha, testCommand: "true" });
+    const result = await mergeBranch({ mainDir: fx.main, mainBranch: "main", worktree: fx.wt, branch: "worker", approvedSha: fx.approvedSha, testCommand: "node -e 0" });
     assert.equal(result.status, 0, "merge proceeds over phantom dirt");
     assert.equal(result.data.merged, true);
     assert.equal(result.data.phantomDirtCleared.length, 3, "all three phantom files are reported: " + JSON.stringify(result.data.phantomDirtCleared));
@@ -4333,7 +4333,7 @@ T("mergeBranch gate failure keeps the resume: retry with the same approvedSha co
     assert.equal(state.phase, "gated", "resume state is phase gated");
     assert.equal(state.approvedSha, fx.approvedSha, "resume state binds the approved SHA");
     assert.ok(/^[0-9a-f]{40}$/.test(state.collapsedSha), "resume state records the collapsed SHA");
-    const retry = await mergeBranch({ mainDir: fx.main, mainBranch: "main", worktree: fx.wt, branch: "worker", approvedSha: fx.approvedSha, testCommand: "true" });
+    const retry = await mergeBranch({ mainDir: fx.main, mainBranch: "main", worktree: fx.wt, branch: "worker", approvedSha: fx.approvedSha, testCommand: "node -e 0" });
     assert.equal(retry.status, 0, "retry with the same approvedSha merges (no branch-moved rejection)");
     assert.equal(retry.data.merged, true);
     assert.equal(git(fx.main, "rev-list", "--count", "main~1..main"), "1", "exactly the squash merge commit landed");

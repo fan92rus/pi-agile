@@ -1,0 +1,19 @@
+# Amendment 3 evidence (extracted, small)
+
+Command: cd D:/Documents/Repositories/pi-agile && grep -E '^# (tests|pass|fail)' D:/tmp/true-fixture-review.log
+# tests 224
+# pass 224
+# fail 0
+
+Command: grep -c 'testCommand: "true"' tests/agile-loop.test.mjs
+0
+
+Command: grep -n 'core.editor=true' tests/agile-loop.test.mjs | head -2
+3950:    const continued = spawnSync("git", ["-c", "core.editor=true", "rebase", "--continue"], { cwd: wt, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+
+Command: grep -n '|| true' tests/agile-loop.test.mjs | head -3
+26:// A git MUTATION command silently continued with `|| true` - the ban targets real
+27:// commands, not prose that happens to mention both `git add -A` and `|| true`.
+1866:// (merged/dropped=false), never a blind `|| true` continue; any other dirt refuses.
+
+Review verdict from run true-fixture-fix-sync-mwxqt2j5-fe9b56: ГОДЕН, blockers none, minors none. The reviewer ran npm test independently: exit 0, 224/224. Shell check: cmd //c "node -e 0 && echo CMD_OK" printed CMD_OK, exit 0.
