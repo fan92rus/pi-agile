@@ -42,7 +42,7 @@
       "id": "work",
       "type": "agent",
       "agent": "executor-code",
-      "model": "opencode-go/hy4-flash-free",
+      "model": "openai-codex/gpt-6-luna",
       "tools": ["read", "grep", "find", "ls", "edit", "write"],
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 600000,
@@ -59,15 +59,37 @@
         }
       },
       "dependsOn": ["branch"],
-      "task": "Implement the verbatim contract in Appendix A of docs/plans/taskflow-pilot/PLAN.md (read that file). HARD RULES: finish in at most 15 turns; read only the two target files and the plan appendix; do not call bd, do not touch any repository outside this cwd, do not commit, do not edit files outside workflows/agile-loop.js and tests/agile-loop.test.mjs. If branch tf-pilot/8en already exists, REUSE it and keep existing edits; never recreate or reset it. Tests are run by deterministic script phases, not by you; write only assertions whose expected text actually exists in the engine source. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else."
+      "task": "Implement the verbatim contract in Appendix A of docs/plans/taskflow-pilot/PLAN.md (read that file). HARD RULES: finish in at most 15 turns; read only the two target files and the plan appendix; do not call bd, do not touch any repository outside this cwd, do not commit, do not edit files outside workflows/agile-loop.js and tests/agile-loop.test.mjs. If branch tf-pilot/8en already exists, REUSE it; never recreate or reset it. If the two target files still match HEAD, implement the contract from scratch; if edits already exist, refine them. Invariants to satisfy: a BD_WRITE_BAN constant that explicitly names `bd close`, `bd reopen`, `bd create` and `bd update`, plus four brief insertions (work/rework/repair/report-repair), post-loop `bd reopen` with incident recording, and tests asserting both. Baseline HEAD contains ZERO occurrences of BD_WRITE_BAN: you MUST edit workflows/agile-loop.js as well as the test file. Produce exactly five BD_WRITE_BAN references in the engine (one constant + four brief insertions including ledgerRepair) and expose the incident list in the return as bdReopenIncidents or bdCloseIncidents. Tests are run by deterministic script phases, not by you; write only assertions whose expected text actually exists in the engine source. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else."
     },
     {
       "id": "contract-check",
       "type": "script",
-      "run": ["node", "-e", "const fs=require('fs');const e=fs.readFileSync('workflows/agile-loop.js','utf8');const t=fs.readFileSync('tests/agile-loop.test.mjs','utf8');const n=(e.match(/BD_WRITE_BAN/g)||[]).length;const r=/bd reopen/.test(e);const b=/bd write ban/i.test(t);const q=/reopen/i.test(t);console.log(n>=5&&r&&b&&q?'CONTRACT PASS':'CONTRACT FAIL n='+n+' reopen='+r+' tests='+b+' q='+q);"],
+      "run": ["node", "-e", "const fs=require('fs');const e=fs.readFileSync('workflows/agile-loop.js','utf8');const t=fs.readFileSync('tests/agile-loop.test.mjs','utf8');const n=(e.match(/BD_WRITE_BAN/g)||[]).length;const r=/bd reopen \" \\+ /.test(e);const inc=/bdReopenIncidents|bdCloseIncidents/.test(e);const c=/bd create/.test(e);const u=/bd update/.test(e);const b=/BD_WRITE_BAN/.test(t)&&/bdReopenIncidents|bdCloseIncidents|post-loop-bd-reopen/.test(t);console.log(n>=5&&r&&inc&&c&&u&&b?'CONTRACT PASS':'CONTRACT FAIL n='+n+' reopenCmd='+r+' incidents='+inc+' create='+c+' update='+u+' tests='+b);"],
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 30000,
       "dependsOn": ["work"]
+    },
+    {
+      "id": "parse-check",
+      "type": "script",
+      "run": ["node", "-e", "const cp=require('child_process');let ok=true;const r=cp.spawnSync(process.execPath,['--check','tests/agile-loop.test.mjs'],{encoding:'utf8'});if(r.status){ok=false;console.error(r.stderr)}function done(){console.log(ok?'PARSE OK':'PARSE FAIL')}import('./tests/harness.mjs').then(m=>{m.compileWorkflow();done()}).catch(e=>{console.error(e.message);ok=false;done()})"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "dependsOn": ["contract-check"]
+    },
+    {
+      "id": "gate-parse",
+      "type": "gate",
+      "dependsOn": ["work", "parse-check"],
+      "onBlock": "retry",
+      "retry": { "max": 1, "backoffMs": 0 },
+      "score": {
+        "target": "{steps.parse-check.output}",
+        "scorers": [
+          { "type": "contains", "name": "parse-ok", "value": "PARSE OK" }
+        ],
+        "combine": "all"
+      }
     },
     {
       "id": "gate-contract",
@@ -89,7 +111,7 @@
       "run": "npm test",
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 300000,
-      "dependsOn": ["gate-contract"]
+      "dependsOn": ["gate-parse", "gate-contract"]
     },
     {
       "id": "diff-stat",
@@ -111,7 +133,7 @@
       "id": "review-correctness",
       "type": "agent",
       "agent": "reviewer",
-      "model": "openai-codex/gpt-6-luna",
+      "model": "opencode-go/hy4-flash-free",
       "tools": ["read", "grep", "find", "ls"],
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 600000,
