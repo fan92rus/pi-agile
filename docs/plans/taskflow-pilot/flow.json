@@ -1,0 +1,202 @@
+{
+  "name": "agile-leaf-pilot",
+  "description": "One bd-free agile leaf through a declarative DAG: script gates, parallel reviews, deterministic score gates, script merge, early report",
+  "concurrency": 2,
+  "strictInterpolation": true,
+  "phases": [
+    {
+      "id": "base",
+      "type": "script",
+      "run": "node -e \"const cp=require('child_process'); const sha=cp.execSync('git rev-parse HEAD').toString().trim(); const s=cp.execSync('git status --porcelain --untracked-files=all').toString(); console.log(sha); if(s.trim()){console.error(s); process.exit(1)}\"",
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000
+    },
+    {
+      "id": "baseline-test",
+      "type": "script",
+      "run": "npm test",
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 300000,
+      "dependsOn": ["base"]
+    },
+    {
+      "id": "branch",
+      "type": "script",
+      "run": "git checkout -B tf-pilot/8en",
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "idempotent": false,
+      "dependsOn": ["baseline-test"]
+    },
+    {
+      "id": "work",
+      "type": "agent",
+      "agent": "executor-code",
+      "model": "opencode-go/hy4-flash-free",
+      "tools": ["read", "grep", "find", "ls", "edit", "write"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 900000,
+      "idleTimeout": 300000,
+      "idempotent": false,
+      "output": "json",
+      "expect": {
+        "type": "object",
+        "required": ["files", "tests", "summary"],
+        "properties": {
+          "files": { "type": "array", "items": { "type": "string" } },
+          "tests": { "type": "string" },
+          "summary": { "type": "string" }
+        }
+      },
+      "dependsOn": ["branch"],
+      "task": "Implement the verbatim contract in Appendix A of docs/plans/taskflow-pilot/PLAN.md (read that file). HARD RULES: you have NO shell tool; do not call bd, do not touch any repository outside this cwd, do not commit, do not edit files outside workflows/agile-loop.js and tests/agile-loop.test.mjs. Tests are run by a deterministic script phase, not by you. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else."
+    },
+    {
+      "id": "verify",
+      "type": "script",
+      "run": "npm test",
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 300000,
+      "dependsOn": ["work"]
+    },
+    {
+      "id": "diff-stat",
+      "type": "script",
+      "run": ["git", "diff", "--stat", "{steps.base.output}...HEAD"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "dependsOn": ["base", "verify"]
+    },
+    {
+      "id": "diff-full",
+      "type": "script",
+      "run": ["git", "diff", "{steps.base.output}...HEAD"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "dependsOn": ["base", "verify"]
+    },
+    {
+      "id": "review-correctness",
+      "type": "agent",
+      "agent": "reviewer",
+      "model": "openai-codex/gpt-6-luna",
+      "tools": ["read", "grep", "find", "ls"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 900000,
+      "idleTimeout": 300000,
+      "output": "json",
+      "expect": {
+        "type": "object",
+        "required": ["verdict", "blockers", "evidence", "tests"],
+        "properties": {
+          "verdict": { "type": "string", "enum": ["pass", "block"] },
+          "blockers": { "type": "array", "items": { "type": "string" } },
+          "evidence": { "type": "array", "items": { "type": "string" } },
+          "tests": { "type": "string" }
+        }
+      },
+      "retry": { "max": 1 },
+      "dependsOn": ["diff-stat", "diff-full", "verify"],
+      "task": "Fresh adversarial review from a clean context; you did not write this code. Read the verbatim contract in Appendix A of docs/plans/taskflow-pilot/PLAN.md. Base SHA: {steps.base.output}. Diff stat: {steps.diff-stat.output}. Diff: {steps.diff-full.output}. Test output from a deterministic script: {steps.verify.output}. Try to refute every acceptance item with file:line evidence. You have NO shell tool; do not call bd. VERDICT pass only if every item is implemented and the script test output contains '# fail 0'. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"<exact numbers, include the substring fail 0 if green>\"}. Do not edit files."
+    },
+    {
+      "id": "review-guardrails",
+      "type": "agent",
+      "agent": "fusion-reviewer",
+      "model": "openai-codex/gpt-6-luna",
+      "tools": ["read", "grep", "find", "ls"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 900000,
+      "idleTimeout": 300000,
+      "output": "json",
+      "expect": {
+        "type": "object",
+        "required": ["verdict", "blockers", "evidence", "tests"],
+        "properties": {
+          "verdict": { "type": "string", "enum": ["pass", "block"] },
+          "blockers": { "type": "array", "items": { "type": "string" } },
+          "evidence": { "type": "array", "items": { "type": "string" } },
+          "tests": { "type": "string" }
+        }
+      },
+      "retry": { "max": 1 },
+      "dependsOn": ["diff-stat", "diff-full", "verify"],
+      "task": "Fresh cheap guardrail review in parallel with the correctness reviewer; you did not write this code. Check ONLY: (1) work/rework/report-repair briefs contain an explicit ban on bd close/create/update; (2) a post-loop reconciliation reopens a falsely closed failed leaf and records an incident; (3) no file outside the two allowed files changed; (4) the diff contains no bd executable call. Base SHA: {steps.base.output}. Diff stat: {steps.diff-stat.output}. Diff: {steps.diff-full.output}. Test output: {steps.verify.output}. You have NO shell tool; do not call bd. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"<n/a or exact numbers>\"}. Do not edit files."
+    },
+    {
+      "id": "report",
+      "type": "agent",
+      "agent": "doc-writer",
+      "model": "opencode-go/hy4-flash-free",
+      "tools": ["read", "write"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 300000,
+      "dependsOn": ["review-correctness", "review-guardrails", "verify", "diff-stat"],
+      "task": "Write a Markdown report to the ABSOLUTE path D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/results.md using the write tool. Include: base SHA {steps.base.output}; baseline tests {steps.baseline-test.output}; post-work tests {steps.verify.output}; diff stat {steps.diff-stat.output}; correctness verdict {steps.review-correctness.output}; guardrails verdict {steps.review-guardrails.output}. State that gate outcome, final git state and per-phase token/time figures will be appended by the driver after the run, and that no bd command was executed. Do not run commands, do not call bd, do not write anywhere else."
+    },
+    {
+      "id": "gate-correctness",
+      "type": "gate",
+      "dependsOn": ["report", "review-correctness"],
+      "score": {
+        "target": "{steps.review-correctness.output}",
+        "scorers": [
+          { "type": "json-schema", "name": "verdict-pass", "schema": { "type": "object", "required": ["verdict"], "properties": { "verdict": { "enum": ["pass"] } } } },
+          { "type": "contains", "name": "tests-green", "value": "fail 0" }
+        ],
+        "combine": "all"
+      }
+    },
+    {
+      "id": "gate-guardrails",
+      "type": "gate",
+      "dependsOn": ["report", "review-guardrails"],
+      "score": {
+        "target": "{steps.review-guardrails.output}",
+        "scorers": [
+          { "type": "json-schema", "name": "verdict-pass", "schema": { "type": "object", "required": ["verdict"], "properties": { "verdict": { "enum": ["pass"] } } } }
+        ],
+        "combine": "all"
+      }
+    },
+    {
+      "id": "gate-tests",
+      "type": "gate",
+      "dependsOn": ["report", "verify"],
+      "score": {
+        "target": "{steps.verify.output}",
+        "scorers": [
+          { "type": "contains", "name": "fail-zero", "value": "fail 0" }
+        ],
+        "combine": "all"
+      }
+    },
+    {
+      "id": "commit",
+      "type": "script",
+      "run": "git add workflows/agile-loop.js tests/agile-loop.test.mjs && git commit -m \"pilot: protect failed leaves from child bd-close\"",
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 60000,
+      "idempotent": false,
+      "dependsOn": ["gate-correctness", "gate-guardrails", "gate-tests"]
+    },
+    {
+      "id": "merge",
+      "type": "script",
+      "run": "git checkout main && git merge --ff-only tf-pilot/8en && npm test",
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 300000,
+      "idempotent": false,
+      "dependsOn": ["commit"]
+    },
+    {
+      "id": "post",
+      "type": "script",
+      "run": "git status --porcelain --untracked-files=all && git log --oneline -1",
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "dependsOn": ["merge"],
+      "final": true
+    }
+  ]
+}
