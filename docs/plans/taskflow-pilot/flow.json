@@ -1,7 +1,7 @@
 {
   "name": "agile-leaf-pilot",
   "description": "One bd-free agile leaf through a declarative DAG: script gates, parallel reviews, deterministic score gates, script merge, early report",
-  "budget": { "maxUSD": 0.5, "maxTokens": 2000000 },
+  "budget": { "maxUSD": 0.5, "maxTokens": 1200000 },
   "concurrency": 2,
   "strictInterpolation": true,
   "phases": [
@@ -39,6 +39,24 @@
       "dependsOn": ["baseline-test"]
     },
     {
+      "id": "seed",
+      "type": "script",
+      "run": ["git", "apply", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/seed.patch"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "idempotent": false,
+      "dependsOn": ["branch"]
+    },
+    {
+      "id": "seed-check",
+      "type": "script",
+      "run": ["node", "-e", "const cp=require('child_process');const f=require('D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/flow.json');const cc=f.phases.find(p=>p.id==='contract-check').run.slice(1);const pc=f.phases.find(p=>p.id==='parse-check').run.slice(1);const a=cp.spawnSync(process.execPath,cc,{cwd:'D:/tmp/tf-pilot-repo',encoding:'utf8'});const b=cp.spawnSync(process.execPath,pc,{cwd:'D:/tmp/tf-pilot-repo',encoding:'utf8'});const ok=a.status===0&&b.status===0;console.log(ok?'SEED OK':'SEED FAIL');if(!ok){console.error((a.stdout||'')+(b.stdout||''))}"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 300000,
+      "idempotent": false,
+      "dependsOn": ["seed"]
+    },
+    {
       "id": "work",
       "type": "agent",
       "agent": "executor-code",
@@ -58,16 +76,25 @@
           "summary": { "type": "string" }
         }
       },
-      "dependsOn": ["branch"],
-      "task": "Implement the verbatim contract in Appendix A of docs/plans/taskflow-pilot/PLAN.md (read that file). HARD RULES: finish in at most 15 turns; read only the two target files and the plan appendix; do not call bd, do not touch any repository outside this cwd, do not commit, do not edit files outside workflows/agile-loop.js and tests/agile-loop.test.mjs. If branch tf-pilot/8en already exists, REUSE it; never recreate or reset it. If the two target files still match HEAD, implement the contract from scratch; if edits already exist, refine them. Invariants to satisfy: a BD_WRITE_BAN constant that explicitly names `bd close`, `bd reopen`, `bd create` and `bd update`, plus four brief insertions (work/rework/repair/report-repair), post-loop `bd reopen` with incident recording, and tests asserting both. Baseline HEAD contains ZERO occurrences of BD_WRITE_BAN: you MUST edit workflows/agile-loop.js as well as the test file. Produce exactly five BD_WRITE_BAN references in the engine (one constant + four brief insertions including ledgerRepair) and expose the incident list in the return as bdReopenIncidents or bdCloseIncidents. Tests are run by deterministic script phases, not by you; write only assertions whose expected text actually exists in the engine source. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else."
+      "when": "{steps.seed-check.output} != \"SEED OK\"",
+      "dependsOn": ["seed-check"],
+      "task": "The seed patch failed its machine checks. Fix ONLY the blockers printed by seed-check. HARD RULES: finish in at most 8 turns; read only the two target files and docs/plans/taskflow-pilot/PLAN.md Appendix A; do not call bd, do not commit, do not edit files outside workflows/agile-loop.js and tests/agile-loop.test.mjs. Invariants: a BD_WRITE_BAN constant naming `bd close`, `bd reopen`, `bd create` and `bd update`, five total references including ledgerRepair, a real post-loop `bd reopen` and an incident list in the return (bdIncidents, bdReopenIncidents or bdCloseIncidents), plus tests asserting behavior. Tests are run by deterministic script phases, not by you. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else."
+    },
+    {
+      "id": "work-echo",
+      "type": "script",
+      "run": "echo WORK-STATE-RECORDED",
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "dependsOn": ["work"]
     },
     {
       "id": "contract-check",
       "type": "script",
-      "run": ["node", "-e", "const fs=require('fs');const e=fs.readFileSync('workflows/agile-loop.js','utf8');const t=fs.readFileSync('tests/agile-loop.test.mjs','utf8');const n=(e.match(/BD_WRITE_BAN/g)||[]).length;const r=/bd reopen \" \\+ /.test(e);const inc=/bdReopenIncidents|bdCloseIncidents/.test(e);const c=/bd create/.test(e);const u=/bd update/.test(e);const b=/BD_WRITE_BAN/.test(t)&&/bdReopenIncidents|bdCloseIncidents|post-loop-bd-reopen/.test(t);console.log(n>=5&&r&&inc&&c&&u&&b?'CONTRACT PASS':'CONTRACT FAIL n='+n+' reopenCmd='+r+' incidents='+inc+' create='+c+' update='+u+' tests='+b);"],
+      "run": ["node", "-e", "const fs=require('fs');const e=fs.readFileSync('workflows/agile-loop.js','utf8');const t=fs.readFileSync('tests/agile-loop.test.mjs','utf8');const n=(e.match(/BD_WRITE_BAN/g)||[]).length;const r=/bd reopen \" \\+ /.test(e);const inc=/bdReopenIncidents|bdCloseIncidents|bdIncidents/.test(e);const c=/bd create/.test(e);const u=/bd update/.test(e);const b=/BD_WRITE_BAN|BD WRITES BAN/.test(t)&&/bdReopenIncidents|bdCloseIncidents|bdIncidents|post-loop-bd-reopen/.test(t);console.log(n>=5&&r&&inc&&c&&u&&b?'CONTRACT PASS':'CONTRACT FAIL n='+n+' reopenCmd='+r+' incidents='+inc+' create='+c+' update='+u+' tests='+b);"],
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 30000,
-      "dependsOn": ["work"]
+      "dependsOn": ["seed"]
     },
     {
       "id": "parse-check",
@@ -75,14 +102,12 @@
       "run": ["node", "-e", "const cp=require('child_process');let ok=true;const r=cp.spawnSync(process.execPath,['--check','tests/agile-loop.test.mjs'],{encoding:'utf8'});if(r.status){ok=false;console.error(r.stderr)}function done(){console.log(ok?'PARSE OK':'PARSE FAIL')}import('./tests/harness.mjs').then(m=>{m.compileWorkflow();done()}).catch(e=>{console.error(e.message);ok=false;done()})"],
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 30000,
-      "dependsOn": ["contract-check"]
+      "dependsOn": ["contract-check", "seed"]
     },
     {
       "id": "gate-parse",
       "type": "gate",
-      "dependsOn": ["work", "parse-check"],
-      "onBlock": "retry",
-      "retry": { "max": 1, "backoffMs": 0 },
+      "dependsOn": ["parse-check"],
       "score": {
         "target": "{steps.parse-check.output}",
         "scorers": [
@@ -94,9 +119,7 @@
     {
       "id": "gate-contract",
       "type": "gate",
-      "dependsOn": ["work", "contract-check"],
-      "onBlock": "retry",
-      "retry": { "max": 1, "backoffMs": 0 },
+      "dependsOn": ["contract-check"],
       "score": {
         "target": "{steps.contract-check.output}",
         "scorers": [

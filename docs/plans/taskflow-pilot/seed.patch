@@ -1,0 +1,296 @@
+diff --git a/tests/agile-loop.test.mjs b/tests/agile-loop.test.mjs
+index 85722fd..1b7d04b 100644
+--- a/tests/agile-loop.test.mjs
++++ b/tests/agile-loop.test.mjs
+@@ -2376,6 +2376,73 @@ T("toy-falcon bd-close post-loop: nothing pending after the merger closed everyt
+   assert.ok(out.res.log.every((l) => !/sprint 2: bd-close closed/.test(l)), "the boundary no longer logs any bd-close");
+ });
+ 
++// --- pi-agile-8en: workers never close bd leaves; post-loop reconciles false closes ----
++T("bd reconcile: a child-reported closed FAILED leaf is reopened post-loop, incident in return", async () => {
++  const routes = makeRuns([
++    // a misbehaving child closed the leaf while the engine verdict is failed
++    { match: K.work, handle: ok(workOut({ completed: false, bd_closed: true })) },
++    { match: /reopen/, handle: ok({ cleaned: [], closed: [{ id: "fal-a", closed: true, note: "reopened" }], leaves: [] }) },
++  ]);
++  const out = await runCampaign(baseArgs({
++    taskSource: "bd-epic", bdEpic: "t-fal.1", doneWhen: "bd-epic-closed",
++    sprintTasks: 1, maxSprints: 1,
++    bdTasks: [falconLeaf("fal-a")],
++  }), routes, makeState());
++  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
++  assert.equal(out.res.tasks[0].verdict, "failed", "no merge happened in this campaign");
++  assert.equal(routes.count(/reopen/), 1, "exactly one mechanical reopen child");
++  const rc = routes.spec(/reopen/);
++  assert.ok(/bd reopen fal-a -r /.test(rc.spec.task), "the reopen command names the leaf: " + rc.spec.task);
++  assert.ok(/no merged verdict in this campaign/.test(rc.spec.task), "the -r explanation is carried verbatim");
++  assert.equal(out.res.bdIncidents.length, 1, "the false close is an incident in the return");
++  assert.equal(out.res.bdIncidents[0].id, "fal-a");
++  assert.equal(out.res.bdIncidents[0].verdict, "failed");
++  assert.equal(out.res.bdIncidents[0].reopened, true);
++  assert.equal(out.res.incidents, out.res.bdIncidents, "generic incident alias");
++  assert.ok(out.res.log.some((l) => /BD CONSISTENCY INCIDENT/.test(l) && /fal-a/.test(l)), "incident logged: " + JSON.stringify(out.res.log));
++});
++
++T("bd write ban: work / rework / report-repair / repair briefs forbid worker bd close", async () => {
++  const briefs = [];
++  const routesWork = makeRuns(happyRoutes({ curator: ok(curatorOut(true, [task(1)])) }));
++  assert.ok(!(await runCampaign(baseArgs(), routesWork)).err, "work campaign threw");
++  briefs.push(["work", routesWork.spec(K.work).spec.task]);
++
++  let reviews = 0;
++  const routesRework = makeRuns(happyRoutes({
++    curator: ok(curatorOut(true, [task(1)])),
++    review: () => ok(reviewOk(reviews++ > 0))(),
++    rework: ok(workOut({ head: "2222222222222222222222222222222222222222" })),
++  }));
++  assert.ok(!(await runCampaign(baseArgs({ reworkLimit: 1 }), routesRework)).err, "rework campaign threw");
++  briefs.push(["rework", routesRework.spec(K.rework).spec.task]);
++
++  const routesSalvage = makeRuns(happyRoutes({
++    curator: ok(curatorOut(true, [task(1)])),
++    work: ok(workOut({ validationOutput: [] })),
++    reportRepair: ok(workOut()),
++  }));
++  assert.ok(!(await runCampaign(baseArgs(), routesSalvage)).err, "salvage campaign threw");
++  briefs.push(["report-repair", routesSalvage.spec(K.reportRepair).spec.task]);
++
++  let repairReviews = 0;
++  const routesRepair = makeRuns(happyRoutes({
++    curator: ok(curatorOut(true, [task(1)])),
++    work: ok(workOut({ head: "1111111111111111111111111111111111111111" })),
++    review: () => ok(reviewOk(repairReviews++ > 0))(),
++    arbiter: ok(arbOut("escalate-ledger", "genuinely nontrivial")),
++    repair: ok(workOut({ head: "9999999999999999999999999999999999999999", what_done: "repair done" })),
++  }));
++  assert.ok(!(await runCampaign(baseArgs({ reworkLimit: 0, agentWork: "ledger-worker" }), routesRepair)).err, "repair campaign threw");
++  briefs.push(["repair", routesRepair.spec(K.repair).spec.task]);
++
++  for (const [label, brief] of briefs) {
++    assert.ok(/BD WRITES BAN/.test(brief), label + " brief carries the bd write ban");
++    assert.ok(/bd close\/reopen\/create\/update/.test(brief), label + " brief names close/reopen/create/update");
++    assert.ok(/merge child/i.test(brief) && /post-loop bd-close child/.test(brief), label + " brief names the only bd writers");
++  }
++});
++
+ // --- mergeApproval: who authorizes each merge commit ------------------------------
+ // bd-epic/headless viability: merge children asking the supervisor hang headless
+ // federations (pi -p / goal-x non-interactive). 'auto' (default in bd-epic mode)
+diff --git a/workflows/agile-loop.js b/workflows/agile-loop.js
+index 5973bb2..f5df555 100644
+--- a/workflows/agile-loop.js
++++ b/workflows/agile-loop.js
+@@ -802,6 +802,20 @@ let bdSnapshot = (Array.isArray(args.bdTasks) ? args.bdTasks : []).map(normalize
+ // post-loop child closed them) - never closed twice (exactly-once: a failed close stays
+ // unmarked and is retried by the post-loop child or the driver).
+ const bdClosedIds = new Set();
++// pi-agile-8en: a child may REPORT a close for a leaf whose campaign verdict is failed.
++// Keep that evidence separate from the confirmed-close set (exactly-once bookkeeping)
++// and reconcile it with taskResults at the end of the campaign.
++const bdReportedClosed = new Set();
++function noteBdClosed(o) {
++  if (!o || !Array.isArray(o.closed)) return;
++  o.closed.forEach(function (c) {
++    if (c && c.closed === true && c.id) bdReportedClosed.add(String(c.id));
++  });
++}
++function noteBdClosedByChild(rec, o) {
++  if (!o || !rec || !rec.id) return;
++  if (o.bd_closed === true || o.bdClosed === true || o.closed === true) bdReportedClosed.add(String(rec.id));
++}
+ function doneSet() {
+   const s = new Set();
+   bdSnapshot.forEach(function (l) { if (!l.open) s.add(l.id); });
+@@ -943,6 +957,10 @@ const REPORT_SHAPE_RE = /^schema-missing:/i; // salvage-class rejections: the ma
+ const FACTS = "FACTS DISCIPLINE: state only facts you personally verified this session (ran or read); mark recollections as [unverified]. CITATION RULE: cite only sources you actually opened this session.\n";
+ const CMDS = "Every long command runs with piped stdin and an explicit timeout; running servers, tests or solvers without piped stdin is a violation. Work incrementally.\n";
+ const GIT_RULES = "Git rules: work on YOUR feature branch only; never push; never mutate main; never rewrite history.\n";
++// pi-agile-8en: workers are NOT bookkeepers. A child once closed bd leaf xj0.3 with
++// 'Implemented... gates passed' while the engine verdict was failed - nothing had
++// merged. Only the merge child and the post-loop bd-close child may change bd status.
++const BD_WRITE_BAN = "BD WRITES BAN (absolute, ANY issue including this leaf): no `bd close`, `bd reopen`, `bd create`, `bd update`, `bd edit` or any other bd write - bd close/reopen/create/update is the merge child's and the post-loop bd-close child's job ONLY, never a worker's. `bd show`/`bd list` are read-only and allowed only when a brief explicitly asks. A child that closes a failed leaf destroys unmerged work: report the fact instead of writing to bd.\n";
+ // ys9/wave-5 precedent: workers twice burned 250k+ tokens on self-written helper
+ // scripts (bd-cursor ys9, debug-tracker.mjs) because they read BRIEFS, not AGENTS.md.
+ // Shared by the work/rework/repair briefs below.
+@@ -1304,6 +1322,7 @@ function salvageReport(ctx, fromLabel) {
+   const repairLines = [
+     "You are the REPORT-REPAIR worker. A previous worker EXECUTED the task on branch " + slug + " but its structured report failed validation ('schema-missing'). Your ONLY job: reconstruct the COMPLETE structured report (the acceptance report) from the ACTUAL repository state.",
+     "HARD RULES: do NOT implement anything new; do NOT create branches, worktrees or commits; do NOT reset or delete anything. Read-only investigation plus ONE report.",
++    BD_WRITE_BAN,
+     parallel ? "The task worktree is \"" + wt + "\" (branch " + slug + " checked out there) - inspect THERE." : "",
+     absPathRule(wt),
+     "1) `git log --oneline main.." + slug + "` and `git diff main..." + slug + "` - what landed vs the task.",
+@@ -1321,6 +1340,7 @@ function salvageReport(ctx, fromLabel) {
+       rec.iterations++;
+       rec.repaired = true;
+       noteFiles(rec, o);
++      noteBdClosedByChild(rec, o);
+       log.push("sprint " + sprint + " task " + ((t._idx || 0) + 1) + ": report repaired from branch state (completed=" + (o.completed === true) + ")");
+       return o;
+     },
+@@ -1371,6 +1391,7 @@ function workPhase(t, rec, parallel) {
+     "Verification command (must pass before you finish): " + (relayMode && testCommandQuick ? gateRun(testCommandQuick) + " (quick gate; the FULL suite runs again at merge)" : gateRun(testCommand)),
+     "",
+     "Global constraints (repeated for direct workers): " + constraints,
++    BD_WRITE_BAN,
+     GIT_RULES, CMDS, NO_SCRATCH_DEBUG, EDIT_FAILURE_RULE,
+     "MINIMALITY CONTRACT: the acceptance criteria and the verification command are the source of truth; delete anything no criterion needs before finishing.",
+     "TDD preference: for aspects the verification command does not cover, write a failing test first and keep it in the deliverable.",
+@@ -1404,6 +1425,7 @@ function workPhase(t, rec, parallel) {
+       const o = outOf(w); // already schema-valid + semantically validated in runChild
+       rec.iterations++;
+       noteFiles(rec, o);
++      noteBdClosedByChild(rec, o);
+       return o;
+     },
+     function (e) {
+@@ -1437,6 +1459,7 @@ function ledgerRepair(t, rec, parallel, arbiterNote) {
+     "TASK-END",
+     "",
+     "ARBITER CONTEXT: " + String(arbiterNote || "rework exhausted").slice(0, 400),
++    BD_WRITE_BAN,
+     "",
+     "Your worktree is \"" + wt + "\" (branch " + slug + " is checked out there). cd into it first; verify `git status` is clean; never touch the main working copy.",,
+     absPathRule(wt),
+@@ -1459,6 +1482,7 @@ function ledgerRepair(t, rec, parallel, arbiterNote) {
+       const o = outOf(w);
+       rec.iterations++;
+       noteFiles(rec, o);
++      noteBdClosedByChild(rec, o);
+       return o;
+     },
+     function (e) {
+@@ -1860,7 +1884,7 @@ function postPhase(t, rec, wOut, parallel) {
+       absPathRule(wt),
+       (fixOnly ? "Reviewer verdict reasons (context only): " : "Reviewer rework reasons to address: ") + notes,
+       "Verification command: " + gateRun(testCommand),
+-      "", "Global constraints: " + constraints, GIT_RULES, CMDS, NO_SCRATCH_DEBUG, EDIT_FAILURE_RULE,
++      "", "Global constraints: " + constraints, BD_WRITE_BAN, GIT_RULES, CMDS, NO_SCRATCH_DEBUG, EDIT_FAILURE_RULE,
+       "HEAD REPORT (mandatory): after your FINAL commit run `git rev-parse HEAD` and report the full SHA in the `head` field.",
+       "Commit your fixes to the same branch; leave the working copy clean.",
+       (useLedger ? "Rework fixes are SMALL and focused: implement them DIRECTLY yourself - do NOT launch a new ledger ceremony." : ""),
+@@ -1876,6 +1900,7 @@ function postPhase(t, rec, wOut, parallel) {
+         const o2 = outOf(w2);
+         rec.iterations++;
+         noteFiles(rec, o2);
++        noteBdClosedByChild(rec, o2);
+         if (o2 && o2.head) rec.head = String(o2.head); // re-review/merge verify the NEW head, not the stale one
+         // Same rule as postPhase: a completed=false rework report is the worker's own
+         // rejection - a fresh review child would only re-reject it and burn the
+@@ -2091,6 +2116,7 @@ while (sprint < maxSprints && continueCampaign && !stopReason) {
+       try {
+         const bd = await runChild("s" + sprint + "-boundary", childOpts({ task: boundaryBrief(refresh), outputSchema: BOUNDARY_SCHEMA, acceptance: false }));
+         const bo = outOf(bd);
++        noteBdClosed(bo); // a closed[] report is bd evidence even when the snapshot part is empty
+         if (refresh && Array.isArray(bo.leaves) && bo.leaves.length) {
+           bdSnapshot = bo.leaves.map(normalizeLeaf);
+           log.push("bd-cursor: snapshot refreshed (" + bdSnapshot.filter(function (l) { return l.open; }).length + " open / " + bdSnapshot.length + " leaves)");
+@@ -2382,16 +2408,77 @@ if (taskSource === "bd-epic") {
+   if (finalClosables.length) {
+     try {
+       const fb = await runChild("final-bd-close", childOpts({ task: boundaryBrief(false, finalClosables), outputSchema: BOUNDARY_SCHEMA, acceptance: false }));
+-      const fbClosed = (outOf(fb).closed || []).filter(function (c) { return c && c.closed === true; }).length;
++      const fbOut = outOf(fb);
++      noteBdClosed(fbOut);
++      const fbClosed = (fbOut.closed || []).filter(function (c) { return c && c.closed === true; }).length;
+       log.push("post-loop: bd-close closed " + fbClosed + "/" + finalClosables.length + " done leaf(s) in bd" + (fbClosed < finalClosables.length ? " (rest stays open in bd)" : ""));
+     } catch (e) {
+       log.push("post-loop: bd-close child failed (" + String(e).slice(0, 120) + "); " + finalClosables.length + " done leaf(s) stay open in bd");
+     }
+   }
+ }
++// POST-LOOP RECONCILIATION (pi-agile-8en): bd status is EVIDENCE, not a verdict. A child
++// reported "Implemented... gates passed" and closed a leaf while the engine's verdict
++// was failed - nothing was merged. Compare every "closed in bd" signal (confirmed
++// merger/post-loop closes, closed[] reports, the final snapshot) against taskResults:
++// closed in bd WITHOUT a merged verdict in THIS campaign => mechanical reopen + incident.
++// Report stands even when the reopen child fails; no auto-revert, no other issue touched.
++const closedInBd = new Set();
++bdClosedIds.forEach(function (id) { if (id) closedInBd.add(String(id)); });
++bdReportedClosed.forEach(function (id) { if (id) closedInBd.add(String(id)); });
++bdSnapshot.forEach(function (l) { if (l && l.id && !l.open) closedInBd.add(String(l.id)); });
++const suspectById = Object.create(null);
++taskResults.forEach(function (r) {
++  if (!r || !r.id) return;
++  if (r.verdict === "merged" || r.verdict === "merged-after-arbitration") return;
++  if (closedInBd.has(String(r.id))) suspectById[String(r.id)] = r; // last attempt wins
++});
++const bdReconcileSuspects = Object.keys(suspectById).map(function (id) { return suspectById[id]; });
++const bdIncidents = bdReconcileSuspects.map(function (r) {
++  return {
++    id: String(r.id), leaf: String(r.id), verdict: String(r.verdict || "unknown"),
++    reason: "closed in bd without a merged verdict in this campaign",
++    reopened: false, note: ""
++  };
++});
++if (bdReconcileSuspects.length) {
++  const reopenLines = [
++    "You are the BD CONSISTENCY RECONCILER - a mechanical POST-LOOP bookkeeping child, NOT a planner, NOT an implementer and NOT a judge. The engine compared bd close evidence with this campaign's taskResults: the leaves below are closed in bd although they have NO merged verdict in this campaign. Reopen EACH of them so bd never claims work that was not merged.",
++    "For each line below, run it VERBATIM from the MAIN working copy with piped stdin (the grep pre-check skips a leaf that is already open):",
++    ...bdReconcileSuspects.map(function (r) {
++      const id = String(r.id);
++      const why = id + ": reopened by agile-loop post-loop reconciliation - campaign verdict " + String(r.verdict || "unknown") + " (no merged verdict in this campaign); closed by a child without a merge";
++      return "  bd show " + id + " --json </dev/null | grep -q '\"status\": *\"open\"' || bd reopen " + id + " -r " + JSON.stringify(why) + " </dev/null";
++    }),
++    "The -r comment is the MECHANICAL explanation above; do not invent a different reason and do not modify any issue not listed here.",
++    "Inspect the export path from the MAIN working copy: `git check-ignore -q .beads/issues.jsonl` and `git ls-files --error-unmatch .beads/issues.jsonl`. If ignored or untracked (stealth-bd), do NOT run bd export/add/commit; report note='export=stealth' and consider a reopen successful only when `bd show <id> --json` shows status open.",
++    "Tracked path only: run `bd export </dev/null`, then `git add .beads/issues.jsonl && git commit -m \"chore(bd): reopen non-merged leaves\"` (NO `|| true`; a failed git command surfaces). Verify `git status --porcelain -- .beads/issues.jsonl` is EMPTY; if still dirty, report the entry with closed=false and note='export commit failed: .beads/issues.jsonl still dirty'.",
++    FINAL_MSG,
++    "Schema keys: closed[{id, closed (true ONLY when bd confirms the leaf is OPEN again and the tracked export is clean or stealth), note}], leaves."
++  ].join("\n");
++  bdReconcileSuspects.forEach(function (r) {
++    log.push("BD CONSISTENCY INCIDENT: " + String(r.id) + " is closed in bd with campaign verdict " + String(r.verdict || "unknown") + " - reopening (no merged verdict in this campaign)");
++  });
++  try {
++    const rr = await runChild("final-bd-reopen", childOpts({ task: reopenLines, outputSchema: BOUNDARY_SCHEMA, acceptance: false }));
++    const rOut = outOf(rr);
++    const reported = Array.isArray(rOut.closed) ? rOut.closed : [];
++    bdIncidents.forEach(function (inc) {
++      const hit = reported.filter(function (c) { return c && String(c.id) === inc.id; }).pop();
++      inc.reopened = !(hit && hit.closed === false); // the child completed; an explicit closed=false is the only refusal
++      inc.note = String((hit && hit.note) || "").slice(0, 300);
++    });
++    log.push("post-loop: bd reopen completed for " + bdIncidents.filter(function (i) { return i.reopened; }).length + "/" + bdIncidents.length + " falsely closed leaf(ies)");
++  } catch (e) {
++    const msg = String(e).slice(0, 120);
++    bdIncidents.forEach(function (inc) { inc.note = "bd reopen child failed: " + msg; });
++    log.push("post-loop: bd reopen child failed (" + msg + "); " + bdIncidents.length + " falsely closed leaf(ies) remain incidents in the return");
++  }
++  cpWrite({ bdIncidents: bdIncidents }); // best-effort: the incident survives a resume
++}
+ // A fully completed bd epic must be closed explicitly after its leaves. Keep this
+ // mechanical action in the engine so headless runs do not depend on an outer driver.
+-if (taskSource === "bd-epic" && doneWhen === "bd-epic-closed" && stopReason === "epic-closed" && bdEpic) {
++if (taskSource === "bd-epic" && doneWhen === "bd-epic-closed" && stopReason === "epic-closed" && bdEpic && bdIncidents.length === 0) {
+   const epicCloseTask = [
+     "You perform only the final bd epic-close bookkeeping for " + JSON.stringify(bdEpic) + ".",
+     "From the MAIN working copy, verify the epic is not already closed (`bd show " + bdEpic + " --json </dev/null`). If open, run `bd close " + bdEpic + " -r \"all done leaves merged\" </dev/null` and verify with bd show. Do not close any leaf or other issue.",
+@@ -2401,11 +2488,15 @@ if (taskSource === "bd-epic" && doneWhen === "bd-epic-closed" && stopReason ===
+   ].join("\n");
+   try {
+     const ec = await runChild("epic-close", childOpts({ task: epicCloseTask, outputSchema: BOUNDARY_SCHEMA, acceptance: false }));
+-    const ecClosed = (outOf(ec).closed || []).some(function (c) { return c && String(c.id) === bdEpic && c.closed === true; });
++    const ecOut = outOf(ec);
++    noteBdClosed(ecOut);
++    const ecClosed = (ecOut.closed || []).some(function (c) { return c && String(c.id) === bdEpic && c.closed === true; });
+     log.push("post-loop: bd epic-close " + (ecClosed ? "confirmed " : "not confirmed ") + bdEpic);
+   } catch (e) {
+     log.push("post-loop: bd epic-close failed (" + String(e).slice(0, 120) + ")");
+   }
++} else if (taskSource === "bd-epic" && doneWhen === "bd-epic-closed" && stopReason === "epic-closed" && bdEpic && bdIncidents.length) {
++  log.push("post-loop: bd epic-close SKIPPED - " + bdIncidents.length + " falsely closed leaf(ies) were reopened; the epic stays open for the lead");
+ }
+ // K1: NO final cleanup. Unmerged branches and worktrees are never deleted by the engine; they
+ // are handed to the lead in return.keptBranches (the lead decides what to remove).
+@@ -2494,6 +2585,11 @@ return {
+   tasks: taskResults,
+   analytics: analytics,
+   mainIncidents: mainIncidents,
++  // pi-agile-8en: aliases keep the bd-consistency incident discoverable under the
++  // generic name as well as the bd-specific one (the return is the lead's hand-off).
++  bdIncidents: bdIncidents,
++  incidents: bdIncidents,
++  reconcileIncidents: bdIncidents,
+   needsAttention: needsAttention,
+   needsReview: needsReview,
+   keptBranches: keptBranches,
