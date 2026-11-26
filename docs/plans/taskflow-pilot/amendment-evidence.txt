@@ -1,0 +1,21 @@
+not ok 187 - mergeBranch conflict fixture: exit 2 reports conflicts and leaves integration HEAD untouched
+    testCommand failed (1): 'true' is not recognized as an internal or external command,
+    mergeBranch (file:///D:/tmp/tf-pilot-repo/workflows/merge-branch.mjs:209:75)
+not ok 188 - mergeBranch clean fixture: deterministic CLI squashes after full test command
+    testCommand failed (1): 'true' is not recognized as an internal or external command,
+    mergeBranch (file:///D:/tmp/tf-pilot-repo/workflows/merge-branch.mjs:209:75)
+not ok 190 - mergeBranch bd spawn error is best-effort after committed merge
+    testCommand failed (1): 'true' is not recognized as an internal or external command,
+    mergeBranch (file:///D:/tmp/tf-pilot-repo/workflows/merge-branch.mjs:209:75)
+not ok 191 - K2: mergeBranch deletes the merged campaign branch after git cherry; a foreign feat/* branch is never touched
+    testCommand failed (1): 'true' is not recognized as an internal or external command,
+    mergeBranch (file:///D:/tmp/tf-pilot-repo/workflows/merge-branch.mjs:209:75)
+not ok 192 - K2: a campaign branch whose git cherry shows a '+' line is kept (branchDeleted=false) and the merge still stands
+    testCommand failed (1): 'true' is not recognized as an internal or external command,
+    mergeBranch (file:///D:/tmp/tf-pilot-repo/workflows/merge-branch.mjs:209:75)
+not ok 203 - mergeBranch phantom dirt: porcelain-dirty worktree with quiet unstaged diff merges, phantomDirtCleared names all three files
+    testCommand failed (1): 'true' is not recognized as an internal or external command,
+    mergeBranch (file:///D:/tmp/tf-pilot-repo/workflows/merge-branch.mjs:209:75)
+not ok 204 - mergeBranch gate failure keeps the resume: retry with the same approvedSha continues from the gate, not branch moved
+    testCommand failed (1): 'true' is not recognized as an internal or external command,
+    mergeBranch (file:///D:/tmp/tf-pilot-repo/workflows/merge-branch.mjs:209:75)
