@@ -2919,3 +2919,35 @@ Amendment 5 убирает `fix` из основного flow и перенос�
 - happy-path (`SEED OK`) не создаёт сессию и сохраняет 0-токенный cross-run cache.
 
 Проверено до живого прогона: `validateTaskflow` для обоих flow — 0 ошибок и 0 предупреждений; модульные тесты форка на интерполяцию `session.id`, unresolved-placeholder и `cleanup: "keep"` зелёные. Живой замер fresh-токенов на 2–3 листах остаётся следующим шагом после рестарта Pi.
+
+### Автоматический замер: agile-leaf-pilot-mwypdy46-a848f3
+
+| phase | status | fresh | cache | total | turns | cost |
+|---|---|---:|---:|---:|---:|---:|
+| review-correctness | done | 99 875 | 334 080 | 433 955 | 6 | $0.00000 |
+| review-guardrails | done | 83 763 | 411 136 | 494 899 | 8 | $0.00000 |
+| **ИТОГО** | | **183 638** | **745 216** | **928 854** | | |
+
+### rev.6 живые прогоны (2026-11-27)
+
+**Happy path.** `agile-leaf-pilot-mwypdy46-a848f3` завершился `completed 26/28`: `work` пропущен по `SEED OK`, гейты и MERGE прошли. Ревьюеры не попали в cross-run cache из-за смены HEAD клона, поэтому замер получился 183 638 fresh / 745 216 cache — пайп рабочий, но цифра показывает, что кэш привязан к HEAD.
+
+**Session handoff.** Отдельный producer-прогон `handoff-producer-probe-mwyqip34-b2cac1` создал сессию `tf-pilot-8en-worker` с `cleanup: "keep"`, а consumer `handoff-consumer-probe-mwyqjahr-d5dfcd` продолжил её по `{args.sessionId}`:
+
+| run / phase | fresh | cacheRead | turns | результат |
+|---|---:|---:|---:|---|
+| producer `work` | 357 | 37 120 | 2 | `BD_WRITE_BANX` |
+| consumer `fix` | 110 | 18 816 | 1 | `BD_WRITE_BANX` из предыдущей сессии |
+
+После consumer-запуска transcript удалён по умолчанию (`cleanup: "run"`).
+
+**Полный rework.** Два прогона `agile-leaf-rework` прошли `completed 15/15`, оба ревью `pass`, мерж выполнен:
+
+| run | fresh fix | cacheRead fix | turns fix | коммит |
+|---|---:|---:|---:|---|
+| `agile-leaf-rework-mwyq2jt6-9d5131` | 42 242 | 429 696 | 9 | `9622dcd` |
+| `agile-leaf-rework-mwyqa87z-0b0608` | 30 562 | 347 776 | 9 | `84f776f` |
+
+Второй прогон дешевле, потому что tools в producer совпали с tools в rework `fix`; это подтверждает, что стабильный префикс system prompt улучшает provider cache.
+
+**Наладка.** Первый producer-запуск через уже загруженный хост не сохранил transcript: `cleanup: "keep"` в нём не действует. Прогон через свежий `pi` с явной загрузкой расширения (`--no-extensions -e .../pi-taskflow/dist/index.js`) корректно сохранил и затем удалил сессию. Все приведённые выше живые цифры — из свежих процессов.
