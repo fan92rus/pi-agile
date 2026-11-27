@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 const fail = (m) => { console.error(`RECHECK FAIL: ${m}`); process.exit(1); };
 const cwd = process.env.TF_MVP_WORKTREE_CWD || process.cwd();
 const dir = path.join(cwd, '.taskflow-mvp');
@@ -12,7 +13,7 @@ if (diff.error || diff.status !== 0) fail(`git diff failed: ${diff.stderr || dif
 const current = createHash('sha256').update(diff.stdout).digest('hex');
 const previous = fs.readFileSync(storedFile, 'utf8').trim();
 if (current === previous) { console.log('RECHECK OK (no diff)'); process.exit(0); }
-const gates = path.join(path.dirname(new URL(import.meta.url).pathname), 'gates.mjs');
+const gates = path.join(path.dirname(fileURLToPath(import.meta.url)), 'gates.mjs');
 const result = spawnSync(process.execPath, [gates, 'full'], { cwd, encoding: 'utf8', shell: false, windowsHide: true, env: { ...process.env, TF_MVP_WORKTREE_CWD: cwd } });
 if (result.stdout) process.stdout.write(result.stdout);
 if (result.stderr) process.stderr.write(result.stderr);
