@@ -1582,6 +1582,23 @@ T("no-code marker past the first 300 chars of the description does not select th
   assert.equal(runs.count(K.merge), 0, "rejected empty diff is not merged");
 });
 
+T("BD snapshot mapping preserves long acceptance clauses in work and review briefs", async () => {
+  const clause = Array.from({ length: 8 }, (_, i) => `criterion-${i + 1}: ${"x".repeat(45)}`).join("; ");
+  assert.ok(clause.length > 300);
+  const leaf = { id: "long-a", title: "long acceptance", rationale: "why", acceptance: clause, files_hint: "src/a.txt", deps: [], open: true };
+  const routes = makeRuns([
+    { match: K.work, handle: ok(workOut()) },
+    { match: K.review, handle: ok(reviewOk()) },
+    { match: K.merge, handle: ok(mergeOut()) },
+  ]);
+  const out = await runCampaign(baseArgs({ taskSource: "bd-epic", bdEpic: "long-epic", doneWhen: "bd-epic-closed", bdTasks: [leaf], maxSprints: 1 }), routes, makeState());
+  assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+  assert.ok(routes.spec(K.work).spec.task.includes(clause), "all acceptance clauses reach worker");
+  assert.ok(routes.spec(K.review).spec.task.includes(clause), "all acceptance clauses reach reviewer");
+  assert.ok(WORKFLOW_SRC.includes("rationale = the complete description (do NOT truncate)"));
+  assert.ok(WORKFLOW_SRC.includes("acceptance = the complete test/contract clause"));
+});
+
 // --- toy-falcon: FICTIONAL bd-epic federation fixtures (no real bd touched) ---
 const falconLeaf = (id, over = {}) => Object.assign({
   id, title: "falcon: " + id, rationale: "why " + id, acceptance: "gate " + id,
