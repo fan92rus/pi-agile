@@ -15,6 +15,7 @@
 | context-reuse-probe.json | замер реального фикса с блокером; после `4203e27` использует `session.key` и измеряет нативную continuity |
 | session-reuse-probe.json | минимальная проба одной Pi-сессии между фазами: `fix` = 247 fresh / 17 920 cacheRead |
 | SHARECONTEXT-FIX.md | root cause `TFWS_MUTEX_IDENTITY` (Windows inode > 2^53) и patch для taskflow-core |
+| `mvp/` | One-task Taskflow MVP: 19 phases, work/final review, gates, merge, bd close/export; 2 live runs, escalation proof in `mvp/RESULTS.md` |
 | reports/ | черновики прогонов; `results.md` больше не перезаписывается |
 
 Amendment 3 прошёл свежее ревью с вердиктом ГОДЕН. Amendment 4 — решение ведущего по ускорению: reuse-first вместо повторной генерации; измерено два успешных прогона (`mwxv52gt`, `mwxvcr6h`), последний — 0 LLM-токенов и 105.6 c. Доработки P0/P1 проверены прогонами `mwyfq258` (results.md не тронут) и `mwyfy22k` (completed). Вариант «тот же агент» измерен прогонами `mwygv53p` (461k provider-cache) и `mwygzdmh` (0 токенов).

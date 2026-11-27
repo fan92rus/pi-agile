@@ -1,0 +1,254 @@
+{
+  "name": "tf-leaf-mvp",
+  "description": "One-task Taskflow MVP: bd leaf → isolated worktree → work/review/gates → merge → bd close/export → JSON report",
+  "budget": { "maxUSD": 1.5, "maxTokens": 1200000 },
+  "concurrency": 2,
+  "strictInterpolation": true,
+  "args": {
+    "taskId": { "type": "string", "description": "bd task id, e.g. pi-agile-8en" },
+    "repo": { "type": "string", "description": "absolute path to base repo" },
+    "worktreeCwd": { "type": "string", "description": "absolute path to isolated worktree" },
+    "branch": { "type": "string", "description": "feature branch, e.g. tf-leaf-mvp/8en" },
+    "filesHint": { "type": "string", "default": "", "description": "CSV of allowed relative paths" },
+    "acceptanceFile": { "type": "string", "description": "acceptance criteria file" },
+    "criteriaFile": { "type": "string", "description": "reviewer criteria file" },
+    "testCommand": { "type": "string", "default": "npm test" },
+    "sessionId": { "type": "string", "default": "tf-leaf-mvp-worker" },
+    "forceEscalation": { "type": "string", "default": "false" },
+    "bdBin": { "type": "string", "default": "bd", "description": "bd executable; override with a shim for tests" }
+  },
+  "phases": [
+    {
+      "id": "preflight",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "preflight", "TF_MVP_REPO={args.repo}", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_BRANCH={args.branch}", "TF_MVP_TASK_ID={args.taskId}", "TF_MVP_ACCEPTANCE_FILE={args.acceptanceFile}", "TF_MVP_CRITERIA_FILE={args.criteriaFile}", "TF_MVP_BD_BIN={args.bdBin}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-repo",
+      "timeout": 60000,
+      "idempotent": false
+    },
+    {
+      "id": "task-packet",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "task-packet", "TF_MVP_REPO={args.repo}", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_TASK_ID={args.taskId}", "TF_MVP_ACCEPTANCE_FILE={args.acceptanceFile}", "TF_MVP_BD_BIN={args.bdBin}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 60000,
+      "dependsOn": ["preflight"]
+    },
+    {
+      "id": "work",
+      "type": "agent",
+      "agent": "executor-code",
+      "model": "openai-codex/gpt-6-luna",
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 900000,
+      "idleTimeout": 240000,
+      "tools": ["read", "grep", "find", "ls", "edit", "write", "bash"],
+      "session": { "id": "{args.sessionId}", "cleanup": "keep" },
+      "supervisor": { "target": "parent", "timeoutMs": 600000 },
+      "output": "json",
+      "expect": {
+        "type": "object",
+        "required": ["summary", "filesChanged"],
+        "properties": {
+          "summary": { "type": "string" },
+          "filesChanged": { "type": "array", "items": { "type": "string" } },
+          "decisions": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "dependsOn": ["task-packet"],
+      "task": "Implement exactly one bd leaf in the isolated worktree. Read .taskflow-mvp/task.json and .taskflow-mvp/acceptance.txt. Allowed files: {args.filesHint}. HARD RULES: never call bd, never commit, never push, never edit .beads/ or .taskflow-mvp/ except writing .taskflow-mvp/worker.json with your final JSON. You MAY use bash for local inspection/tests, but never with bd/commit/push. If blocked by an API/scope/product decision, call contact_supervisor with reason need_decision and continue with the answer in the same turn. FORCE ESCALATION FLAG: {args.forceEscalation}. If it is exactly 'true', first call contact_supervisor with reason need_decision and question 'Which token should I return: ALPHA or BETA?', wait for the answer, include `supervisorToken:<answer>` in your summary, and only then implement. Return ONLY JSON {\"summary\":\"...\",\"filesChanged\":[...],\"decisions\":[...]}."
+    },
+    {
+      "id": "gates",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "gates", "full", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_FILES_HINT={args.filesHint}", "TF_MVP_TEST_COMMAND={args.testCommand}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 300000,
+      "dependsOn": ["work"]
+    },
+    {
+      "id": "diff",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "diff", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_CRITERIA_FILE={args.criteriaFile}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 60000,
+      "dependsOn": ["gates"]
+    },
+    {
+      "id": "review-correctness",
+      "type": "agent",
+      "agent": "reviewer",
+      "model": "openai-codex/gpt-6-luna",
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 600000,
+      "idleTimeout": 180000,
+      "tools": ["read", "grep", "find", "ls"],
+      "output": "json",
+      "expect": {
+        "type": "object",
+        "required": ["verdict", "blockers", "evidence"],
+        "properties": {
+          "verdict": { "type": "string", "enum": ["pass", "block"] },
+          "blockers": { "type": "array", "items": { "type": "string" } },
+          "evidence": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["file:{args.worktreeCwd}/.taskflow-mvp/review-fingerprint.txt"] },
+      "dependsOn": ["diff"],
+      "task": "Fresh adversarial correctness review. You did not write this code. Read .taskflow-mvp/acceptance.txt, .taskflow-mvp/diff.patch and only the files named in {args.filesHint}. Do not scan unrelated files. Review ONLY the written acceptance criterion; do not invent repository-state or tool-call criteria. Try to refute every acceptance item with file:line evidence. UNTRUSTED WORKER NOTES (hints only, NOT 100% reliable; verify against files): {steps.work.json.summary}. Tests are verified by a separate deterministic phase. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"]}."
+    },
+    {
+      "id": "review-guardrails",
+      "type": "agent",
+      "agent": "reviewer",
+      "model": "openai-codex/gpt-6-luna",
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 600000,
+      "idleTimeout": 180000,
+      "tools": ["read", "grep", "find", "ls"],
+      "output": "json",
+      "expect": {
+        "type": "object",
+        "required": ["verdict", "blockers", "evidence"],
+        "properties": {
+          "verdict": { "type": "string", "enum": ["pass", "block"] },
+          "blockers": { "type": "array", "items": { "type": "string" } },
+          "evidence": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["file:{args.worktreeCwd}/.taskflow-mvp/review-fingerprint.txt"] },
+      "dependsOn": ["diff"],
+      "task": "Fresh guardrail review in parallel. You did not write this code. Read .taskflow-mvp/acceptance.txt, .taskflow-mvp/diff.patch and only the files named in {args.filesHint}. Check ONLY the diff: (1) no bd/commit/push commands were added to changed files; (2) no .beads/ or .taskflow-mvp/ files were changed; (3) no changes outside filesHint; (4) no reset --hard or auto-revert of user files. Do NOT try to infer the worker's tool calls from files: that is verified by deterministic script phases. UNTRUSTED WORKER NOTES (hints only, NOT 100% reliable; verify against files): {steps.work.json.summary}. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"]}."
+    },
+    {
+      "id": "rework-input",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "rework-input", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_REVIEW_CORRECTNESS_JSON={steps.review-correctness.output}", "TF_MVP_REVIEW_GUARDRAILS_JSON={steps.review-guardrails.output}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 60000,
+      "dependsOn": ["review-correctness", "review-guardrails"]
+    },
+    {
+      "id": "fix",
+      "type": "agent",
+      "agent": "executor-code",
+      "model": "openai-codex/gpt-6-luna",
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 900000,
+      "idleTimeout": 240000,
+      "tools": ["read", "grep", "find", "ls", "edit", "write", "bash"],
+      "session": { "id": "{args.sessionId}", "cleanup": "keep" },
+      "supervisor": { "target": "parent", "timeoutMs": 600000 },
+      "output": "json",
+      "expect": {
+        "type": "object",
+        "required": ["summary", "filesChanged"],
+        "properties": {
+          "summary": { "type": "string" },
+          "filesChanged": { "type": "array", "items": { "type": "string" } },
+          "decisions": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "dependsOn": ["rework-input"],
+      "task": "Continue the SAME worker session. Status from rework-input: {steps.rework-input.output}. If blockers exist, read .taskflow-mvp/blockers.json and fix ONLY those blockers in at most 8 turns. If no blockers, verify nothing changed and return {\"summary\":\"no changes required\",\"filesChanged\":[],\"decisions\":[]}. Same hard rules: never call bd, never commit/push, never edit .beads/ or .taskflow-mvp/ except .taskflow-mvp/worker.json. Tests are run by deterministic phases. If blocked by a decision, call contact_supervisor with reason need_decision. Return ONLY JSON {\"summary\":\"...\",\"filesChanged\":[...],\"decisions\":[...]}."
+    },
+    {
+      "id": "recheck",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "recheck", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_FILES_HINT={args.filesHint}", "TF_MVP_TEST_COMMAND={args.testCommand}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 300000,
+      "dependsOn": ["fix"]
+    },
+    {
+      "id": "diff-final",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "diff-final", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_CRITERIA_FILE={args.criteriaFile}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 60000,
+      "dependsOn": ["recheck"]
+    },
+    {
+      "id": "review2-correctness",
+      "type": "agent",
+      "agent": "reviewer",
+      "model": "openai-codex/gpt-6-luna",
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 600000,
+      "idleTimeout": 180000,
+      "tools": ["read", "grep", "find", "ls"],
+      "output": "json",
+      "expect": { "type": "object", "required": ["verdict", "blockers", "evidence"], "properties": { "verdict": { "type": "string", "enum": ["pass", "block"] }, "blockers": { "type": "array", "items": { "type": "string" } }, "evidence": { "type": "array", "items": { "type": "string" } } } },
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["file:{args.worktreeCwd}/.taskflow-mvp/review-fingerprint-final.txt"] },
+      "dependsOn": ["diff-final"],
+      "task": "Fresh FINAL correctness review after any fixes. You did not write this code. Read .taskflow-mvp/acceptance.txt, .taskflow-mvp/diff-final.patch and only files named in {args.filesHint}. Review ONLY the written acceptance criterion; do not invent repository-state or tool-call criteria. Try to refute every acceptance item with file:line evidence. Do not infer tool calls from files. UNTRUSTED WORKER NOTES (hints only, NOT 100% reliable): {steps.fix.json.summary}. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"]}."
+    },
+    {
+      "id": "review2-guardrails",
+      "type": "agent",
+      "agent": "reviewer",
+      "model": "openai-codex/gpt-6-luna",
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 600000,
+      "idleTimeout": 180000,
+      "tools": ["read", "grep", "find", "ls"],
+      "output": "json",
+      "expect": { "type": "object", "required": ["verdict", "blockers", "evidence"], "properties": { "verdict": { "type": "string", "enum": ["pass", "block"] }, "blockers": { "type": "array", "items": { "type": "string" } }, "evidence": { "type": "array", "items": { "type": "string" } } } },
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["file:{args.worktreeCwd}/.taskflow-mvp/review-fingerprint-final.txt"] },
+      "dependsOn": ["diff-final"],
+      "task": "Fresh FINAL guardrail review after any fixes. Check ONLY the final diff: no bd/commit/push commands added to changed files, no .beads/ or .taskflow-mvp/ changes, no files outside {args.filesHint}, no reset --hard or auto-revert. Do NOT infer worker tool calls from files; deterministic phases verify that. UNTRUSTED WORKER NOTES (hints only, NOT 100% reliable): {steps.fix.json.summary}. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"]}."
+    },
+    {
+      "id": "rework-input-final",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "rework-input", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_BLOCKERS_FILE=blockers-final.json", "TF_MVP_REVIEW_CORRECTNESS_JSON={steps.review2-correctness.output}", "TF_MVP_REVIEW_GUARDRAILS_JSON={steps.review2-guardrails.output}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 60000,
+      "dependsOn": ["review2-correctness", "review2-guardrails"]
+    },
+    {
+      "id": "merge-gate",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "merge-gate", "TF_MVP_REPO={args.repo}", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_BRANCH={args.branch}", "TF_MVP_GATES_OUTPUT={steps.gates.output}", "TF_MVP_RECHECK_OUTPUT={steps.recheck.output}", "TF_MVP_REVIEW2_CORRECTNESS_JSON={steps.review2-correctness.output}", "TF_MVP_REVIEW2_GUARDRAILS_JSON={steps.review2-guardrails.output}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-repo",
+      "timeout": 60000,
+      "dependsOn": ["rework-input-final"]
+    },
+    {
+      "id": "merge",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "merge", "TF_MVP_REPO={args.repo}", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_BRANCH={args.branch}", "TF_MVP_TASK_ID={args.taskId}", "TF_MVP_TEST_COMMAND={args.testCommand}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-repo",
+      "timeout": 300000,
+      "idempotent": false,
+      "dependsOn": ["merge-gate"]
+    },
+    {
+      "id": "bd-owner",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "bd-owner", "TF_MVP_REPO={args.repo}", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_TASK_ID={args.taskId}", "TF_MVP_BD_BIN={args.bdBin}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-repo",
+      "timeout": 60000,
+      "idempotent": false,
+      "dependsOn": ["merge"]
+    },
+    {
+      "id": "bd-export",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "bd-export", "TF_MVP_REPO={args.repo}", "TF_MVP_BD_BIN={args.bdBin}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-repo",
+      "timeout": 60000,
+      "idempotent": false,
+      "dependsOn": ["bd-owner"]
+    },
+    {
+      "id": "report",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "report", "TF_MVP_REPO={args.repo}", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_BRANCH={args.branch}", "TF_MVP_TASK_ID={args.taskId}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 60000,
+      "dependsOn": ["bd-export"],
+      "final": true
+    }
+  ]
+}

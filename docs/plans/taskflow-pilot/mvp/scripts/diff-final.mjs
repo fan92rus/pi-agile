@@ -1,0 +1,25 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+
+const fail = (m) => { console.error(`DIFF FINAL FAIL: ${m}`); process.exit(1); };
+const cwd = process.env.TF_MVP_WORKTREE_CWD || process.cwd();
+const dir = path.join(cwd, '.taskflow-mvp');
+const baseFile = path.join(dir, 'base-sha.txt');
+if (!fs.existsSync(baseFile)) fail('base SHA file missing');
+const base = fs.readFileSync(baseFile, 'utf8').trim();
+const result = spawnSync('git', ['diff', base, '--', '.'], { cwd, encoding: 'utf8', shell: false, windowsHide: true });
+if (result.error || result.status !== 0) fail(`git diff failed: ${result.stderr || result.error?.message}`);
+const digest = (v) => createHash('sha256').update(v).digest('hex');
+const diffHash = digest(result.stdout);
+const criteriaFile = process.env.TF_MVP_CRITERIA_FILE;
+if (!criteriaFile || !fs.existsSync(criteriaFile)) fail('criteria file missing');
+const criteriaHash = digest(fs.readFileSync(criteriaFile));
+fs.writeFileSync(path.join(dir, 'diff-final.patch'), result.stdout, 'utf8');
+fs.writeFileSync(path.join(dir, 'diff-final-sha256.txt'), `${diffHash}\n`, 'utf8');
+fs.writeFileSync(path.join(dir, 'review-fingerprint-final.txt'), `${diffHash}${criteriaHash}\n`, 'utf8');
+const reviewed = spawnSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8', shell: false, windowsHide: true });
+if (reviewed.error || reviewed.status !== 0) fail(`git rev-parse failed: ${reviewed.stderr || reviewed.error?.message}`);
+fs.writeFileSync(path.join(dir, 'reviewed-sha.txt'), `${reviewed.stdout.trim()}\n`, 'utf8');
+console.log('DIFF FINAL OK');
