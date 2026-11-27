@@ -55,3 +55,13 @@ The mutex bootstrap step — the exact step that produced `TFWS_MUTEX_IDENTITY` 
 The currently running Pi/taskflow host process imported `taskflow-core` before the patch; ESM module cache cannot be refreshed in-place. A **Pi restart is required** before `taskflow` tool calls will use the patched code. The next step after restart is to re-run `ctx-repair-probe` with `shareContext: true` and confirm `ctx_write`/`ctx_read`.
 
 An npm/pnpm reinstall of `taskflow-core` will revert the patch; reapply `sharecontext-fix.patch` then.
+
+## Upstream PR
+
+The same fix was prepared against the upstream TypeScript sources in `heggria/taskflow` and submitted from the fork `fan92rus/taskflow`:
+
+- PR: https://github.com/heggria/taskflow/pull/218
+- fork branch: `fix/windows-inode-identity`
+- commit: `dbc924a`
+
+`pnpm typecheck` is clean and the added regression test passes. The full `mutex-bootstrap.test.ts` suite was timing-flaky on this Windows host; the PR states this explicitly.
