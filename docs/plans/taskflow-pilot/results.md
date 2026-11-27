@@ -2908,3 +2908,14 @@ Gate outcomes, final git state, token/time figures: appended by driver after the
 Вывод: требование владельца о «новых токенах только на дельту фикса со всем контекстом воркера» выполнено. Механизм — не живой OS-процесс, а одно сохранённое Pi-session, открытое заново фазой `fix` через `--session-id`.
 
 Ограничения: `session`-фазы не используют cross-run cache (иначе кэш пропустил бы открытие транскрипта); ревьюеры остаются отдельными свежими сессиями; основной happy-path без `session` сохраняет 0-токенный cross-run cache.
+
+### rev.6 — session handoff в rework-flow (2026-11-27)
+
+Amendment 5 убирает `fix` из основного flow и переносит реwork в отдельный запуск с продолжением сессии воркера:
+
+- `work` в основном flow использует `session.id = tf-pilot-8en-worker` и `cleanup: "keep"`;
+- `rework-flow.json` принимает `args.sessionId` и открывает ту же сессию в `fix` через `{args.sessionId}`;
+- `fix` в rework использует стандартный `cleanup: "run"`, поэтому transient-транскрипт удаляется в конце rework-запуска;
+- happy-path (`SEED OK`) не создаёт сессию и сохраняет 0-токенный cross-run cache.
+
+Проверено до живого прогона: `validateTaskflow` для обоих flow — 0 ошибок и 0 предупреждений; модульные тесты форка на интерполяцию `session.id`, unresolved-placeholder и `cleanup: "keep"` зелёные. Живой замер fresh-токенов на 2–3 листах остаётся следующим шагом после рестарта Pi.

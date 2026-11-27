@@ -4,7 +4,10 @@
   "budget": { "maxUSD": 0.5, "maxTokens": 1200000 },
   "concurrency": 2,
   "strictInterpolation": true,
-  "args": { "blockers": { "type": "string", "default": "No blockers supplied", "description": "Verbatim blocker list from the blocked review" } },
+  "args": {
+    "blockers": { "type": "string", "default": "No blockers supplied", "description": "Verbatim blocker list from the blocked review" },
+    "sessionId": { "type": "string", "default": "tf-pilot-8en-worker", "description": "Pi session id published by the main work phase; fix continues this transcript" }
+  },
   "phases": [
     {
       "id": "preflight",
@@ -23,6 +26,7 @@
       "timeout": 600000,
       "idleTimeout": 180000,
       "idempotent": false,
+      "session": { "id": "{args.sessionId}" },
       "output": "json",
       "expect": { "type": "object", "required": ["files", "tests", "summary"], "properties": { "files": { "type": "array", "items": { "type": "string" } }, "tests": { "type": "string" }, "summary": { "type": "string" } } },
       "dependsOn": ["preflight"],
