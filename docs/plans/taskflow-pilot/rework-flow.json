@@ -1,0 +1,164 @@
+{
+  "name": "agile-leaf-rework",
+  "description": "Bounded rework from reviewer blockers, then the same deterministic gates and reviews as the main pilot flow",
+  "budget": { "maxUSD": 0.5, "maxTokens": 1200000 },
+  "concurrency": 2,
+  "strictInterpolation": true,
+  "args": { "blockers": { "type": "string", "default": "No blockers supplied", "description": "Verbatim blocker list from the blocked review" } },
+  "phases": [
+    {
+      "id": "preflight",
+      "type": "script",
+      "run": ["node", "-e", "const cp=require('child_process');const b=cp.execSync('git branch --show-current',{cwd:'D:/tmp/tf-pilot-repo',encoding:'utf8'}).trim();if(b!=='tf-pilot/8en'){console.error('expected tf-pilot/8en, got '+b);process.exit(1)}console.log(b)"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000
+    },
+    {
+      "id": "fix",
+      "type": "agent",
+      "agent": "executor-code",
+      "model": "openai-codex/gpt-6-luna",
+      "tools": ["read", "grep", "find", "ls", "edit", "write"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 600000,
+      "idleTimeout": 180000,
+      "idempotent": false,
+      "output": "json",
+      "expect": { "type": "object", "required": ["files", "tests", "summary"], "properties": { "files": { "type": "array", "items": { "type": "string" } }, "tests": { "type": "string" }, "summary": { "type": "string" } } },
+      "dependsOn": ["preflight"],
+      "task": "Fix ONLY the blockers supplied in args.blockers, in at most 8 turns: {args.blockers}. Read only docs/plans/taskflow-pilot/PLAN.md Appendix A, workflows/agile-loop.js and tests/agile-loop.test.mjs. Do not call bd, do not commit, do not edit outside those two files. Make the ban present in EVERY work-family brief including fix-only rework, make the post-loop bd reopen record an incident in the return, and make tests exercise behavior. Tests are run by deterministic script phases. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"}."
+    },
+    {
+      "id": "recheck",
+      "type": "script",
+      "run": ["node", "-e", "const cp=require('child_process');const f=require('D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/flow.json');const a=cp.spawnSync(process.execPath,f.phases.find(p=>p.id==='contract-check').run.slice(1),{cwd:'D:/tmp/tf-pilot-repo',encoding:'utf8'});const b=cp.spawnSync(process.execPath,f.phases.find(p=>p.id==='parse-check').run.slice(1),{cwd:'D:/tmp/tf-pilot-repo',encoding:'utf8'});const t=cp.spawnSync('npm',['test'],{cwd:'D:/tmp/tf-pilot-repo',encoding:'utf8',shell:true});const ok=a.status===0&&b.status===0&&t.status===0&&/fail 0/.test(t.stdout);console.log(ok?'RECHECK OK':'RECHECK FAIL');if(!ok){console.error((a.stdout||'')+(b.stdout||'')+(t.stdout||''))}"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 300000,
+      "idempotent": false,
+      "dependsOn": ["fix"]
+    },
+    {
+      "id": "gate-recheck",
+      "type": "gate",
+      "dependsOn": ["recheck"],
+      "score": {
+        "target": "{steps.recheck.output}",
+        "scorers": [{ "type": "contains", "name": "recheck-ok", "value": "RECHECK OK" }],
+        "combine": "all"
+      }
+    },
+    {
+      "id": "base",
+      "type": "script",
+      "run": "git rev-parse HEAD",
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "dependsOn": ["gate-recheck"]
+    },
+    {
+      "id": "diff-stat",
+      "type": "script",
+      "run": ["git", "diff", "--stat", "4d36c54f172cc491f1158db1eb9d5fb73e862958...HEAD"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "dependsOn": ["base"]
+    },
+    {
+      "id": "diff-full",
+      "type": "script",
+      "run": ["git", "diff", "4d36c54f172cc491f1158db1eb9d5fb73e862958...HEAD"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "dependsOn": ["base"]
+    },
+    {
+      "id": "review-correctness",
+      "type": "agent",
+      "agent": "reviewer",
+      "model": "opencode-go/hy4-flash-free",
+      "tools": ["read", "grep", "find", "ls"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 600000,
+      "idleTimeout": 180000,
+      "output": "json",
+      "expect": { "type": "object", "required": ["verdict", "blockers", "evidence", "tests"], "properties": { "verdict": { "type": "string", "enum": ["pass", "block"] }, "blockers": { "type": "array", "items": { "type": "string" } }, "evidence": { "type": "array", "items": { "type": "string" } }, "tests": { "type": "string" } } },
+      "retry": { "max": 1 },
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["git:HEAD", "file:workflows/agile-loop.js", "file:tests/agile-loop.test.mjs"] },
+      "dependsOn": ["base", "diff-stat", "diff-full", "recheck"],
+      "task": "Fresh adversarial review from a clean context; you did not write this code. Read ONLY docs/plans/taskflow-pilot/PLAN.md (Appendix A), workflows/agile-loop.js, tests/agile-loop.test.mjs. Try to refute every acceptance item with file:line evidence. You have NO shell tool; do not call bd. VERDICT pass only if both acceptance items are implemented; the green suite is verified by a separate deterministic script phase. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
+    },
+    {
+      "id": "review-guardrails",
+      "type": "agent",
+      "agent": "reviewer",
+      "model": "opencode-go/hy4-flash-free",
+      "tools": ["read", "grep", "find", "ls"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 600000,
+      "idleTimeout": 180000,
+      "output": "json",
+      "expect": { "type": "object", "required": ["verdict", "blockers", "evidence", "tests"], "properties": { "verdict": { "type": "string", "enum": ["pass", "block"] }, "blockers": { "type": "array", "items": { "type": "string" } }, "evidence": { "type": "array", "items": { "type": "string" } }, "tests": { "type": "string" } } },
+      "retry": { "max": 1 },
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["git:HEAD", "file:workflows/agile-loop.js", "file:tests/agile-loop.test.mjs"] },
+      "dependsOn": ["base", "diff-stat", "diff-full", "recheck"],
+      "task": "Fresh guardrail review in parallel; you did not write this code. Read ONLY workflows/agile-loop.js and tests/agile-loop.test.mjs. Check ONLY: (1) work/rework/repair/report-repair/fix-only briefs contain an explicit ban on bd close/create/update/reopen; (2) a post-loop reconciliation reopens a falsely closed failed leaf and records an incident; (3) tests cover both behaviors; (4) no bd executable call was added. You have NO shell tool; do not call bd. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
+    },
+    {
+      "id": "report",
+      "type": "script",
+      "run": ["node", "-e", "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const fs=require('fs'),dir='D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/reports',sha=(s.match(/base: ([0-9a-f]+)/)||[])[1]||Date.now();fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(dir+'/rework-'+sha+'.md',s)})"],
+      "input": "# Rework report\n\nbase: {steps.base.output}\n\nfix: {steps.fix.output}\n\nrecheck:\n{steps.recheck.output}\n\ncorrectness review:\n{steps.review-correctness.output}\n\nguardrails review:\n{steps.review-guardrails.output}\n",
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 60000,
+      "idempotent": false,
+      "dependsOn": ["base", "fix", "recheck", "review-correctness", "review-guardrails"]
+    },
+    {
+      "id": "gate-correctness",
+      "type": "gate",
+      "dependsOn": ["report", "review-correctness"],
+      "score": {
+        "target": "{steps.review-correctness.output}",
+        "scorers": [{ "type": "json-schema", "name": "verdict-pass", "schema": { "type": "object", "required": ["verdict"], "properties": { "verdict": { "enum": ["pass"] } } } }],
+        "combine": "all"
+      }
+    },
+    {
+      "id": "gate-guardrails",
+      "type": "gate",
+      "dependsOn": ["report", "review-guardrails"],
+      "score": {
+        "target": "{steps.review-guardrails.output}",
+        "scorers": [{ "type": "json-schema", "name": "verdict-pass", "schema": { "type": "object", "required": ["verdict"], "properties": { "verdict": { "enum": ["pass"] } } } }],
+        "combine": "all"
+      }
+    },
+    {
+      "id": "commit",
+      "type": "script",
+      "run": "git add workflows/agile-loop.js tests/agile-loop.test.mjs && git commit -m \"pilot: rework from review blockers\"",
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 60000,
+      "idempotent": false,
+      "dependsOn": ["gate-correctness", "gate-guardrails"]
+    },
+    {
+      "id": "merge",
+      "type": "script",
+      "run": "git checkout main && git merge --ff-only tf-pilot/8en && npm test",
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 300000,
+      "idempotent": false,
+      "dependsOn": ["commit"]
+    },
+    {
+      "id": "post",
+      "type": "script",
+      "run": "git status --porcelain --untracked-files=all && git log --oneline -1",
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "dependsOn": ["merge"],
+      "final": true
+    }
+  ]
+}

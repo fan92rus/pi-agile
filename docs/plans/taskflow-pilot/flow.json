@@ -23,7 +23,7 @@
     {
       "id": "report-stub",
       "type": "script",
-      "run": ["node", "-e", "require('fs').writeFileSync('D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/results.md','# Pilot results\\n\\nРанняя заготовка: подробности появятся после ревью; при досрочном падении см. трассу taskflow.\\n')"],
+      "run": ["node", "-e", "const fs=require('fs'),dir='D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/reports';fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(dir+'/stub-'+Date.now()+'.md','# Pilot stub\\n\\nРанняя заготовка: подробности появятся после ревью; при досрочном падении см. трассу taskflow.\\n')"],
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 30000,
       "idempotent": false,
@@ -205,7 +205,7 @@
     {
       "id": "report",
       "type": "script",
-      "run": ["node", "-e", "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{require('fs').writeFileSync('D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/results.md',s)})"],
+      "run": ["node", "-e", "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const fs=require('fs'),dir='D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/reports',sha=(s.match(/base: ([0-9a-f]+)/)||[])[1]||Date.now();fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(dir+'/report-'+sha+'.md',s)})"],
       "input": "# Pilot results (draft; driver appends gate outcome and metrics)\n\nbase: {steps.base.output}\n\nbaseline tests:\n{steps.baseline-test.output}\n\npost-work tests:\n{steps.verify.output}\n\ndiff stat:\n{steps.diff-stat.output}\n\ncorrectness review:\n{steps.review-correctness.output}\n\nguardrails review:\n{steps.review-guardrails.output}\n\nGate outcomes, final git state, token/time figures: appended by driver after the run. No bd command was executed by the pilot.\n",
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 60000,
