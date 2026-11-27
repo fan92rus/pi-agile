@@ -1,0 +1,31 @@
+{
+  "name": "session-reuse-probe",
+  "version": 1,
+  "phases": [
+    {
+      "id": "work",
+      "type": "agent",
+      "agent": "executor-fast",
+      "model": "opencode-go/hy4-flash-free",
+      "tools": ["read"],
+      "cwd": "D:/tmp/tf-session-reuse-probe",
+      "timeout": 180000,
+      "idleTimeout": 60000,
+      "session": { "key": "worker" },
+      "task": "Remember this token exactly: SECTOR-2026-REUSE. Reply only REMEMBERED."
+    },
+    {
+      "id": "fix",
+      "type": "agent",
+      "agent": "executor-fast",
+      "model": "opencode-go/hy4-flash-free",
+      "tools": ["read"],
+      "cwd": "D:/tmp/tf-session-reuse-probe",
+      "timeout": 180000,
+      "idleTimeout": 60000,
+      "dependsOn": ["work"],
+      "session": { "key": "worker" },
+      "task": "What exact token was remembered in the previous step? Reply only the token."
+    }
+  ]
+}

@@ -12,7 +12,8 @@
 | seed.patch | зафиксированный рабочий диф успешного воркера, применяется до вызова LLM |
 | rework-flow.json | отдельный bounded rework от blockers ревью (`args.blockers`), 8 turn-ов (запасной вариант) |
 | fix phase | тот же агент по роли/модели/префиксу возвращается после внешних ревью; cross-run cache |
-| context-reuse-probe.json | замер реального фикса с блокером: provider-cache нестабилен, это не продолжение сессии |
+| context-reuse-probe.json | замер реального фикса с блокером; после `4203e27` использует `session.key` и измеряет нативную continuity |
+| session-reuse-probe.json | минимальная проба одной Pi-сессии между фазами: `fix` = 247 fresh / 17 920 cacheRead |
 | SHARECONTEXT-FIX.md | root cause `TFWS_MUTEX_IDENTITY` (Windows inode > 2^53) и patch для taskflow-core |
 | reports/ | черновики прогонов; `results.md` больше не перезаписывается |
 

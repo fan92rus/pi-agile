@@ -2867,3 +2867,44 @@ Gate outcomes, final git state, token/time figures: appended by driver after the
 Вывод: `fix` — отдельный процесс, а не продолжение сессии воркера. Стабильный префикс даёт только best-effort provider-cache: во втором прогоне `fix` заметно дешевле воркера и читает 363k контекста, но в первом и третьем cacheRead ниже, а fresh такой же порядок. Гарантированного «новых токенов ровно на фикс со всем контекстом воркера» нет. nonzero `cacheWrite` не наблюдался, поэтому часть контекста могло прийти из более ранних прогонов, а не от `work` в этом же run.
 
 Итог: cross-run cache экономит 100% только на неизменённых блокерах (no-op). При реальном блокере экономия нестабильна; для настоящего продолжения контекста нужен рабочий `shareContext`/blackboard или нативный `subagent resume` вне taskflow.
+
+### Автоматический замер: agile-leaf-pilot-mwykp7ll-73cabf
+
+| phase | status | fresh | cache | total | turns | cost |
+|---|---|---:|---:|---:|---:|---:|
+| review-correctness | done | 122 975 | 792 576 | 915 551 | 11 | $0.00000 |
+| review-guardrails | done | 87 297 | 656 640 | 743 937 | 11 | $0.00000 |
+| fix | done | 89 729 | 824 320 | 914 049 | 16 | $0.01790 |
+| **ИТОГО** | | **300 001** | **2 273 536** | **2 573 537** | | |
+
+### Автоматический замер: agile-leaf-pilot-mwyl2kji-1ddcea
+
+| phase | status | fresh | cache | total | turns | cost |
+|---|---|---:|---:|---:|---:|---:|
+| review-correctness | done | 106 202 | 1 042 432 | 1 148 634 | 14 | $0.00000 |
+| review-guardrails | done | 92 662 | 838 144 | 930 806 | 13 | $0.00000 |
+| fix | done | 85 264 | 311 808 | 397 072 | 8 | $0.01202 |
+| **ИТОГО** | | **284 128** | **2 192 384** | **2 476 512** | | |
+
+### Нативная continuity сессии (`session-reuse-probe`) — 2026-11-27
+
+После рестарта Pi с обновлённым `taskflow-core`/`pi-taskflow` из форка `fan92rus/taskflow` (`4203e27`) проверен новый механизм `phase.session`.
+
+Минимальная проба: `work` запомнил токен, `fix` в другой taskflow-фазе с тем же `session.key` его воспроизвёл.
+
+| Прогон | work fresh | work cacheRead | fix fresh | fix cacheRead | Результат |
+|---|---:|---:|---:|---:|---|
+| `session-reuse-probe-mwyn9l45-f439ed` | 18 136 | 0 | **247** | 17 920 | `SECTOR-2026-REUSE` |
+
+Реальная блокер-проба на том же контракте, что и прежний `context-reuse-probe`: `work` → инъекция блокера → `fix` → `RECHECK OK`. `fix` действительно правил `workflows/agile-loop.js`.
+
+| Прогон | work fresh | work cacheRead | fix fresh | fix cacheRead | fix turns | Результат |
+|---|---:|---:|---:|---:|---:|---|
+| `context-reuse-probe-mwynb1l9-81365d` | 65 444 | 375 936 | **1 693** | 195 584 | 3 | RECHECK OK |
+| `context-reuse-probe-mwynfcka-258ed4` | 64 415 | 538 880 | **5 683** | 391 296 | 6 | RECHECK OK |
+
+Сравнение с прежним режимом isolated processes + blackboard: `fix` тратил 40 180–69 914 fresh. С продолжением одной Pi-сессии — 1 693–5 683 fresh, то есть примерно в 8–23 раза меньше, при высоком cacheRead и реальном recheck.
+
+Вывод: требование владельца о «новых токенах только на дельту фикса со всем контекстом воркера» выполнено. Механизм — не живой OS-процесс, а одно сохранённое Pi-session, открытое заново фазой `fix` через `--session-id`.
+
+Ограничения: `session`-фазы не используют cross-run cache (иначе кэш пропустил бы открытие транскрипта); ревьюеры остаются отдельными свежими сессиями; основной happy-path без `session` сохраняет 0-токенный cross-run cache.

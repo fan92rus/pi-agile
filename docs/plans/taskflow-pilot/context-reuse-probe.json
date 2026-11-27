@@ -38,6 +38,9 @@
       "timeout": 600000,
       "idleTimeout": 180000,
       "idempotent": false,
+      "session": {
+        "key": "worker"
+      },
       "output": "json",
       "expect": {
         "type": "object",
@@ -64,7 +67,7 @@
       "dependsOn": [
         "seed"
       ],
-      "task": "You are the task worker for one pi-agile leaf. Read ONLY docs/plans/taskflow-pilot/PLAN.md Appendix A, workflows/agile-loop.js and tests/agile-loop.test.mjs in the current cwd. Do not call bd, do not commit, do not edit files outside those two files. Implement or refine this contract: a BD_WRITE_BAN constant naming `bd close`, `bd reopen`, `bd create` and `bd update`; five total references including ledgerRepair; a real post-loop `bd reopen` with an incident list in the return (bdIncidents, bdReopenIncidents or bdCloseIncidents); behavior tests, not just source-string assertions. Record any decisions needed to continue in the summary field of your JSON report. If the current tree already satisfies the contract, do not reimplement it; only fix the listed blockers. Finish in at most 8 turns. Tests are run by deterministic script phases. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else.\nReview blockers: seed-check said SEED FAIL"
+      "task": "You are the task worker for one pi-agile leaf. Read ONLY docs/plans/taskflow-pilot/PLAN.md Appendix A, workflows/agile-loop.js and tests/agile-loop.test.mjs in the current cwd. Do not call bd, do not commit, do not edit files outside those two files. Implement or refine this contract: a BD_WRITE_BAN constant naming `bd close`, `bd reopen`, `bd create` and `bd update`; five total references including ledgerRepair; a real post-loop `bd reopen` with an incident list in the return (bdIncidents, bdReopenIncidents or bdCloseIncidents); behavior tests, not just source-string assertions. You are continuing the same Pi session across work and fix phases; use transcript continuity and do not re-explore unchanged context. If the current tree already satisfies the contract, do not reimplement it; only fix the listed blockers. Finish in at most 8 turns. Tests are run by deterministic script phases. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else.\nReview blockers: seed-check said SEED FAIL"
     },
     {
       "id": "inject",
@@ -109,6 +112,9 @@
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 600000,
       "idleTimeout": 180000,
+      "session": {
+        "key": "worker"
+      },
       "output": "json",
       "expect": {
         "type": "object",
@@ -140,7 +146,7 @@
       "dependsOn": [
         "blockers"
       ],
-      "task": "You are the task worker for one pi-agile leaf. Read ONLY docs/plans/taskflow-pilot/PLAN.md Appendix A, workflows/agile-loop.js and tests/agile-loop.test.mjs in the current cwd. Do not call bd, do not commit, do not edit files outside those two files. Implement or refine this contract: a BD_WRITE_BAN constant naming `bd close`, `bd reopen`, `bd create` and `bd update`; five total references including ledgerRepair; a real post-loop `bd reopen` with an incident list in the return (bdIncidents, bdReopenIncidents or bdCloseIncidents); behavior tests, not just source-string assertions. Record any decisions needed to continue in the summary field of your JSON report. If the current tree already satisfies the contract, do not reimplement it; only fix the listed blockers. Finish in at most 8 turns. Tests are run by deterministic script phases. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else.\nReview blockers:\n- correctness: {steps.blockers.json.correctness}\n- guardrails: {steps.blockers.json.guardrails}"
+      "task": "You are the task worker for one pi-agile leaf. Read ONLY docs/plans/taskflow-pilot/PLAN.md Appendix A, workflows/agile-loop.js and tests/agile-loop.test.mjs in the current cwd. Do not call bd, do not commit, do not edit files outside those two files. Implement or refine this contract: a BD_WRITE_BAN constant naming `bd close`, `bd reopen`, `bd create` and `bd update`; five total references including ledgerRepair; a real post-loop `bd reopen` with an incident list in the return (bdIncidents, bdReopenIncidents or bdCloseIncidents); behavior tests, not just source-string assertions. You are continuing the same Pi session across work and fix phases; use transcript continuity and do not re-explore unchanged context. If the current tree already satisfies the contract, do not reimplement it; only fix the listed blockers. Finish in at most 8 turns. Tests are run by deterministic script phases. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else.\nReview blockers:\n- correctness: {steps.blockers.json.correctness}\n- guardrails: {steps.blockers.json.guardrails}"
     },
     {
       "id": "recheck",
