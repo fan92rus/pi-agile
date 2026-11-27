@@ -32,9 +32,9 @@ node docs/plans/taskflow-pilot/mvp/scripts/make-task-flow.mjs \
 - `--filesHint` — когда тестовый файл не перечислен в bd-описании;
 - `--workerModel` / `--reviewerModel` — модели прямо в сгенерированный flow;
 - `--maxCycles` — потолок финальных циклов (по умолчанию 3);
-- `--reuseReviewerSession true|false` — переиспользовать ли сессии reviewer'ов между циклами.
+- `--reuseReviewerSession true|false` — переиспользовать ли сессии reviewer'ов между циклами; по умолчанию `false`.
 
-Worker/fix всегда переиспользуют `{args.sessionId}` с `cleanup: keep`. Reviewer'ы по умолчанию тоже переиспользуют свои сессии, но получают только инкрементальный diff и untrusted fix summary.
+Worker/fix всегда переиспользуют `{args.sessionId}` с `cleanup: keep`. Reviewer'ы по умолчанию работают в свежих сессиях и получают только инкрементальный diff и untrusted fix summary. Переиспользование reviewer-сессии остаётся опцией для случаев, когда важна преемственность предыдущих blockers.
 
 ## Входные аргументы
 

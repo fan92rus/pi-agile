@@ -53,7 +53,7 @@ The first four runs looked like a reviewer-reuse penalty, but the reverse-order 
 
 Root cause: the numbers are governed by **provider prompt-cache state**, not by taskflow session reuse as such. Continuing a reviewer session sends the already-warmed prefix from the initial review, so the incremental review is cheap; a fresh session must rebuild that prefix and can be cold or warm depending on whether the provider has cached an identical prompt. Taskflow's own cross-run cache was disabled for both variants, but provider-level prefix caching was not observable or controllable from the flow. The `final-cycles` aggregate also includes `final-fix`, adding worker-session variance to the first table.
 
-Practical conclusion: reviewer session reuse gives a *stable hot prefix* for the second review, but it is not a reliable token-cost win in these measurements. Any future claim must control run order and cache warmth, and should instrument nested phases separately instead of relying on the aggregate `final-cycles` usage.
+Practical conclusion: reviewer session reuse gives a *stable hot prefix* for the second review, but it is not a reliable token-cost win in these measurements. `make-task-flow.mjs` therefore defaults to `--reuseReviewerSession false`; worker/fix session reuse stays enabled. Any future claim must control run order and cache warmth, and should instrument nested phases separately instead of relying on the aggregate `final-cycles` usage.
 
 ## Repeat-cycle proof
 

@@ -50,7 +50,7 @@ const reviewerCorrectnessSessionId = opts.reviewerCorrectnessSessionId || `tf-le
 const reviewerGuardrailsSessionId = opts.reviewerGuardrailsSessionId || `tf-leaf-mvp-${taskId}-reviewer-guardrails`;
 const maxCycles = Number(opts.maxCycles || 3);
 if (!Number.isInteger(maxCycles) || maxCycles < 1 || maxCycles > 20) fail('--maxCycles must be an integer from 1 to 20');
-const reuseReviewerSession = String(opts.reuseReviewerSession || 'true');
+const reuseReviewerSession = String(opts.reuseReviewerSession || 'false');
 if (!['true', 'false'].includes(reuseReviewerSession)) fail('--reuseReviewerSession must be true or false');
 const workerModel = opts.workerModel || 'openai-codex/gpt-6-luna';
 const reviewerModel = opts.reviewerModel || 'openai-codex/gpt-6-luna';
