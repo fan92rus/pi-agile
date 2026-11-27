@@ -1,6 +1,10 @@
 # RESULTS — tf-leaf-mvp
 
-> Исторические прогоны ниже были на 19-фазовой версии до добавления финальной `cleanup`-фазы. Текущий flow: 20 фаз.
+> Исторические прогоны ниже были на 19-фазовой версии до добавления `cleanup` и repeat-циклов. Текущий flow: 19 топ-level фаз, внутри `final-cycles` — повторяемый saved subflow.
+
+## Repeat-cycle proof
+
+Синтетический прогон `tf-leaf-mvp-TEST-1-mwz7k01r-d8c206`: completed 19/19, `final-cycles` завершился на `cycle=2` с `done=true`, blockers пуст, merge `1461622`, cleanup удалил worktree/branch. Reviewer'ы получали `.taskflow-mvp/diff-cycle-N.patch` и untrusted `fixSummary`; worker/fix и reviewer-сессии configured as `cleanup: keep`.
 
 Два живых прогона на synthetic bd task `TEST-1` в throwaway repo `D:/tmp/tf-leaf-mvp-repo` с `bd` shim.
 

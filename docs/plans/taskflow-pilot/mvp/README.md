@@ -21,7 +21,20 @@ node docs/plans/taskflow-pilot/mvp/scripts/make-task-flow.mjs \
   --filesHint extensions/pi-agile/bd.ts,workflows/agile-loop.js,tests/agile-loop.test.mjs
 ```
 
-Скрипт читает `bd show <taskId> --json`, достаёт `Files:`/`Acceptance:` из описания, пишет `acceptance.md` и `criteria.md` во временную директорию вне репо и создаёт готовый flow в `.pi/taskflows/tf-leaf-mvp-<taskId>.json`. `--filesHint` нужен, когда тестовый файл не перечислен в bd-описании. Флаги `--workerModel` и `--reviewerModel` подставляют модели прямо в сгенерированный flow.
+Скрипт читает `bd show <taskId> --json`, достаёт `Files:`/`Acceptance:` из описания, пишет `acceptance.md` и `criteria.md` во временную директорию вне репо и создаёт:
+
+- `.pi/taskflows/tf-leaf-mvp-<taskId>.json` — главный flow;
+- `.pi/taskflows/mvp-loop-<taskId>.json` — repeat-wrapper;
+- `.pi/taskflows/mvp-final-cycle-<taskId>.json` — saved subflow одного цикла.
+
+Флаги:
+
+- `--filesHint` — когда тестовый файл не перечислен в bd-описании;
+- `--workerModel` / `--reviewerModel` — модели прямо в сгенерированный flow;
+- `--maxCycles` — потолок финальных циклов (по умолчанию 3);
+- `--reuseReviewerSession true|false` — переиспользовать ли сессии reviewer'ов между циклами.
+
+Worker/fix всегда переиспользуют `{args.sessionId}` с `cleanup: keep`. Reviewer'ы по умолчанию тоже переиспользуют свои сессии, но получают только инкрементальный diff и untrusted fix summary.
 
 ## Входные аргументы
 
@@ -77,6 +90,10 @@ Worker и reviewer не вызывают `bd`, не коммитят, не пу�
 | `.taskflow-mvp/blockers-final.json` | `rework-input-final` | blockers после финального review |
 | `.taskflow-mvp/merge-commit.txt` | `merge` | SHA merge commit |
 | `.taskflow-mvp/gates.log` | `gates` / `recheck` | вывод тестов |
+| `.taskflow-mvp/snapshots/cycle-N/` | `snapshot` | проверенное состояние файлов |
+| `.taskflow-mvp/diff-cycle-N.patch` | `incremental-diff` | дельта с прошлого цикла |
+| `.taskflow-mvp/fix-summary.json` | `incremental-diff` | untrusted резюме фикса |
+| `.taskflow-mvp/blockers-cycle-N.json` | `cycle-aggregate` | blockers текущего цикла |
 | `.taskflow-mvp/result.json` | `report` | финальный structured report |
 
 `cleanup` копирует `result.json` в `<repo>/.pi/taskflows/results/<taskId>.json`, затем удаляет worktree и branch.
@@ -89,8 +106,10 @@ Worker и reviewer не вызывают `bd`, не коммитят, не пу�
 preflight → task-packet → work → gates → diff
   → review-correctness ┬┐
   → review-guardrails ─┴→ rework-input → fix → recheck → diff-final
-    → review2-correctness ┬┐
-    → review2-guardrails ─┴→ rework-input-final
+    → snapshot(cycle-0)
+    → final-cycles (repeat ≤ N):
+        incremental-diff → review-correctness/review-guardrails
+        → cycle-aggregate → final-fix → recheck → snapshot → cycle-result
       → merge-gate → merge → bd-owner → bd-export → report → cleanup
 ```
 

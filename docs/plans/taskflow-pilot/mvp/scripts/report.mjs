@@ -17,11 +17,13 @@ try {
   const dir = join(root, '.taskflow-mvp');
   const taskId = process.env.TF_MVP_TASK_ID || artifact(join(dir, 'task.json'))?.id || '';
   const worker = artifact(join(dir, 'worker.json'));
-  const blockersData = artifact(join(dir, 'blockers-final.json')) || artifact(join(dir, 'blockers.json'));
+  const finalCycle = jsonEnv('TF_MVP_FINAL_CYCLE_JSON');
+  const blockersData = finalCycle || artifact(join(dir, 'blockers-final.json')) || artifact(join(dir, 'blockers.json'));
   const gates = process.env.TF_MVP_GATES_OUTPUT || artifact(join(dir, 'gates.log')) || '';
   const recheck = process.env.TF_MVP_RECHECK_OUTPUT || '';
   const commit = process.env.TF_MVP_COMMIT || (existsSync(join(dir, 'merge-commit.txt')) ? readFileSync(join(dir, 'merge-commit.txt'), 'utf8').trim() : '');
   const blockers = Array.isArray(blockersData?.blockers) ? blockersData.blockers : [];
+  const needsAttentionFromCycle = finalCycle?.needsAttention || null;
   let mergeVerified = false;
   if (commit) {
     const repo = process.env.TF_MVP_REPO || root;
@@ -45,7 +47,7 @@ try {
     merged: status === 'merged',
     bdClosed: Boolean(artifact(join(dir, 'bd-owner.json'))?.closed) && mergeVerified,
     blockers,
-    needsAttention: status === 'merged' ? null : (blockers.join('; ') || worker?.error || String(gates || recheck || 'Taskflow did not complete successfully')),
+    needsAttention: status === 'merged' ? null : (needsAttentionFromCycle || blockers.join('; ') || worker?.error || String(gates || recheck || 'Taskflow did not complete successfully')),
     freshTokens: Number(process.env.TF_MVP_FRESH_TOKENS || 0),
     cacheReadTokens: Number(process.env.TF_MVP_CACHE_READ_TOKENS || 0)
   };

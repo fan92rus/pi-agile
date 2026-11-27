@@ -1,0 +1,49 @@
+{
+  "name": "mvp-loop",
+  "description": "Repeat the final review/repair cycle until both reviewers pass or max cycles is reached",
+  "args": {
+    "cycle": { "type": "string", "default": "1" },
+    "reviewedDir": { "type": "string", "default": ".taskflow-mvp/snapshots/cycle-0" },
+    "blockersFile": { "type": "string", "default": ".taskflow-mvp/blockers-cycle-1.json" },
+    "fixSummary": { "type": "string", "default": "" },
+    "needsAttention": { "type": "string", "default": "" },
+    "maxCycles": { "type": "string", "default": "3" },
+    "sessionId": { "type": "string", "default": "tf-leaf-mvp-worker" },
+    "reviewerCorrectnessSessionId": { "type": "string", "default": "tf-leaf-mvp-reviewer-correctness" },
+    "reviewerGuardrailsSessionId": { "type": "string", "default": "tf-leaf-mvp-reviewer-guardrails" },
+    "worktreeCwd": { "type": "string", "description": "absolute worktree path" },
+    "filesHint": { "type": "string", "description": "CSV of allowed relative paths" },
+    "acceptanceFile": { "type": "string", "description": "acceptance criteria file" },
+    "criteriaFile": { "type": "string", "description": "reviewer criteria file" },
+    "testCommand": { "type": "string", "default": "npm test" }
+  },
+  "phases": [
+    {
+      "id": "cycle",
+      "type": "flow",
+      "use": "mvp-final-cycle",
+      "with": {
+        "cycle": "{args.cycle}",
+        "reviewedDir": "{args.reviewedDir}",
+        "blockersFile": "{args.blockersFile}",
+        "fixSummary": "{args.fixSummary}",
+        "maxCycles": "{args.maxCycles}",
+        "sessionId": "{args.sessionId}",
+        "reviewerCorrectnessSessionId": "{args.reviewerCorrectnessSessionId}",
+        "reviewerGuardrailsSessionId": "{args.reviewerGuardrailsSessionId}",
+        "worktreeCwd": "{args.worktreeCwd}",
+        "filesHint": "{args.filesHint}",
+        "acceptanceFile": "{args.acceptanceFile}",
+        "criteriaFile": "{args.criteriaFile}",
+        "testCommand": "{args.testCommand}"
+      },
+      "output": "json",
+      "final": true,
+      "repeat": {
+        "until": "{steps.cycle.json.done} == true",
+        "max": 3,
+        "carry": ["cycle", "reviewedDir", "blockersFile", "fixSummary", "needsAttention"]
+      }
+    }
+  ]
+}

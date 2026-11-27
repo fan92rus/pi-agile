@@ -20,9 +20,18 @@ try {
   const reviewed = existsSync(reviewedFile) ? readFileSync(reviewedFile, 'utf8').trim() : (process.env.TF_MVP_REVIEWED_SHA || '').trim();
   if (!reviewed || sha !== reviewed) throw new Error('branch SHA differs from reviewed SHA');
   if (!/^GATES OK\s*$/m.test(process.env.TF_MVP_GATES_OUTPUT || '')) throw new Error('gates are not OK');
-  for (const key of ['TF_MVP_REVIEW2_CORRECTNESS_JSON', 'TF_MVP_REVIEW2_GUARDRAILS_JSON']) {
-    const review = JSON.parse(process.env[key] || 'null');
-    if (review?.verdict !== 'pass') throw new Error(`${key} verdict is not pass`);
+  const finalCycleRaw = process.env.TF_MVP_FINAL_CYCLE_JSON;
+  if (finalCycleRaw) {
+    const finalCycle = JSON.parse(finalCycleRaw);
+    if (finalCycle.done !== true) throw new Error('final review cycle did not complete');
+    if (!Array.isArray(finalCycle.blockers)) throw new Error('final cycle blockers must be an array');
+    if (finalCycle.needsAttention) throw new Error(finalCycle.needsAttention);
+    if (finalCycle.blockers.length) throw new Error(`final blockers remain: ${finalCycle.blockers.join('; ')}`);
+  } else {
+    for (const key of ['TF_MVP_REVIEW2_CORRECTNESS_JSON', 'TF_MVP_REVIEW2_GUARDRAILS_JSON']) {
+      const review = JSON.parse(process.env[key] || 'null');
+      if (review?.verdict !== 'pass') throw new Error(`${key} verdict is not pass`);
+    }
   }
   if (!/^RECHECK OK(?: \(no diff\))?\s*$/m.test(process.env.TF_MVP_RECHECK_OUTPUT || '')) throw new Error('recheck is not OK');
   console.log('MERGE GATE OK');

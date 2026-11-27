@@ -1,0 +1,104 @@
+{
+  "name": "mvp-final-cycle",
+  "description": "One final-review/repair cycle for tf-leaf-mvp; invoked by mvp-loop via repeat",
+  "concurrency": 2,
+  "strictInterpolation": true,
+  "args": {
+    "cycle": { "type": "string", "default": "1" },
+    "reviewedDir": { "type": "string", "default": ".taskflow-mvp/snapshots/cycle-0" },
+    "blockersFile": { "type": "string", "default": ".taskflow-mvp/blockers-cycle-1.json" },
+    "fixSummary": { "type": "string", "default": "" },
+    "maxCycles": { "type": "string", "default": "3" },
+    "sessionId": { "type": "string", "default": "tf-leaf-mvp-worker" },
+    "reviewerCorrectnessSessionId": { "type": "string", "default": "tf-leaf-mvp-reviewer-correctness" },
+    "reviewerGuardrailsSessionId": { "type": "string", "default": "tf-leaf-mvp-reviewer-guardrails" },
+    "worktreeCwd": { "type": "string", "description": "absolute worktree path" },
+    "filesHint": { "type": "string", "description": "CSV of allowed relative paths" },
+    "acceptanceFile": { "type": "string", "description": "acceptance criteria file" },
+    "criteriaFile": { "type": "string", "description": "reviewer criteria file" },
+    "testCommand": { "type": "string", "default": "npm test" }
+  },
+  "phases": [
+    {
+      "id": "incremental-diff",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "incremental-diff", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_CYCLE={args.cycle}", "TF_MVP_REVIEWED_DIR={args.reviewedDir}", "TF_MVP_FILES_HINT={args.filesHint}", "TF_MVP_FIX_SUMMARY={args.fixSummary}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 60000
+    },
+    {
+      "id": "review-correctness",
+      "type": "agent",
+      "agent": "reviewer",
+      "model": "openai-codex/gpt-6-luna",
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 600000,
+      "idleTimeout": 180000,
+      "tools": ["read", "grep", "find", "ls"],
+      "session": { "id": "{args.reviewerCorrectnessSessionId}", "cleanup": "keep" },
+      "dependsOn": ["incremental-diff"],
+      "expect": { "type": "object", "required": ["verdict", "blockers", "evidence"], "properties": { "verdict": { "type": "string", "enum": ["pass", "block"] }, "blockers": { "type": "array", "items": { "type": "string" } }, "evidence": { "type": "array", "items": { "type": "string" } } } },
+      "task": "Incremental FINAL correctness review, cycle {args.cycle}. You previously reviewed the prior cycle snapshot (path passed in TF_MVP_REVIEWED_DIR). Read .taskflow-mvp/acceptance.txt, .taskflow-mvp/diff-cycle-{args.cycle}.patch and the files named in {args.filesHint}. UNTRUSTED FIX SUMMARY (hint only, NOT 100% reliable): {args.fixSummary}. If the patch is empty, treat it as NO CHANGE since the prior review and verify the current files named in {args.filesHint} against acceptance; do not block solely because the patch is empty. Verify that previous blockers are fixed and that the delta introduced no new correctness failures. Do not scan unrelated files and do not call git. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"]}."
+    },
+    {
+      "id": "review-guardrails",
+      "type": "agent",
+      "agent": "reviewer",
+      "model": "openai-codex/gpt-6-luna",
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 600000,
+      "idleTimeout": 180000,
+      "tools": ["read", "grep", "find", "ls"],
+      "session": { "id": "{args.reviewerGuardrailsSessionId}", "cleanup": "keep" },
+      "dependsOn": ["incremental-diff"],
+      "expect": { "type": "object", "required": ["verdict", "blockers", "evidence"], "properties": { "verdict": { "type": "string", "enum": ["pass", "block"] }, "blockers": { "type": "array", "items": { "type": "string" } }, "evidence": { "type": "array", "items": { "type": "string" } } } },
+      "task": "Incremental FINAL guardrail review, cycle {args.cycle}. Check ONLY .taskflow-mvp/diff-cycle-{args.cycle}.patch with your read/grep tools (do NOT call git): no bd/commit/push commands, no .beads/ or .taskflow-mvp/ changes, no files outside {args.filesHint}, no reset --hard or auto-revert. UNTRUSTED FIX SUMMARY: {args.fixSummary}. If the patch is empty, treat it as NO CHANGE since the prior review and verify the current files named in {args.filesHint}; do not block solely because the patch is empty. Prior review context is only a hint; verify the delta yourself. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"]}."
+    },
+    {
+      "id": "cycle-aggregate",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "cycle-aggregate", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_CYCLE={args.cycle}", "TF_MVP_MAX_CYCLES={args.maxCycles}", "TF_MVP_REVIEW_CORRECTNESS_JSON={steps.review-correctness.output}", "TF_MVP_REVIEW_GUARDRAILS_JSON={steps.review-guardrails.output}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 60000,
+      "dependsOn": ["review-correctness", "review-guardrails"]
+    },
+    {
+      "id": "final-fix",
+      "type": "agent",
+      "agent": "executor-code",
+      "model": "openai-codex/gpt-6-luna",
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 600000,
+      "idleTimeout": 180000,
+      "tools": ["read", "grep", "find", "ls", "edit", "write", "bash"],
+      "session": { "id": "{args.sessionId}", "cleanup": "keep" },
+      "dependsOn": ["cycle-aggregate"],
+      "task": "Continue the SAME worker session. Cycle {args.cycle}. Status: {steps.cycle-aggregate.output}. Read {args.blockersFile}. If blockers exist, fix ONLY those blockers in at most 8 turns. If no blockers, verify nothing changed and return {\"summary\":\"no changes required\",\"filesChanged\":[],\"decisions\":[]}. HARD RULES: never call bd, never commit/push, never edit .beads/ or .taskflow-mvp/ except writing .taskflow-mvp/worker.json. If you changed files, run `{args.testCommand}` locally with bash and fix every failure. If blocked by a decision, call contact_supervisor with reason need_decision. Return ONLY JSON {\"summary\":\"...\",\"filesChanged\":[...],\"decisions\":[...]}."
+    },
+    {
+      "id": "recheck",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "recheck", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_FILES_HINT={args.filesHint}", "TF_MVP_TEST_COMMAND={args.testCommand}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 600000,
+      "dependsOn": ["final-fix"]
+    },
+    {
+      "id": "snapshot",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "snapshot", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_CYCLE={args.cycle}", "TF_MVP_FILES_HINT={args.filesHint}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 60000,
+      "dependsOn": ["recheck"]
+    },
+    {
+      "id": "cycle-result",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "cycle-result", "TF_MVP_CYCLE_AGGREGATE_JSON={steps.cycle-aggregate.output}", "TF_MVP_FIX_JSON={steps.final-fix.output}"],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 60000,
+      "dependsOn": ["snapshot"],
+      "final": true
+    }
+  ]
+}

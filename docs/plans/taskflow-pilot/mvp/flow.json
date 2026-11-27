@@ -6,7 +6,7 @@
     "maxTokens": 1200000
   },
   "concurrency": 2,
-  "strictInterpolation": true,
+  "strictInterpolation": false,
   "args": {
     "taskId": {
       "type": "string",
@@ -44,6 +44,18 @@
     "sessionId": {
       "type": "string",
       "default": "tf-leaf-mvp-worker"
+    },
+    "reviewerCorrectnessSessionId": {
+      "type": "string",
+      "default": "tf-leaf-mvp-reviewer-correctness"
+    },
+    "reviewerGuardrailsSessionId": {
+      "type": "string",
+      "default": "tf-leaf-mvp-reviewer-guardrails"
+    },
+    "maxCycles": {
+      "type": "string",
+      "default": "3"
     },
     "forceEscalation": {
       "type": "string",
@@ -402,134 +414,45 @@
       ]
     },
     {
-      "id": "review2-correctness",
-      "type": "agent",
-      "agent": "reviewer",
-      "model": "openai-codex/gpt-6-luna",
-      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
-      "timeout": 600000,
-      "idleTimeout": 180000,
-      "tools": [
-        "read",
-        "grep",
-        "find",
-        "ls"
-      ],
-      "output": "json",
-      "expect": {
-        "type": "object",
-        "required": [
-          "verdict",
-          "blockers",
-          "evidence"
-        ],
-        "properties": {
-          "verdict": {
-            "type": "string",
-            "enum": [
-              "pass",
-              "block"
-            ]
-          },
-          "blockers": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "evidence": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          }
-        }
-      },
-      "cache": {
-        "scope": "cross-run",
-        "ttl": "30m",
-        "fingerprint": [
-          "file:{args.worktreeCwd}/.taskflow-mvp/review-fingerprint-final.txt"
-        ]
-      },
-      "dependsOn": [
-        "diff-final"
-      ],
-      "task": "Fresh FINAL correctness review after any fixes. You did not write this code. Read .taskflow-mvp/acceptance.txt, .taskflow-mvp/diff-final.patch and only files named in {args.filesHint}. Review ONLY the written acceptance criterion; do not invent repository-state or tool-call criteria. Try to refute every acceptance item with file:line evidence. Do not infer tool calls from files. UNTRUSTED WORKER NOTES (hints only, NOT 100% reliable): {steps.fix.json.summary}. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"]}."
-    },
-    {
-      "id": "review2-guardrails",
-      "type": "agent",
-      "agent": "reviewer",
-      "model": "openai-codex/gpt-6-luna",
-      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
-      "timeout": 600000,
-      "idleTimeout": 180000,
-      "tools": [
-        "read",
-        "grep",
-        "find",
-        "ls"
-      ],
-      "output": "json",
-      "expect": {
-        "type": "object",
-        "required": [
-          "verdict",
-          "blockers",
-          "evidence"
-        ],
-        "properties": {
-          "verdict": {
-            "type": "string",
-            "enum": [
-              "pass",
-              "block"
-            ]
-          },
-          "blockers": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "evidence": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          }
-        }
-      },
-      "cache": {
-        "scope": "cross-run",
-        "ttl": "30m",
-        "fingerprint": [
-          "file:{args.worktreeCwd}/.taskflow-mvp/review-fingerprint-final.txt"
-        ]
-      },
-      "dependsOn": [
-        "diff-final"
-      ],
-      "task": "Fresh FINAL guardrail review after any fixes. Read .taskflow-mvp/diff-final.patch with your read/grep tools (do NOT call git; the patch is the authoritative final diff). Check ONLY that patch: no bd/commit/push commands added to changed files, no .beads/ or .taskflow-mvp/ changes, no files outside {args.filesHint}, no reset --hard or auto-revert. Do NOT infer worker tool calls from files; deterministic phases verify that. UNTRUSTED WORKER NOTES (hints only, NOT 100% reliable): {steps.fix.json.summary}. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"]}."
-    },
-    {
-      "id": "rework-input-final",
+      "id": "snapshot",
       "type": "script",
       "run": [
         "node",
         "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs",
-        "rework-input",
+        "snapshot",
         "TF_MVP_WORKTREE_CWD={args.worktreeCwd}",
-        "TF_MVP_BLOCKERS_FILE=blockers-final.json",
-        "TF_MVP_REVIEW_CORRECTNESS_JSON={steps.review2-correctness.output}",
-        "TF_MVP_REVIEW_GUARDRAILS_JSON={steps.review2-guardrails.output}"
+        "TF_MVP_CYCLE=0",
+        "TF_MVP_FILES_HINT={args.filesHint}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
       "timeout": 60000,
       "dependsOn": [
-        "review2-correctness",
-        "review2-guardrails"
+        "diff-final"
+      ]
+    },
+    {
+      "id": "final-cycles",
+      "type": "flow",
+      "use": "mvp-loop",
+      "with": {
+        "cycle": "1",
+        "reviewedDir": ".taskflow-mvp/snapshots/cycle-0",
+        "blockersFile": ".taskflow-mvp/blockers-cycle-1.json",
+        "fixSummary": "",
+        "needsAttention": "",
+        "maxCycles": "{args.maxCycles}",
+        "sessionId": "{args.sessionId}",
+        "reviewerCorrectnessSessionId": "{args.reviewerCorrectnessSessionId}",
+        "reviewerGuardrailsSessionId": "{args.reviewerGuardrailsSessionId}",
+        "worktreeCwd": "{args.worktreeCwd}",
+        "filesHint": "{args.filesHint}",
+        "acceptanceFile": "{args.acceptanceFile}",
+        "criteriaFile": "{args.criteriaFile}",
+        "testCommand": "{args.testCommand}"
+      },
+      "output": "json",
+      "dependsOn": [
+        "snapshot"
       ]
     },
     {
@@ -544,13 +467,12 @@
         "TF_MVP_BRANCH={args.branch}",
         "TF_MVP_GATES_OUTPUT={steps.gates.output}",
         "TF_MVP_RECHECK_OUTPUT={steps.recheck.output}",
-        "TF_MVP_REVIEW2_CORRECTNESS_JSON={steps.review2-correctness.output}",
-        "TF_MVP_REVIEW2_GUARDRAILS_JSON={steps.review2-guardrails.output}"
+        "TF_MVP_FINAL_CYCLE_JSON={steps.final-cycles.json}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-repo",
       "timeout": 60000,
       "dependsOn": [
-        "rework-input-final"
+        "final-cycles"
       ]
     },
     {
@@ -619,7 +541,8 @@
         "TF_MVP_REPO={args.repo}",
         "TF_MVP_WORKTREE_CWD={args.worktreeCwd}",
         "TF_MVP_BRANCH={args.branch}",
-        "TF_MVP_TASK_ID={args.taskId}"
+        "TF_MVP_TASK_ID={args.taskId}",
+        "TF_MVP_FINAL_CYCLE_JSON={steps.final-cycles.json}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
       "timeout": 60000,
