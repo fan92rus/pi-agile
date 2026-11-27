@@ -1,0 +1,161 @@
+{
+  "name": "context-reuse-probe",
+  "version": 1,
+  "strictInterpolation": true,
+  "concurrency": 2,
+  "budget": {
+    "maxTokens": 500000,
+    "maxUSD": 3
+  },
+  "phases": [
+    {
+      "id": "seed",
+      "type": "script",
+      "run": [
+        "git",
+        "apply",
+        "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/seed.patch"
+      ],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "idempotent": false,
+      "dependsOn": []
+    },
+    {
+      "id": "work",
+      "type": "agent",
+      "agent": "executor-code",
+      "model": "openai-codex/gpt-6-luna",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "edit",
+        "write"
+      ],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 600000,
+      "idleTimeout": 180000,
+      "idempotent": false,
+      "output": "json",
+      "expect": {
+        "type": "object",
+        "required": [
+          "files",
+          "tests",
+          "summary"
+        ],
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tests": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        }
+      },
+      "dependsOn": [
+        "seed"
+      ],
+      "task": "You are the task worker for one pi-agile leaf. Read ONLY docs/plans/taskflow-pilot/PLAN.md Appendix A, workflows/agile-loop.js and tests/agile-loop.test.mjs in the current cwd. Do not call bd, do not commit, do not edit files outside those two files. Implement or refine this contract: a BD_WRITE_BAN constant naming `bd close`, `bd reopen`, `bd create` and `bd update`; five total references including ledgerRepair; a real post-loop `bd reopen` with an incident list in the return (bdIncidents, bdReopenIncidents or bdCloseIncidents); behavior tests, not just source-string assertions. Record any decisions needed to continue in the summary field of your JSON report. If the current tree already satisfies the contract, do not reimplement it; only fix the listed blockers. Finish in at most 8 turns. Tests are run by deterministic script phases. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else.\nReview blockers: seed-check said SEED FAIL"
+    },
+    {
+      "id": "inject",
+      "type": "script",
+      "run": [
+        "node",
+        "-e",
+        "const fs=require('fs');const p='workflows/agile-loop.js';let s=fs.readFileSync(p,'utf8');if(!s.includes('BD_WRITE_BAN'))throw new Error('no marker');fs.writeFileSync(p,s.replace('BD_WRITE_BAN','BD_WRITE_BANX'));console.log('INJECT OK')"
+      ],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "idempotent": false,
+      "dependsOn": [
+        "work"
+      ]
+    },
+    {
+      "id": "blockers",
+      "type": "script",
+      "run": [
+        "node",
+        "-e",
+        "console.log(JSON.stringify({correctness:'Контракт сломан: BD_WRITE_BAN встречается 4 раза вместо 5',guardrails:'Тот же дефект: restore BD_WRITE_BAN marker'}))"
+      ],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "dependsOn": [
+        "inject"
+      ]
+    },
+    {
+      "agent": "executor-code",
+      "model": "openai-codex/gpt-6-luna",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "edit",
+        "write"
+      ],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 600000,
+      "idleTimeout": 180000,
+      "output": "json",
+      "expect": {
+        "type": "object",
+        "required": [
+          "files",
+          "tests",
+          "summary"
+        ],
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tests": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        }
+      },
+      "id": "fix",
+      "idempotent": false,
+      "cache": {
+        "scope": "off"
+      },
+      "dependsOn": [
+        "blockers"
+      ],
+      "task": "You are the task worker for one pi-agile leaf. Read ONLY docs/plans/taskflow-pilot/PLAN.md Appendix A, workflows/agile-loop.js and tests/agile-loop.test.mjs in the current cwd. Do not call bd, do not commit, do not edit files outside those two files. Implement or refine this contract: a BD_WRITE_BAN constant naming `bd close`, `bd reopen`, `bd create` and `bd update`; five total references including ledgerRepair; a real post-loop `bd reopen` with an incident list in the return (bdIncidents, bdReopenIncidents or bdCloseIncidents); behavior tests, not just source-string assertions. Record any decisions needed to continue in the summary field of your JSON report. If the current tree already satisfies the contract, do not reimplement it; only fix the listed blockers. Finish in at most 8 turns. Tests are run by deterministic script phases. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else.\nReview blockers:\n- correctness: {steps.blockers.json.correctness}\n- guardrails: {steps.blockers.json.guardrails}"
+    },
+    {
+      "id": "recheck",
+      "type": "script",
+      "run": [
+        "node",
+        "-e",
+        "const cp=require('child_process');const c=cp.spawnSync(process.execPath,['-e',require('D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/flow.json').phases.find(p=>p.id==='contract-check').run[2]],{cwd:'D:/tmp/tf-pilot-repo',encoding:'utf8'});const p=cp.spawnSync(process.execPath,['-e',require('D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/flow.json').phases.find(p=>p.id==='parse-check').run[2]],{cwd:'D:/tmp/tf-pilot-repo',encoding:'utf8'});const t=cp.spawnSync('npm',['test'],{cwd:'D:/tmp/tf-pilot-repo',encoding:'utf8',shell:true});console.log(c.status===0&&p.status===0&&t.status===0&&/fail 0/.test(t.stdout)?'RECHECK OK':'RECHECK FAIL')"
+      ],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 300000,
+      "idempotent": false,
+      "dependsOn": [
+        "fix"
+      ]
+    }
+  ]
+}
