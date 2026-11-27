@@ -78,7 +78,7 @@
       },
       "when": "{steps.seed-check.output} != \"SEED OK\"",
       "dependsOn": ["seed-check"],
-      "task": "The seed patch failed its machine checks. Fix ONLY the blockers printed by seed-check. HARD RULES: finish in at most 8 turns; read only the two target files and docs/plans/taskflow-pilot/PLAN.md Appendix A; do not call bd, do not commit, do not edit files outside workflows/agile-loop.js and tests/agile-loop.test.mjs. Invariants: a BD_WRITE_BAN constant naming `bd close`, `bd reopen`, `bd create` and `bd update`, five total references including ledgerRepair, a real post-loop `bd reopen` and an incident list in the return (bdIncidents, bdReopenIncidents or bdCloseIncidents), plus tests asserting behavior. Tests are run by deterministic script phases, not by you. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else."
+      "task": "You are the task worker for one pi-agile leaf. Read ONLY docs/plans/taskflow-pilot/PLAN.md Appendix A, workflows/agile-loop.js and tests/agile-loop.test.mjs in the current cwd. Do not call bd, do not commit, do not edit files outside those two files. Implement or refine this contract: a BD_WRITE_BAN constant naming `bd close`, `bd reopen`, `bd create` and `bd update`; five total references including ledgerRepair; a real post-loop `bd reopen` with an incident list in the return (bdIncidents, bdReopenIncidents or bdCloseIncidents); behavior tests, not just source-string assertions. Record any decisions needed to continue in the summary field of your JSON report. If the current tree already satisfies the contract, do not reimplement it; only fix the listed blockers. Finish in at most 8 turns. Tests are run by deterministic script phases. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else.\nReview blockers: seed-check said {steps.seed-check.output}."
     },
     {
       "id": "work-echo",
@@ -137,6 +137,14 @@
       "dependsOn": ["gate-parse", "gate-contract"]
     },
     {
+      "id": "hash-before",
+      "type": "script",
+      "run": ["node", "-e", "const c=require('crypto'),f=require('fs');console.log(c.createHash('sha256').update(f.readFileSync('workflows/agile-loop.js')).update(f.readFileSync('tests/agile-loop.test.mjs')).digest('hex'))"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "dependsOn": ["verify"]
+    },
+    {
       "id": "diff-stat",
       "type": "script",
       "run": ["git", "diff", "--stat", "{steps.base.output}...HEAD"],
@@ -175,7 +183,7 @@
       "retry": { "max": 1 },
       "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["git:HEAD", "file:workflows/agile-loop.js", "file:tests/agile-loop.test.mjs"] },
       "dependsOn": ["base", "diff-stat", "diff-full", "verify"],
-      "task": "Fresh adversarial review from a clean context; you did not write this code. Work in the current cwd and read ONLY: docs/plans/taskflow-pilot/PLAN.md (Appendix A), workflows/agile-loop.js, tests/agile-loop.test.mjs with your read/grep tools. Base SHA: {steps.base.output}. Try to refute every acceptance item with file:line evidence. You have NO shell tool; do not call bd. VERDICT pass only if both acceptance items are implemented; the green suite is verified by a separate deterministic script phase. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
+      "task": "Fresh adversarial review from a clean context; you did not write this code. Work in the current cwd and read ONLY: docs/plans/taskflow-pilot/PLAN.md (Appendix A), workflows/agile-loop.js, tests/agile-loop.test.mjs with your read/grep tools. Do NOT call ctx_read and ignore any shared worker notes; review only the files. Base SHA: {steps.base.output}. Try to refute every acceptance item with file:line evidence. You have NO shell tool; do not call bd. VERDICT pass only if both acceptance items are implemented; the green suite is verified by a separate deterministic script phase. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
     },
     {
       "id": "review-guardrails",
@@ -200,7 +208,49 @@
       "retry": { "max": 1 },
       "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["git:HEAD", "file:workflows/agile-loop.js", "file:tests/agile-loop.test.mjs"] },
       "dependsOn": ["base", "diff-stat", "diff-full", "verify"],
-      "task": "Fresh guardrail review in parallel with the correctness reviewer; you did not write this code. Work in the current cwd and read ONLY workflows/agile-loop.js and tests/agile-loop.test.mjs with your read/grep tools. Check ONLY: (1) work/rework/repair/report-repair briefs contain an explicit ban on bd close/create/update; (2) a post-loop reconciliation reopens a falsely closed failed leaf and records an incident; (3) tests cover both; (4) no bd executable call was added. Base SHA: {steps.base.output}. You have NO shell tool; do not call bd. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
+      "task": "Fresh guardrail review in parallel with the correctness reviewer; you did not write this code. Work in the current cwd and read ONLY workflows/agile-loop.js and tests/agile-loop.test.mjs with your read/grep tools. Do NOT call ctx_read and ignore any shared worker notes; review only the files. Check ONLY: (1) work/rework/repair/report-repair briefs contain an explicit ban on bd close/create/update; (2) a post-loop reconciliation reopens a falsely closed failed leaf and records an incident; (3) tests cover both; (4) no bd executable call was added. Base SHA: {steps.base.output}. You have NO shell tool; do not call bd. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
+    },
+    {
+      "id": "fix",
+      "type": "agent",
+      "agent": "executor-code",
+      "model": "openai-codex/gpt-6-luna",
+      "tools": ["read", "grep", "find", "ls", "edit", "write"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 600000,
+      "idleTimeout": 180000,
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["git:HEAD", "file:workflows/agile-loop.js", "file:tests/agile-loop.test.mjs"] },
+      "output": "json",
+      "expect": {
+        "type": "object",
+        "required": ["files", "tests", "summary"],
+        "properties": {
+          "files": { "type": "array", "items": { "type": "string" } },
+          "tests": { "type": "string" },
+          "summary": { "type": "string" }
+        }
+      },
+      "dependsOn": ["review-correctness", "review-guardrails", "hash-before"],
+      "task": "You are the task worker for one pi-agile leaf. Read ONLY docs/plans/taskflow-pilot/PLAN.md Appendix A, workflows/agile-loop.js and tests/agile-loop.test.mjs in the current cwd. Do not call bd, do not commit, do not edit files outside those two files. Implement or refine this contract: a BD_WRITE_BAN constant naming `bd close`, `bd reopen`, `bd create` and `bd update`; five total references including ledgerRepair; a real post-loop `bd reopen` with an incident list in the return (bdIncidents, bdReopenIncidents or bdCloseIncidents); behavior tests, not just source-string assertions. Record any decisions needed to continue in the summary field of your JSON report. If the current tree already satisfies the contract, do not reimplement it; only fix the listed blockers. Finish in at most 8 turns. Tests are run by deterministic script phases. Report EXACTLY JSON {\"files\":[...],\"tests\":\"<n/a>\",\"summary\":\"<short>\"} and nothing else.\nReview blockers:\n- correctness: {steps.review-correctness.json.blockers}\n- guardrails: {steps.review-guardrails.json.blockers}"
+    },
+    {
+      "id": "recheck",
+      "type": "script",
+      "run": ["node", "-e", "const cp=require('child_process'),c=require('crypto'),f=require('fs');const before='{steps.hash-before.output}';const now=c.createHash('sha256').update(f.readFileSync('workflows/agile-loop.js')).update(f.readFileSync('tests/agile-loop.test.mjs')).digest('hex');if(now===before){console.log('RECHECK OK (no file change)')}else{const a=cp.spawnSync(process.execPath,['-e',require('D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/flow.json').phases.find(p=>p.id==='contract-check').run[2]],{cwd:'D:/tmp/tf-pilot-repo',encoding:'utf8'});const b=cp.spawnSync(process.execPath,['-e',require('D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/flow.json').phases.find(p=>p.id==='parse-check').run[2]],{cwd:'D:/tmp/tf-pilot-repo',encoding:'utf8'});const t=cp.spawnSync('npm',['test'],{cwd:'D:/tmp/tf-pilot-repo',encoding:'utf8',shell:true});console.log(a.status===0&&b.status===0&&t.status===0&&/fail 0/.test(t.stdout)?'RECHECK OK':'RECHECK FAIL')}"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 300000,
+      "idempotent": false,
+      "dependsOn": ["fix", "hash-before"]
+    },
+    {
+      "id": "gate-recheck",
+      "type": "gate",
+      "dependsOn": ["recheck"],
+      "score": {
+        "target": "{steps.recheck.output}",
+        "scorers": [{ "type": "contains", "name": "recheck-ok", "value": "RECHECK OK" }],
+        "combine": "all"
+      }
     },
     {
       "id": "report",
@@ -210,12 +260,12 @@
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 60000,
       "idempotent": false,
-      "dependsOn": ["base", "baseline-test", "review-correctness", "review-guardrails", "verify", "diff-stat", "report-stub"]
+      "dependsOn": ["base", "baseline-test", "review-correctness", "review-guardrails", "fix", "recheck", "verify", "diff-stat", "report-stub"]
     },
     {
       "id": "gate-correctness",
       "type": "gate",
-      "dependsOn": ["report", "review-correctness"],
+      "dependsOn": ["report", "review-correctness", "gate-recheck"],
       "score": {
         "target": "{steps.review-correctness.output}",
         "scorers": [
@@ -227,7 +277,7 @@
     {
       "id": "gate-guardrails",
       "type": "gate",
-      "dependsOn": ["report", "review-guardrails"],
+      "dependsOn": ["report", "review-guardrails", "gate-recheck"],
       "score": {
         "target": "{steps.review-guardrails.output}",
         "scorers": [
@@ -255,7 +305,7 @@
       "cwd": "D:/tmp/tf-pilot-repo",
       "timeout": 60000,
       "idempotent": false,
-      "dependsOn": ["gate-correctness", "gate-guardrails", "gate-tests"]
+      "dependsOn": ["gate-correctness", "gate-guardrails", "gate-tests", "gate-recheck"]
     },
     {
       "id": "merge",
