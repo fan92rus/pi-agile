@@ -39,10 +39,21 @@ Full 19-phase flow, same synthetic `TEST-1`, identical repo state and worker/fix
 | `tf-leaf-mvp-review-fresh-mwz9cukn-40adbf` | fresh | 43,487 | 281,600 | 17 | 128.1 | 0.007733 |
 | `tf-leaf-mvp-review-reuse-mwz9ftso-38472f` | reused | 61,620 | 263,936 | 17 | 150.3 | 0.009391 |
 | `tf-leaf-mvp-review-fresh-mwz9jd9g-3f4192` | fresh | 23,587 | 262,912 | 15 | 218.8 | 0.005597 |
-| average | reused | 60,956 | 207,232 | 14.0 | 137.9 | 0.009000 |
-| average | fresh | 33,537 | 272,256 | 16.0 | 173.4 | 0.007000 |
+| `tf-leaf-mvp-review-fresh-mwza0q3y-c01697` | fresh | 42,968 | 280,448 | 17 | 141.1 | — |
+| `tf-leaf-mvp-review-reuse-mwza403d-f9caa5` | reused | 42,738 | 282,496 | 17 | 150.0 | — |
 
-Unlike fix reuse, reviewer reuse did **not** reduce fresh tokens here: fresh sessions got more provider prompt-cache hits and used fewer fresh tokens, while reused sessions had fewer turns and shorter total runs in this sample. Treat this as evidence that reviewer reuse changes cache behavior rather than as a universal cost win.
+The first four runs looked like a reviewer-reuse penalty, but the reverse-order pair (`fresh` then `reuse`) came out essentially equal. To isolate reviewers from `final-fix`, the same flows were rerun with `final-fix` skipped (`when: 1 == 0`); `final-cycles` then contains only the two incremental reviewers plus deterministic scripts.
+
+| run | mode | final-cycle fresh | final-cycle cacheRead | initial correctness fresh |
+|---|---|---:|---:|---:|
+| `tf-leaf-mvp-review-reuse-mwza964g-4f6816` | reused | 1,731 | 113,792 | 19,638 |
+| `tf-leaf-mvp-review-fresh-mwzabj3r-b01a95` | fresh | 1,564 | 94,720 | 836 |
+| `tf-leaf-mvp-review-fresh-mwzaf22k-8d4ed3` | fresh | 20,327 | 94,976 | 854 |
+| `tf-leaf-mvp-review-reuse-mwzahbma-05e1c6` | reused | 1,491 | 94,848 | 19,640 |
+
+Root cause: the numbers are governed by **provider prompt-cache state**, not by taskflow session reuse as such. Continuing a reviewer session sends the already-warmed prefix from the initial review, so the incremental review is cheap; a fresh session must rebuild that prefix and can be cold or warm depending on whether the provider has cached an identical prompt. Taskflow's own cross-run cache was disabled for both variants, but provider-level prefix caching was not observable or controllable from the flow. The `final-cycles` aggregate also includes `final-fix`, adding worker-session variance to the first table.
+
+Practical conclusion: reviewer session reuse gives a *stable hot prefix* for the second review, but it is not a reliable token-cost win in these measurements. Any future claim must control run order and cache warmth, and should instrument nested phases separately instead of relying on the aggregate `final-cycles` usage.
 
 ## Repeat-cycle proof
 
