@@ -776,11 +776,18 @@ function reviewTierOf(v) {
   const s = String(v || "").trim().toLowerCase();
   return REVIEW_TIERS.indexOf(s) !== -1 ? s : "full";
 }
+function filesHintFromDescription(description) {
+  const text = String(description || "");
+  const filesLine = text.split(/\r?\n/).find(function (line) { return /^\s*Файлы\s*:/i.test(line); });
+  const pathRe = /(?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.(?:js|mjs|cjs|ts|tsx|jsx|json|md|sh|py|yml|yaml|ps1|cmd|bat|toml|txt|html|css|sql|go|rs|java|cs|c|h)\b/i;
+  const match = (filesLine || "").match(pathRe) || text.match(pathRe);
+  return match ? match[0].slice(0, 200) : "";
+}
 function normalizeLeaf(l) {
   l = l && typeof l === "object" ? l : {};
   return {
     id: String(l.id || ""), title: String(l.title || ""), rationale: String(l.rationale || ""),
-    acceptance: String(l.acceptance || ""), files_hint: String(l.files_hint || ""),
+    acceptance: String(l.acceptance || ""), files_hint: filesHintFromDescription(l.rationale) || String(l.files_hint || ""),
     measure: String(l.measure || ""),
     deps: Array.isArray(l.deps) ? l.deps.map(String) : [],
     open: l.open !== false,
@@ -1275,7 +1282,7 @@ function boundaryBrief(refresh, closables) {
     "  id = id; title = title; open = (status != \"closed\");",
     "  rationale = the complete description (do NOT truncate);",
     "  acceptance = the complete test/contract clause of the description (the sentence that states the tests or contract), '' if none;",
-    "  files_hint = the first file path named in the description, first 200 chars, '' if none;",
+    "  files_hint = first use the first path on a line beginning 'Файлы:' (first 200 chars); if absent or no path is present there, use the first path anywhere in the description (first 200 chars), '' if none;", 
     "  measure = the value of the \"Метод измерения:\" line of the description (the whole line after the colon, first 200 chars), '' if the line is absent - the engine needs it to issue a visual-criterion leaf into work (П6);",
     "  deps = ids of dependencies[] entries whose dependency_type is \"blocks\" (parent-child entries are NOT deps), [] if none;",
     "  review = the tier word full|lite|none that the description states for the task; missing or unknown -> \"full\".",

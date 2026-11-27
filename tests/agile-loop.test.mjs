@@ -23,6 +23,24 @@ import { mergeBranch } from "../workflows/merge-branch.mjs";
 
 const T = (name, fn) => test(name, { timeout: 15000 }, fn);
 
+T("bd files_hint prefers the Файлы: path and falls back to the first prose path", async () => {
+  async function hintFor(id, rationale) {
+    const routes = makeRuns([
+      { match: K.work, handle: ok(workOut()) },
+      { match: K.review, handle: ok(reviewOk()) },
+      { match: K.merge, handle: ok(mergeOut()) },
+    ]);
+    const leaf = { id, title: id, rationale, acceptance: "gate", files_hint: "", deps: [], open: true };
+    const out = await runCampaign(baseArgs({ taskSource: "bd-epic", bdEpic: "hint-epic", doneWhen: "bd-epic-closed", bdTasks: [leaf], maxSprints: 1 }), routes, makeState());
+    assert.ok(!out.err, "workflow threw: " + (out.err && out.err.message));
+    return routes.spec(K.work).spec.task;
+  }
+  const preferred = await hintFor("preferred", "Prose: src/prose.ts\nФайлы: lib/actual.js\nMore: src/after.ts");
+  assert.match(preferred, /Expected files \(hint(?:, not a straitjacket)?\): lib\/actual\.js/);
+  const fallback = await hintFor("fallback", "Prose: src/legacy.ts\nNo Файлы line here.");
+  assert.match(fallback, /Expected files \(hint(?:, not a straitjacket)?\): src\/legacy\.ts/);
+});
+
 // A git MUTATION command silently continued with `|| true` - the ban targets real
 // commands, not prose that happens to mention both `git add -A` and `|| true`.
 const GIT_MUTATION_SILENT = /\bgit (?:add|commit|push|reset|restore|checkout|switch|merge|rebase|branch|worktree|clean|rm|mv|tag)[^\n`]*\|\| true/;
