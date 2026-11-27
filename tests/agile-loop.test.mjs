@@ -81,6 +81,7 @@ T("happy path: 1 task -> worktree isolation even solo, merge preflight + journal
   assert.ok(/git worktree add/.test(work.spec.task), "single task is ALSO worktree-isolated (main copy never switched)");
   assert.ok(!/git checkout main && git checkout -b/.test(work.spec.task), "no main-copy branch switch");
   assert.ok(work.spec.task.includes("npm test"), "gate command in worker brief");
+  assert.match(work.spec.task, /NEVER run `bd close` or `bd reopen`/, "worker brief prohibits leaf close/reopen");
   const merge = runs.spec(K.merge);
   assert.ok(merge.spec.task.includes("workflows/merge-branch.mjs"), "merge brief invokes deterministic CLI");
   assert.ok(merge.spec.task.includes("--approved-sha"), "CLI command carries approved SHA");
@@ -2299,6 +2300,9 @@ T("toy-falcon bd-close: failed leaf is never closed - NO boundary child (no refr
   }
   assert.equal(outF.res.tasks.find((r) => r.id === "fal-a").verdict, "failed");
   assert.ok(outF.res.keptBranches.some((k) => k.id === "fal-a" && k.verdict === "failed"), "the failed leaf is kept for the lead");
+  assert.equal(outF.res.failedClosedLeaves.length, 1, "failed-leaf recovery failure is surfaced once");
+  assert.equal(outF.res.failedClosedLeaves[0].id, "fal-a");
+  assert.match(outF.res.failedClosedLeaves[0].note, /failed leaf close check failed/);
 });
 
 T("toy-falcon bd-close: merger bd-close failure does not sink the merge - verdict merged stands, failure logged, the post-loop child retries", async () => {

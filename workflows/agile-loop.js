@@ -954,6 +954,7 @@ const GIT_RULES = "Git rules: work on YOUR feature branch only; never push; neve
 // scripts (bd-cursor ys9, debug-tracker.mjs) because they read BRIEFS, not AGENTS.md.
 // Shared by the work/rework/repair briefs below.
 const NO_SCRATCH_DEBUG = "NO SCRATCH DEBUG SCRIPTS: find answers with EXISTING commands (`bd list --json`, `bd show`, `node --test <file>` with a timeout, ready-made repo analyzers); self-written helper scripts (debug-*.mjs, temp-file+node:fs scripting) are FORBIDDEN without explicit justification in your final report.\n";
+const NO_BD_LEAF_CLOSE = "BD LEAF SAFETY: as a work/rework/repair child, NEVER run `bd close` or `bd reopen` on any issue. Only the campaign merger or post-loop engine may close leaves.\n";
 
 // L4: a failed edit is retried from the FILE, never from memory (CRLF files defeated three memory-based edits in one campaign).
 const EDIT_FAILURE_RULE = "EDIT FAILURE RULE (mandatory; counted per file): 1) on the FIRST failed edit of a file (oldText not found or not unique - typical for CRLF files), READ THE WHOLE FILE with the read tool (no offset/limit) and retry the edit with oldText copied verbatim from that read, never from memory; 2) on the SECOND failure of the same file, OVERWRITE the whole file with the write tool using the content you read, then check `git diff --stat` shows only your intended change; 3) on the THIRD failure (or a failed write), STOP - make no further attempts and report completed=false with the file path, the failed calls and what is left undone.";
@@ -1378,7 +1379,7 @@ function workPhase(t, rec, parallel) {
     "Verification command (must pass before you finish): " + (relayMode && testCommandQuick ? gateRun(testCommandQuick) + " (quick gate; the FULL suite runs again at merge)" : gateRun(testCommand)),
     "",
     "Global constraints (repeated for direct workers): " + constraints,
-    GIT_RULES, CMDS, NO_SCRATCH_DEBUG, EDIT_FAILURE_RULE,
+    GIT_RULES, CMDS, NO_SCRATCH_DEBUG, NO_BD_LEAF_CLOSE, EDIT_FAILURE_RULE,
     "MINIMALITY CONTRACT: the acceptance criteria and the verification command are the source of truth; delete anything no criterion needs before finishing.",
     "TDD preference: for aspects the verification command does not cover, write a failing test first and keep it in the deliverable.",
     isAnalysisLeaf(t) ? "NO-CODE EXCEPTION: do NOT commit. Leave the branch at its original HEAD; report that HEAD SHA and the exact artifact path. The artifact may be ignored/untracked and must be verified by review." : parallel ? "Before finishing: commit all your changes ON YOUR BRANCH inside your worktree (git add <files> && git commit), leave the worktree clean, report branch + worktree." : "Before finishing: commit all your changes to your branch (git add <your changed files> && git commit - NEVER 'git add -A': journal/.env/beads files must not leak into the branch), leave the working copy clean, report your branch name.",
@@ -2379,6 +2380,40 @@ if (!stopReason) {
 if (budgetHit && /^(max-sprints reached|stop-criteria \(retro\)|sdd tasks exhausted|curator returned no tasks)/.test(stopReason)) {
   stopReason = "token budget exhausted (runtime usageBudget)";
 }
+// POST-LOOP recovery: a child may have closed a leaf despite a failed campaign verdict.
+// Reopen those accidental closes and surface each confirmed incident to the caller.
+const failedClosedLeaves = [];
+if (taskSource === "bd-epic") {
+  const failedLeaves = taskResults.filter(function (r) { return r && r.id && ["failed", "arbiter-failed", "merge-failed", "drop-failed", "main-mutated", "needs-attention"].indexOf(r.verdict) !== -1; });
+  if (failedLeaves.length) {
+    try {
+      const recovery = await runChild("final-bd-failed-leaf-check", childOpts({ task: [
+        "From the MAIN working copy, inspect these failed campaign leaves only: " + failedLeaves.map(function (r) { return String(r.id); }).join(", "),
+        "For each, run bd show <id> --json. If status is closed, run bd reopen <id> and verify status is open. Never change any other issue.",
+        "Return closed entries for every inspected id; closed=true means it was closed and successfully reopened, note identifies the incident. Otherwise closed=false.",
+        FINAL_MSG, "Schema keys: closed[{id, closed, note}], leaves."
+      ].join("\\n"), outputSchema: BOUNDARY_SCHEMA, acceptance: false }));
+      const checked = outOf(recovery).closed || [];
+      const seenFailedIds = Object.create(null);
+      failedLeaves.forEach(function (r) {
+        if (seenFailedIds[String(r.id)]) return;
+        seenFailedIds[String(r.id)] = true;
+        const c = checked.find(function (entry) { return entry && String(entry.id) === String(r.id); });
+        if (c && c.closed === true) failedClosedLeaves.push({ id: String(r.id), note: String(c.note || "failed leaf was closed by child and reopened") });
+        else failedClosedLeaves.push({ id: String(r.id), note: c ? String(c.note || "failed leaf close recovery unsuccessful") : "failed leaf close check omitted this issue" });
+      });
+      if (failedClosedLeaves.length) log.push("post-loop: failed-leaf close incidents/checks: " + failedClosedLeaves.map(function (x) { return x.id; }).join(","));
+    } catch (e) {
+      const seenFailedIds = Object.create(null);
+      failedLeaves.forEach(function (r) {
+        if (seenFailedIds[String(r.id)]) return;
+        seenFailedIds[String(r.id)] = true;
+        failedClosedLeaves.push({ id: String(r.id), note: "failed leaf close check failed: " + String(e).slice(0, 120) });
+      });
+      log.push("post-loop: failed-leaf close check failed (" + String(e).slice(0, 120) + ")");
+    }
+  }
+}
 // POST-LOOP bd-close (bd-epic): mergers close their own merges eagerly, but a close can
 // fail or go unreported (best-effort) - those would stay open in bd when the loop ends
 // (maxSprints/budget/stall/epic-closed).
@@ -2502,6 +2537,7 @@ return {
   analytics: analytics,
   mainIncidents: mainIncidents,
   needsAttention: needsAttention,
+  failedClosedLeaves: failedClosedLeaves,
   needsReview: needsReview,
   keptBranches: keptBranches,
   log: log
