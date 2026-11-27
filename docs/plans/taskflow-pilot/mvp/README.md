@@ -9,7 +9,7 @@
 1. **Merge target** — в `base` (текущая branch тестового репо), а не в фиксированный `main`.
 2. **bd export** — отдельный финальный script phase после успешного merge.
 3. **Worker tools** — давать `bash`, но worker не должен вызывать `bd`, коммитить или пушить. Нарушение ловится gates.
-4. **Models** — worker и оба reviewer'а на `openai-codex/gpt-6-luna`. Taskflow 0.2.1 не интерполирует `{args.X}` в поле `model`, поэтому смена модели сейчас делается правкой `flow.json` (или host modelRoles для роли агента), а не аргументом ранна.
+4. **Models** — по умолчанию worker и reviewer'ы на `openai-codex/gpt-6-luna`. Taskflow 0.2.1 не интерполирует `{args.X}` в поле `model`, поэтому модель задаётся генератором (`--workerModel`, `--reviewerModel`) или правкой сгенерированного flow, а не аргументом ранна.
 
 ## Генерация flow под bd-лист
 
@@ -21,7 +21,7 @@ node docs/plans/taskflow-pilot/mvp/scripts/make-task-flow.mjs \
   --filesHint extensions/pi-agile/bd.ts,workflows/agile-loop.js,tests/agile-loop.test.mjs
 ```
 
-Скрипт читает `bd show <taskId> --json`, достаёт `Files:`/`Acceptance:` из описания, пишет `acceptance.md` и `criteria.md` во временную директорию вне репо и создаёт готовый flow в `.pi/taskflows/tf-leaf-mvp-<taskId>.json`. `--filesHint` нужен, когда тестовый файл не перечислен в bd-описании.
+Скрипт читает `bd show <taskId> --json`, достаёт `Files:`/`Acceptance:` из описания, пишет `acceptance.md` и `criteria.md` во временную директорию вне репо и создаёт готовый flow в `.pi/taskflows/tf-leaf-mvp-<taskId>.json`. `--filesHint` нужен, когда тестовый файл не перечислен в bd-описании. Флаги `--workerModel` и `--reviewerModel` подставляют модели прямо в сгенерированный flow.
 
 ## Входные аргументы
 
@@ -36,8 +36,6 @@ node docs/plans/taskflow-pilot/mvp/scripts/make-task-flow.mjs \
 | `criteriaFile` | yes | — | файл с criteria для reviewer'ов |
 | `testCommand` | no | `npm test` | команда гейта |
 | `sessionId` | no | `tf-leaf-mvp-<taskId>-worker` | Pi session id worker'а |
-| `workerModel` | no | `openai-codex/gpt-6-luna` | модель worker/fix |
-| `reviewerModel` | no | `openai-codex/gpt-6-luna` | модель reviewer'ов |
 | `forceEscalation` | no | `false` | `true` заставляет worker спросить супервизора до работы |
 | `bdBin` | no | `bd` | путь к `bd`; нужен для тестовых shim |
 
@@ -81,6 +79,8 @@ Worker и reviewer не вызывают `bd`, не коммитят, не пу�
 | `.taskflow-mvp/gates.log` | `gates` / `recheck` | вывод тестов |
 | `.taskflow-mvp/result.json` | `report` | финальный structured report |
 
+`cleanup` копирует `result.json` в `<repo>/.pi/taskflows/results/<taskId>.json`, затем удаляет worktree и branch.
+
 Все эти файлы исключены из gate на changed files и из commit.
 
 ## Фазы
@@ -91,7 +91,7 @@ preflight → task-packet → work → gates → diff
   → review-guardrails ─┴→ rework-input → fix → recheck → diff-final
     → review2-correctness ┬┐
     → review2-guardrails ─┴→ rework-input-final
-      → merge-gate → merge → bd-owner → bd-export → report
+      → merge-gate → merge → bd-owner → bd-export → report → cleanup
 ```
 
 `fix` запускается всегда: при отсутствии blockers он дешёвый за счёт session reuse и cross-run cache. Это исключает каскадные skip через `dependsOn`.

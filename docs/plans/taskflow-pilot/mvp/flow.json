@@ -147,7 +147,7 @@
       "dependsOn": [
         "task-packet"
       ],
-      "task": "Implement exactly one bd leaf in the isolated worktree. Read .taskflow-mvp/task.json and .taskflow-mvp/acceptance.txt. Allowed files: {args.filesHint}. HARD RULES: never call bd, never commit, never push, never edit .beads/ or .taskflow-mvp/ except writing .taskflow-mvp/worker.json with your final JSON. You MAY use bash for local inspection/tests, but never with bd/commit/push. If blocked by an API/scope/product decision, call contact_supervisor with reason need_decision and continue with the answer in the same turn. FORCE ESCALATION FLAG: {args.forceEscalation}. If it is exactly 'true', first call contact_supervisor with reason need_decision and question 'Which token should I return: ALPHA or BETA?', wait for the answer, include `supervisorToken:<answer>` in your summary, and only then implement. Return ONLY JSON {\"summary\":\"...\",\"filesChanged\":[...],\"decisions\":[...]}."
+      "task": "Implement exactly one bd leaf in the isolated worktree. Read .taskflow-mvp/task.json and .taskflow-mvp/acceptance.txt. Allowed files: {args.filesHint}. HARD RULES: never call bd, never commit, never push, never edit .beads/ or .taskflow-mvp/ except writing .taskflow-mvp/worker.json with your final JSON. You MAY use bash for local inspection/tests, but never with bd/commit/push. Before returning, run `{args.testCommand}` locally with bash and fix every failure; do not report success until it is green. If blocked by an API/scope/product decision, call contact_supervisor with reason need_decision and continue with the answer in the same turn. FORCE ESCALATION FLAG: {args.forceEscalation}. If it is exactly 'true', first call contact_supervisor with reason need_decision and question 'Which token should I return: ALPHA or BETA?', wait for the answer, include `supervisorToken:<answer>` in your summary, and only then implement. Return ONLY JSON {\"summary\":\"...\",\"filesChanged\":[...],\"decisions\":[...]}."
     },
     {
       "id": "gates",
@@ -366,7 +366,7 @@
       "dependsOn": [
         "rework-input"
       ],
-      "task": "Continue the SAME worker session. Status from rework-input: {steps.rework-input.output}. If blockers exist, read .taskflow-mvp/blockers.json and fix ONLY those blockers in at most 8 turns. If no blockers, verify nothing changed and return {\"summary\":\"no changes required\",\"filesChanged\":[],\"decisions\":[]}. Same hard rules: never call bd, never commit/push, never edit .beads/ or .taskflow-mvp/ except .taskflow-mvp/worker.json. Tests are run by deterministic phases. If blocked by a decision, call contact_supervisor with reason need_decision. Return ONLY JSON {\"summary\":\"...\",\"filesChanged\":[...],\"decisions\":[...]}."
+      "task": "Continue the SAME worker session. Status from rework-input: {steps.rework-input.output}. If blockers exist, read .taskflow-mvp/blockers.json and fix ONLY those blockers in at most 8 turns. If no blockers, verify nothing changed and return {\"summary\":\"no changes required\",\"filesChanged\":[],\"decisions\":[]}. Same hard rules: never call bd, never commit/push, never edit .beads/ or .taskflow-mvp/ except .taskflow-mvp/worker.json. If you changed files, run `{args.testCommand}` locally with bash and fix every failure; deterministic phases will still re-verify. If blocked by a decision, call contact_supervisor with reason need_decision. Return ONLY JSON {\"summary\":\"...\",\"filesChanged\":[...],\"decisions\":[...]}."
     },
     {
       "id": "recheck",
@@ -625,6 +625,24 @@
       "timeout": 60000,
       "dependsOn": [
         "bd-export"
+      ]
+    },
+    {
+      "id": "cleanup",
+      "type": "script",
+      "run": [
+        "node",
+        "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs",
+        "cleanup",
+        "TF_MVP_REPO={args.repo}",
+        "TF_MVP_WORKTREE_CWD={args.worktreeCwd}",
+        "TF_MVP_BRANCH={args.branch}",
+        "TF_MVP_TASK_ID={args.taskId}"
+      ],
+      "cwd": "D:/tmp/tf-leaf-mvp-repo",
+      "timeout": 60000,
+      "dependsOn": [
+        "report"
       ],
       "final": true
     }

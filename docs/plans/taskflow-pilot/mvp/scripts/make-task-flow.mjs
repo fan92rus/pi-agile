@@ -34,12 +34,18 @@ const templatePath = path.resolve(here, '..', 'flow.json');
 const opts = parseArgs(process.argv.slice(2));
 
 const taskId = opts.taskId || fail('--taskId is required');
+if (!/^(?!\.\.?$)[A-Za-z0-9._-]+$/.test(taskId)) fail('--taskId contains unsafe characters');
 const repo = path.resolve(opts.repo || process.cwd()).replaceAll('\\', '/');
 const worktree = path.resolve(opts.worktree || fail('--worktree is required')).replaceAll('\\', '/');
 const branch = opts.branch || `tf-leaf-mvp/${taskId}`;
 const bdBin = opts.bdBin || (process.platform === 'win32' ? 'C:/tools/bd.exe' : 'bd');
 const testCommand = opts.testCommand || 'npm test';
 const sessionId = opts.sessionId || `tf-leaf-mvp-${taskId}-worker`;
+const workerModel = opts.workerModel || 'openai-codex/gpt-6-luna';
+const reviewerModel = opts.reviewerModel || 'openai-codex/gpt-6-luna';
+for (const [label, value] of [['--workerModel', workerModel], ['--reviewerModel', reviewerModel]]) {
+  if (!/^[^\s]+$/.test(value)) fail(`${label} must be a non-empty model id without whitespace`);
+}
 const out = path.resolve(opts.out || path.join(repo, '.pi', 'taskflows', `tf-leaf-mvp-${taskId}.json`)).replaceAll('\\', '/');
 const artifactsDir = path.resolve(
   opts.artifactsDir || path.join(os.tmpdir(), 'tf-leaf-mvp-real', taskId),
@@ -129,6 +135,11 @@ Object.assign(flow.args, {
   bdBin: { ...flow.args.bdBin, default: bdBin },
 });
 
+for (const phase of flow.phases) {
+  if (phase.id === 'work' || phase.id === 'fix') phase.model = workerModel;
+  if (/^review/.test(phase.id)) phase.model = reviewerModel;
+}
+
 fs.mkdirSync(path.dirname(out), { recursive: true });
 fs.writeFileSync(out, `${JSON.stringify(flow, null, 2)}\n`, 'utf8');
 console.log(JSON.stringify({
@@ -142,4 +153,6 @@ console.log(JSON.stringify({
   criteriaFile,
   bdBin,
   testCommand,
+  workerModel,
+  reviewerModel,
 }, null, 2));

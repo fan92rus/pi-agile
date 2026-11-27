@@ -1,5 +1,7 @@
 # RESULTS — tf-leaf-mvp
 
+> Исторические прогоны ниже были на 19-фазовой версии до добавления финальной `cleanup`-фазы. Текущий flow: 20 фаз.
+
 Два живых прогона на synthetic bd task `TEST-1` в throwaway repo `D:/tmp/tf-leaf-mvp-repo` с `bd` shim.
 
 | Run | Режим | Фаз | Статус | fresh | cacheRead | turns | commit | escalation |
