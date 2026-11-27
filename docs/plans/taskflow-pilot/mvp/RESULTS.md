@@ -2,6 +2,28 @@
 
 > Исторические прогоны ниже были на 19-фазовой версии до добавления `cleanup` и repeat-циклов. Текущий flow: 19 топ-level фаз, внутри `final-cycles` — повторяемый saved subflow.
 
+## Fix session reuse A/B
+
+Same synthetic `TEST-1` task, identical repo state and prompts; only the `fix` phase session differed. Reviewer reuse was disabled in both runs, `--maxCycles 1`. Two pairs were run.
+
+| run | fix session | fresh tokens | cacheRead | turns | seconds | cost |
+|---|---|---:|---:|---:|---:|---:|
+| `mwz8ecty-0817b6` | reused | 19,736 | 37,248 | 3 | 18.4 | 0.002490 |
+| `mwz8i6fg-6fb5c7` | fresh | 1,358 | 74,624 | 4 | 17.8 | 0.001012 |
+| `mwz8l2h4-72bc02` | reused | 971 | 55,808 | 3 | 15.0 | 0.000742 |
+| `mwz8nyqs-63130b` | fresh | 38,193 | 37,248 | 4 | 12.2 | 0.004259 |
+| average | reused | 10,354 | 46,528 | 3.0 | 16.7 | 0.001616 |
+| average | fresh | 19,776 | 55,936 | 4.0 | 15.0 | 0.002636 |
+
+The token/cost difference is noisy because prompt caching and model nondeterminism dominate a no-op fix. A targeted probe removes that ambiguity: work chose a marker `CYCLE-NNNN` and stored it outside the worktree without mentioning it in its JSON; fix had to append that exact marker.
+
+| probe | result | fix tokens | fix turns | fix seconds |
+|---|---|---:|---:|---:|
+| `token-probe-reuse-mwz8t7sl-8a4486` | `pass=true` | 1,284 | 3 | 18.9 |
+| `token-probe-fresh-mwz8u5r4-9bbe77` | `pass=false`, invented `MVP TEST OK` | 19,692 | 7 | 40.3 |
+
+Conclusion: session reuse makes fix cheaper and reduces turns in this pilot, and gives access to context that is not available in artifacts. Wall time is not reliably lower because a fresh session can be shorter when it does less verification.
+
 ## Repeat-cycle proof
 
 Синтетический прогон `tf-leaf-mvp-TEST-1-mwz7k01r-d8c206`: completed 19/19, `final-cycles` завершился на `cycle=2` с `done=true`, blockers пуст, merge `1461622`, cleanup удалил worktree/branch. Reviewer'ы получали `.taskflow-mvp/diff-cycle-N.patch` и untrusted `fixSummary`; worker/fix и reviewer-сессии configured as `cleanup: keep`.
