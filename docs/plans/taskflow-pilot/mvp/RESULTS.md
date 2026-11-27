@@ -24,6 +24,26 @@ The token/cost difference is noisy because prompt caching and model nondetermini
 
 Conclusion: session reuse makes fix cheaper and reduces turns in this pilot, and gives access to context that is not available in artifacts. Wall time is not reliably lower because a fresh session can be shorter when it does less verification.
 
+## Full-flow reviewer session reuse A/B
+
+Full 19-phase flow, same synthetic `TEST-1`, identical repo state and worker/fix sessions, `--maxCycles 1`. Both reviewer cache scopes were forced to `run-only` because taskflow rejects `cross-run` together with session reuse.
+
+- **reuse** — initial reviewers and final-cycle reviewers shared one session id per reviewer role.
+- **fresh** — initial and final-cycle reviewers used different session ids.
+
+`review total` = `review-correctness` + `review-guardrails` + aggregated `final-cycles`. The last aggregate also includes `final-fix`, so this is reviewer-path cost rather than a pure reviewer-only measurement.
+
+| run | mode | review fresh | review cacheRead | review turns | total run sec | review cost |
+|---|---|---:|---:|---:|---:|---:|
+| `tf-leaf-mvp-review-reuse-mwz99x0a-382d80` | reused | 60,292 | 150,528 | 11 | 125.5 | 0.008060 |
+| `tf-leaf-mvp-review-fresh-mwz9cukn-40adbf` | fresh | 43,487 | 281,600 | 17 | 128.1 | 0.007733 |
+| `tf-leaf-mvp-review-reuse-mwz9ftso-38472f` | reused | 61,620 | 263,936 | 17 | 150.3 | 0.009391 |
+| `tf-leaf-mvp-review-fresh-mwz9jd9g-3f4192` | fresh | 23,587 | 262,912 | 15 | 218.8 | 0.005597 |
+| average | reused | 60,956 | 207,232 | 14.0 | 137.9 | 0.009000 |
+| average | fresh | 33,537 | 272,256 | 16.0 | 173.4 | 0.007000 |
+
+Unlike fix reuse, reviewer reuse did **not** reduce fresh tokens here: fresh sessions got more provider prompt-cache hits and used fewer fresh tokens, while reused sessions had fewer turns and shorter total runs in this sample. Treat this as evidence that reviewer reuse changes cache behavior rather than as a universal cost win.
+
 ## Repeat-cycle proof
 
 Синтетический прогон `tf-leaf-mvp-TEST-1-mwz7k01r-d8c206`: completed 19/19, `final-cycles` завершился на `cycle=2` с `done=true`, blockers пуст, merge `1461622`, cleanup удалил worktree/branch. Reviewer'ы получали `.taskflow-mvp/diff-cycle-N.patch` и untrusted `fixSummary`; worker/fix и reviewer-сессии configured as `cleanup: keep`.
