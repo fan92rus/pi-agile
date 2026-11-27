@@ -55,6 +55,14 @@ Root cause: the numbers are governed by **provider prompt-cache state**, not by 
 
 Practical conclusion: reviewer session reuse gives a *stable hot prefix* for the second review, but it is not a reliable token-cost win in these measurements. `make-task-flow.mjs` therefore defaults to `--reuseReviewerSession false`; worker/fix session reuse stays enabled. Any future claim must control run order and cache warmth, and should instrument nested phases separately instead of relying on the aggregate `final-cycles` usage.
 
+## Campaign layer proof
+
+`campaign/make-campaign-flow.mjs` builds a Taskflow DAG from ready bd leaves; each leaf is the existing saved `tf-leaf-mvp-<taskId>` flow, and a final deterministic `campaign-report` checks leaf result artifacts. No new engine was introduced.
+
+Synthetic two-leaf campaign `tf-campaign-mvp-mwzccj7w-e809b0`: completed 3/3; both leaves `merged`, `bdClosed true`, blockers empty, final report `status: merged`. Leaves ran with `concurrency: 1` because each merges into the same base branch.
+
+Current real repo has no eligible ready code leaves after `pi-agile-8en`; `pi-agile-2nh` and `pi-agile-337` have no `Files:`/`Acceptance:` code-leaf shape and are intentionally filtered out.
+
 ## Repeat-cycle proof
 
 Синтетический прогон `tf-leaf-mvp-TEST-1-mwz7k01r-d8c206`: completed 19/19, `final-cycles` завершился на `cycle=2` с `done=true`, blockers пуст, merge `1461622`, cleanup удалил worktree/branch. Reviewer'ы получали `.taskflow-mvp/diff-cycle-N.patch` и untrusted `fixSummary`; worker/fix и reviewer-сессии configured as `cleanup: keep`.

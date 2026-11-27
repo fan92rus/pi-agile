@@ -193,7 +193,10 @@ Object.assign(mainFlow.args, {
 });
 applyModels(mainFlow);
 fs.mkdirSync(path.dirname(out), { recursive: true });
-fs.writeFileSync(out, `${JSON.stringify(mainFlow, null, 2)}\n`, 'utf8');
+const mainJson = `${JSON.stringify(mainFlow, null, 2)}\n`;
+fs.writeFileSync(out, mainJson, 'utf8');
+const hostMainPath = slash(path.join(tasksDir, `tf-leaf-mvp-${taskId}.json`));
+if (out !== hostMainPath) fs.writeFileSync(hostMainPath, mainJson, 'utf8');
 
 console.log(JSON.stringify({
   flow: out,
