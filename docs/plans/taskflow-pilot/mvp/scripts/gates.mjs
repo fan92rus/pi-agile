@@ -26,7 +26,8 @@ if (mode === 'full') {
   const argv = parts.map(s => s.replace(/^(['"])(.*)\1$/, '$2'));
   if (!argv.length) fail('testCommand is empty');
   const executable = process.platform === 'win32' && argv[0] === 'npm' ? 'npm.cmd' : argv[0];
-  const test = spawnSync(executable, argv.slice(1), { cwd, encoding: 'utf8', shell: false, windowsHide: true });
+  const useShell = process.platform === 'win32' && executable.endsWith('.cmd');
+  const test = spawnSync(executable, argv.slice(1), { cwd, encoding: 'utf8', shell: useShell, windowsHide: true });
   const log = `${test.stdout || ''}${test.stderr || ''}`;
   fs.mkdirSync(path.join(cwd, '.taskflow-mvp'), { recursive: true });
   fs.writeFileSync(path.join(cwd, '.taskflow-mvp', 'gates.log'), log, 'utf8');
