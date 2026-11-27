@@ -2951,3 +2951,35 @@ Amendment 5 убирает `fix` из основного flow и перенос�
 Второй прогон дешевле, потому что tools в producer совпали с tools в rework `fix`; это подтверждает, что стабильный префикс system prompt улучшает provider cache.
 
 **Наладка.** Первый producer-запуск через уже загруженный хост не сохранил transcript: `cleanup: "keep"` в нём не действует. Прогон через свежий `pi` с явной загрузкой расширения (`--no-extensions -e .../pi-taskflow/dist/index.js`) корректно сохранил и затем удалил сессию. Все приведённые выше живые цифры — из свежих процессов.
+
+### Автоматический замер: agile-leaf-pilot-mwyrwhl1-8374cc
+
+| phase | status | fresh | cache | total | turns | cost |
+|---|---|---:|---:|---:|---:|---:|
+| review-correctness | done | 77 854 | 833 792 | 911 646 | 16 | $0.00000 |
+| review-guardrails | done | 109 920 | 338 944 | 448 864 | 6 | $0.00000 |
+| **ИТОГО** | | **187 774** | **1 172 736** | **1 360 510** | | |
+
+### Автоматический замер: agile-leaf-pilot-mwys6bkt-ef517c
+
+| phase | status | fresh | cache | total | turns | cost |
+|---|---|---:|---:|---:|---:|---:|
+| **ИТОГО** | | **0** | **0** | **0** | | |
+
+### Amendment 6 — дешёвые ревью без снижения контроля
+
+| run | фаза | fresh | cacheRead | turns |
+|---|---|---:|---:|---:|
+| `agile-leaf-pilot-mwyrwhl1-8374cc` | review-correctness | 77 854 | 833 792 | 16 |
+| | review-guardrails | 109 920 | 338 944 | 6 |
+| **первый прогон после смены fingerprint** | **ИТОГО ревью** | **187 774** | **1 172 736** | **22** |
+| `agile-leaf-pilot-mwys6bkt-ef517c` | оба ревью | **0** | 0 | 0 |
+| `handoff-producer-probe-mwysn6u2-f9cba8` | work | 580 | 123 520 | 2 |
+| `agile-leaf-rework-mwysnss0-c4d2b5` | fix | 4 688 | 318 080 | 5 |
+| | review-correctness | 83 663 | 659 968 | 13 |
+| | review-guardrails | 97 390 | 475 904 | 8 |
+| **rework** | **ИТОГО** | **185 741** | **1 576 992** | **26** |
+
+Главный эффект: повтор основного прогона с тем же diff/criteria стоит **0 fresh** для обоих ревью. Ревью по-прежнему независимые и основаны на файлах с доказательствами `file:line`; turn-лимиты не вводились.
+
+Первый rework после подключения untrusted notes был `blocked` по настоящему семантическому блокеру post-loop reconciliation — это подтверждает, что охват ревью не ослаблен. После уточнения blocker-текста rework завершился `completed 16/16` с коммитом `771ccf8`.

@@ -162,6 +162,15 @@
       "dependsOn": ["base", "verify"]
     },
     {
+      "id": "review-fingerprint",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/review-fingerprint.mjs"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "idempotent": false,
+      "dependsOn": ["diff-full"]
+    },
+    {
       "id": "review-correctness",
       "type": "agent",
       "agent": "reviewer",
@@ -182,9 +191,9 @@
         }
       },
       "retry": { "max": 1 },
-      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["git:HEAD", "file:workflows/agile-loop.js", "file:tests/agile-loop.test.mjs"] },
-      "dependsOn": ["base", "diff-stat", "diff-full", "verify"],
-      "task": "Fresh adversarial review from a clean context; you did not write this code. Work in the current cwd and read ONLY: docs/plans/taskflow-pilot/PLAN.md (Appendix A), workflows/agile-loop.js, tests/agile-loop.test.mjs with your read/grep tools. Do NOT call ctx_read and ignore any shared worker notes; review only the files. Base SHA: {steps.base.output}. Try to refute every acceptance item with file:line evidence. You have NO shell tool; do not call bd. VERDICT pass only if both acceptance items are implemented; the green suite is verified by a separate deterministic script phase. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["file:D:/tmp/tf-pilot-repo/.taskflow-review-fingerprint.txt"] },
+      "dependsOn": ["base", "diff-stat", "diff-full", "verify", "review-fingerprint"],
+      "task": "Fresh adversarial review from a clean context; you did not write this code. Work in the current cwd and read ONLY: docs/plans/taskflow-pilot/PLAN.md (Appendix A), workflows/agile-loop.js, tests/agile-loop.test.mjs with your read/grep tools. Do NOT call ctx_read and ignore any shared worker notes; review only the listed files and do not scan unrelated files. Criteria stay first; volatile diff evidence goes last. Base SHA: {steps.base.output}. Try to refute every acceptance item with file:line evidence. You have NO shell tool; do not call bd. VERDICT pass only if both acceptance items are implemented; the green suite is verified by a separate deterministic script phase. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
     },
     {
       "id": "review-guardrails",
@@ -207,9 +216,9 @@
         }
       },
       "retry": { "max": 1 },
-      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["git:HEAD", "file:workflows/agile-loop.js", "file:tests/agile-loop.test.mjs"] },
-      "dependsOn": ["base", "diff-stat", "diff-full", "verify"],
-      "task": "Fresh guardrail review in parallel with the correctness reviewer; you did not write this code. Work in the current cwd and read ONLY workflows/agile-loop.js and tests/agile-loop.test.mjs with your read/grep tools. Do NOT call ctx_read and ignore any shared worker notes; review only the files. Check ONLY: (1) work/rework/repair/report-repair briefs contain an explicit ban on bd close/create/update; (2) a post-loop reconciliation reopens a falsely closed failed leaf and records an incident; (3) tests cover both; (4) no bd executable call was added. Base SHA: {steps.base.output}. You have NO shell tool; do not call bd. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["file:D:/tmp/tf-pilot-repo/.taskflow-review-fingerprint.txt"] },
+      "dependsOn": ["base", "diff-stat", "diff-full", "verify", "review-fingerprint"],
+      "task": "Fresh guardrail review in parallel with the correctness reviewer; you did not write this code. Work in the current cwd and read ONLY workflows/agile-loop.js and tests/agile-loop.test.mjs with your read/grep tools. Do NOT call ctx_read and ignore any shared worker notes; review only the listed files and do not scan unrelated files. Criteria stay first; volatile diff evidence goes last. Check ONLY: (1) work/rework/repair/report-repair briefs contain an explicit ban on bd close/create/update; (2) a post-loop reconciliation reopens a falsely closed failed leaf and records an incident; (3) tests cover both; (4) no bd executable call was added. Base SHA: {steps.base.output}. You have NO shell tool; do not call bd. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
     },
     {
       "id": "recheck",

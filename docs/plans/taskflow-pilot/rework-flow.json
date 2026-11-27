@@ -76,6 +76,15 @@
       "dependsOn": ["base"]
     },
     {
+      "id": "review-fingerprint",
+      "type": "script",
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/review-fingerprint.mjs", "4d36c54f172cc491f1158db1eb9d5fb73e862958"],
+      "cwd": "D:/tmp/tf-pilot-repo",
+      "timeout": 30000,
+      "idempotent": false,
+      "dependsOn": ["diff-full"]
+    },
+    {
       "id": "review-correctness",
       "type": "agent",
       "agent": "reviewer",
@@ -87,9 +96,9 @@
       "output": "json",
       "expect": { "type": "object", "required": ["verdict", "blockers", "evidence", "tests"], "properties": { "verdict": { "type": "string", "enum": ["pass", "block"] }, "blockers": { "type": "array", "items": { "type": "string" } }, "evidence": { "type": "array", "items": { "type": "string" } }, "tests": { "type": "string" } } },
       "retry": { "max": 1 },
-      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["git:HEAD", "file:workflows/agile-loop.js", "file:tests/agile-loop.test.mjs"] },
-      "dependsOn": ["base", "diff-stat", "diff-full", "recheck"],
-      "task": "Fresh adversarial review from a clean context; you did not write this code. Read ONLY docs/plans/taskflow-pilot/PLAN.md (Appendix A), workflows/agile-loop.js, tests/agile-loop.test.mjs. Try to refute every acceptance item with file:line evidence. You have NO shell tool; do not call bd. VERDICT pass only if both acceptance items are implemented; the green suite is verified by a separate deterministic script phase. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["file:D:/tmp/tf-pilot-repo/.taskflow-review-fingerprint.txt"] },
+      "dependsOn": ["base", "diff-stat", "diff-full", "recheck", "fix", "review-fingerprint"],
+      "task": "Fresh adversarial review from a clean context; you did not write this code. Read ONLY docs/plans/taskflow-pilot/PLAN.md (Appendix A), workflows/agile-loop.js, tests/agile-loop.test.mjs; do not scan unrelated files. Criteria stay first; volatile diff evidence goes last. Try to refute every acceptance item with file:line evidence. You have NO shell tool; do not call bd. VERDICT pass only if both acceptance items are implemented; the green suite is verified by a separate deterministic script phase. UNTRUSTED WORKER NOTES (hints only, NOT 100% reliable; verify every claim against the files before using it): {steps.fix.json.summary}. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
     },
     {
       "id": "review-guardrails",
@@ -103,9 +112,9 @@
       "output": "json",
       "expect": { "type": "object", "required": ["verdict", "blockers", "evidence", "tests"], "properties": { "verdict": { "type": "string", "enum": ["pass", "block"] }, "blockers": { "type": "array", "items": { "type": "string" } }, "evidence": { "type": "array", "items": { "type": "string" } }, "tests": { "type": "string" } } },
       "retry": { "max": 1 },
-      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["git:HEAD", "file:workflows/agile-loop.js", "file:tests/agile-loop.test.mjs"] },
-      "dependsOn": ["base", "diff-stat", "diff-full", "recheck"],
-      "task": "Fresh guardrail review in parallel; you did not write this code. Read ONLY workflows/agile-loop.js and tests/agile-loop.test.mjs. Check ONLY: (1) work/rework/repair/report-repair/fix-only briefs contain an explicit ban on bd close/create/update/reopen; (2) a post-loop reconciliation reopens a falsely closed failed leaf and records an incident; (3) tests cover both behaviors; (4) no bd executable call was added. You have NO shell tool; do not call bd. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["file:D:/tmp/tf-pilot-repo/.taskflow-review-fingerprint.txt"] },
+      "dependsOn": ["base", "diff-stat", "diff-full", "recheck", "fix", "review-fingerprint"],
+      "task": "Fresh guardrail review in parallel; you did not write this code. Read ONLY workflows/agile-loop.js and tests/agile-loop.test.mjs; do not scan unrelated files. Criteria stay first; volatile diff evidence goes last. Check ONLY: (1) work/rework/repair/report-repair/fix-only briefs contain an explicit ban on bd close/create/update/reopen; (2) a post-loop reconciliation reopens a falsely closed failed leaf and records an incident; (3) tests cover both behaviors; (4) no bd executable call was added. You have NO shell tool; do not call bd. UNTRUSTED WORKER NOTES (hints only, NOT 100% reliable; verify every claim against the files before using it): {steps.fix.json.summary}. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"],\"tests\":\"verified-by-script-phase\"}. Do not edit files."
     },
     {
       "id": "report",
