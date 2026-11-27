@@ -14,7 +14,8 @@ function test(command, cwd) {
   const args = parts.slice(1).map(part => part.replace(/^(?:"([\\s\\S]*)"|'([\\s\\S]*)')$/, '$1$2'));
   if (!parts.length) throw new Error('testCommand is empty');
   const executable = parts[0].replace(/^(?:"([\\s\\S]*)"|'([\\s\\S]*)')$/, '$1$2');
-  const r = spawnSync(executable, args, { cwd, encoding: 'utf8', shell: false, windowsHide: true });
+  const spawnExecutable = process.platform === 'win32' && executable === 'npm' ? 'npm.cmd' : executable;
+  const r = spawnSync(spawnExecutable, args, { cwd, encoding: 'utf8', shell: false, windowsHide: true });
   if (r.error) throw r.error;
   if (r.status !== 0) throw new Error(`testCommand failed (${r.status}): ${(r.stderr || r.stdout || '').trim()}`);
 }

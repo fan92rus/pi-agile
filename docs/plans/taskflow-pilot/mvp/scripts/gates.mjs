@@ -25,7 +25,8 @@ if (mode === 'full') {
   const parts = raw.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
   const argv = parts.map(s => s.replace(/^(['"])(.*)\1$/, '$2'));
   if (!argv.length) fail('testCommand is empty');
-  const test = spawnSync(argv[0], argv.slice(1), { cwd, encoding: 'utf8', shell: false, windowsHide: true });
+  const executable = process.platform === 'win32' && argv[0] === 'npm' ? 'npm.cmd' : argv[0];
+  const test = spawnSync(executable, argv.slice(1), { cwd, encoding: 'utf8', shell: false, windowsHide: true });
   const log = `${test.stdout || ''}${test.stderr || ''}`;
   fs.mkdirSync(path.join(cwd, '.taskflow-mvp'), { recursive: true });
   fs.writeFileSync(path.join(cwd, '.taskflow-mvp', 'gates.log'), log, 'utf8');
