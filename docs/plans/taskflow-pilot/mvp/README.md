@@ -11,6 +11,18 @@
 3. **Worker tools** — давать `bash`, но worker не должен вызывать `bd`, коммитить или пушить. Нарушение ловится gates.
 4. **Models** — worker и оба reviewer'а на `openai-codex/gpt-6-luna`. Taskflow 0.2.1 не интерполирует `{args.X}` в поле `model`, поэтому смена модели сейчас делается правкой `flow.json` (или host modelRoles для роли агента), а не аргументом ранна.
 
+## Генерация flow под bd-лист
+
+```bash
+node docs/plans/taskflow-pilot/mvp/scripts/make-task-flow.mjs \
+  --taskId pi-agile-xzy \
+  --repo D:/Documents/Repositories/pi-agile \
+  --worktree D:/tmp/tf-leaf-mvp-worktrees/pi-agile-xzy \
+  --filesHint extensions/pi-agile/bd.ts,workflows/agile-loop.js,tests/agile-loop.test.mjs
+```
+
+Скрипт читает `bd show <taskId> --json`, достаёт `Files:`/`Acceptance:` из описания, пишет `acceptance.md` и `criteria.md` во временную директорию вне репо и создаёт готовый flow в `.pi/taskflows/tf-leaf-mvp-<taskId>.json`. `--filesHint` нужен, когда тестовый файл не перечислен в bd-описании.
+
 ## Входные аргументы
 
 | Arg | Required | Default | Meaning |
