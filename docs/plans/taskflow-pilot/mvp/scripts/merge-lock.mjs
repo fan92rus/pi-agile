@@ -87,7 +87,14 @@ export async function withLock(lockPath, fn, options = {}) {
       let age = 0;
       try { age = Date.now() - fs.statSync(dir).mtimeMs; } catch { age = STALE_MS; }
       // A live owner must never be evicted, no matter how long the phase runs.
-      if ((alive === false || alive === 'missing') && age > staleMs) {
+      // A dead owner can be evicted right away: no live phase holds the lock.
+      if (alive === false && age > graceMs) {
+        evictStale(dir);
+        continue;
+      }
+      // A missing owner file is only a problem if it never appeared; wait for
+      // the stale timeout so a just-created lock is not stolen.
+      if (alive === 'missing' && age > staleMs) {
         evictStale(dir);
         continue;
       }

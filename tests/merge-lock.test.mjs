@@ -45,7 +45,7 @@ test('dead owner lock is evicted and reacquired', async () => {
     await withLock(lock, async () => {
       const owner = JSON.parse(fs.readFileSync(path.join(lock, 'owner.json'), 'utf8'));
       assert.equal(owner.pid, process.pid);
-    }, { waitMs: 1000, staleMs: 1, graceMs: 1 });
+    }, { waitMs: 1000, staleMs: 60_000, graceMs: 1 });
     assert.equal(fs.existsSync(lock), false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
