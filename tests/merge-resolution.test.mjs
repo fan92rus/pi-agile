@@ -36,6 +36,25 @@ test('union resolver preserves CRLF and removes duplicate lines', () => {
   assert.match(output, /other line/);
 });
 
+test('union resolver repeats shared closing context for both sides', () => {
+  const input = [
+    '<<<<<<< HEAD',
+    'export function waveA() {',
+    "  return 'WAVE A OK';",
+    '=======',
+    'export function waveB() {',
+    "  return 'WAVE B OK';",
+    '>>>>>>> feature',
+    '}',
+    '',
+  ].join('\n');
+  const output = resolveUnionConflicts(input);
+  assert.equal(hasConflictMarkers(output), false);
+  assert.match(output, /function waveA\(\) \{[\s\S]*return 'WAVE A OK';\n\}/);
+  assert.match(output, /function waveB\(\) \{[\s\S]*return 'WAVE B OK';\n\}/);
+  assert.equal((output.match(/^\}$/gm) || []).length, 2);
+});
+
 test('union resolver leaves non-conflict content untouched', () => {
   const input = '# file\nbase\n';
   assert.equal(resolveUnionConflicts(input), input);
