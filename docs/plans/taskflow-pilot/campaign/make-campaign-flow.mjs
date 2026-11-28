@@ -114,7 +114,7 @@ const leafIds = phases.map((phase) => phase.id);
 phases.push({
   id: 'campaign-report',
   type: 'script',
-  run: ['node', reportScript, repo, tasks.map((row) => String(row.id)).join(',')],
+  run: ['node', reportScript, repo, tasks.map((row) => String(row.id)).join(','), name],
   timeout: 60000,
   dependsOn: leafIds,
   final: true,

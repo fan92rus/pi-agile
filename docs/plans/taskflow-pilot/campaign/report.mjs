@@ -8,6 +8,14 @@ if (!repo || !taskList) {
   process.exit(1);
 }
 const tasks = taskList.split(',').map((id) => id.trim()).filter(Boolean);
+if (campaignName && !/^(?!\.\.?$)[A-Za-z0-9._-]+$/.test(campaignName)) {
+  console.error('campaignName must contain only letters, digits, dot, underscore or dash');
+  process.exit(1);
+}
+if (tasks.some((taskId) => !/^(?!\.\.?$)[A-Za-z0-9._-]+$/.test(taskId))) {
+  console.error('task ids must contain only letters, digits, dot, underscore or dash');
+  process.exit(1);
+}
 const resultsDir = path.join(repo, '.pi', 'taskflows', 'results');
 const rows = [];
 let failed = tasks.length === 0;
@@ -43,10 +51,6 @@ const summary = { status: failed ? 'failed' : 'merged', tasks: rows };
 const output = JSON.stringify(summary, null, 2);
 console.log(output);
 if (campaignName) {
-  if (path.basename(campaignName) !== campaignName || campaignName === '.' || campaignName === '..' || /[\\/]/.test(campaignName)) {
-    console.error('campaignName must be a single filename component');
-    process.exit(1);
-  }
   fs.mkdirSync(resultsDir, { recursive: true });
   fs.writeFileSync(path.join(resultsDir, `campaign-${campaignName}.json`), `${output}\n`);
 }
