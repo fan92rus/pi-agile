@@ -34,6 +34,7 @@ const campaignDir = here;
 const pilotDir = path.resolve(campaignDir, '..');
 const leafGenerator = slash(path.join(pilotDir, 'mvp', 'scripts', 'make-task-flow.mjs'));
 const reportScript = slash(path.join(campaignDir, 'report.mjs'));
+const flowProjectRoot = slash(path.resolve(campaignDir, '../../../..'));
 
 const opts = parseArgs(process.argv.slice(2));
 const repo = slash(path.resolve(opts.repo || process.cwd()));
@@ -45,6 +46,8 @@ const maxCycles = Number(opts.maxCycles || 3);
 if (!Number.isInteger(maxCycles) || maxCycles < 1 || maxCycles > 20) fail('--maxCycles must be an integer from 1 to 20');
 const reuseReviewerSession = String(opts.reuseReviewerSession || 'false');
 if (!['true', 'false'].includes(reuseReviewerSession)) fail('--reuseReviewerSession must be true or false');
+const reviewerModel = opts.reviewerModel || 'opencode-go/hy4-flash-free';
+if (!/^[^\s]+$/.test(reviewerModel)) fail('--reviewerModel must be a non-empty model id without whitespace');
 const concurrency = Number(opts.concurrency || 3);
 if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4) fail('--concurrency must be an integer from 1 to 4');
 const repoKey = createHash('sha256').update(repo).digest('hex').slice(0, 12);
@@ -102,6 +105,7 @@ for (const row of tasks) {
     '--testCommand', testCommand,
     '--maxCycles', String(maxCycles),
     '--reuseReviewerSession', reuseReviewerSession,
+    '--reviewerModel', reviewerModel,
     '--out', slash(path.join(repo, '.pi', 'taskflows', `${leafFlowName}.json`)),
   ];
   const generated = spawnSync(process.execPath, [leafGenerator, ...args], { cwd: repo, encoding: 'utf8' });
@@ -119,7 +123,7 @@ const leafIds = phases.map((phase) => phase.id);
 phases.push({
   id: 'campaign-report',
   type: 'script',
-  run: ['node', reportScript, repo, '{args.taskIds}', name],
+  run: ['node', reportScript, repo, '{args.taskIds}', name, flowProjectRoot],
   timeout: 60000,
   dependsOn: leafIds,
   final: true,
@@ -146,6 +150,8 @@ console.log(JSON.stringify({
   concurrency,
   maxCycles,
   reuseReviewerSession,
+  reviewerModel,
+  flowProjectRoot,
   worktreeRoot,
   mergeLock,
 }, null, 2));

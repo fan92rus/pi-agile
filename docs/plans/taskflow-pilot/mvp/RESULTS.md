@@ -126,3 +126,16 @@ pi-agile-wa6.2 — waveB() в lib/wave-overlap.mjs + тест
 Оба финальных состояния прошли `npm test`: 246/246. Модуль содержит обе функции, а тестовый файл — оба теста.
 
 Вывод: на этой пачке taskflow campaign был быстрее примерно на 21–29% по wall-clock, но дороже примерно в 4.4 раза по учтённой стоимости. Сравнение не полностью сопоставимо: у campaign ревьюеры были `gpt-6-luna` с fresh sessions, у agile-loop — `hy4-flash-free`; accounting токенов тоже разный (taskflow считает usage всех agent-фаз, agile-loop считает totalTokens детей). Для выбор движка по стоимости нужно повторять замер на той же модели ревьюера.
+
+## Token work: что включено
+
+1. **Clean-skip.** Новый `review-gate` после первых двух ревью пропускает `fix` и весь `final-cycles`, если оба вердикта `pass`. Вместо `fix` идёт дешёвый `fix-noop`, а `merge-gate` получает fallback от `review-gate` через `join: any`. Это убирает лишний fix и вторую пару ревьюеров для простых листов.
+2. **Cache финальных ревью.** `review-correctness` и `review-guardrails` внутри `mvp-final-cycle` кешируются cross-run по стабильному файлу `.taskflow-mvp/review-fingerprint.txt`, который `incremental-diff` вычисляет из patch + criteria + acceptance + testCommand + fixSummary. Fingerprint в taskflow не интерполирует `{args.*}`, поэтому путь обязан быть относительным к cwd фазы. При `--reuseReviewerSession true` кеш снимается: taskflow запрещает cross-run cache для session-фаз.
+3. **Дешёвый ревьюер по умолчанию.** `--reviewerModel` в генераторах теперь по умолчанию `opencode-go/hy4-flash-free`; worker остаётся на `gpt-6-luna`. Это главный рычаг стоимости.
+4. **Учёт токенов.** `report.mjs` и `campaign/report.mjs` теперь берут usage из run state и пишут `freshTokens` / `cacheReadTokens` в leaf `result.json` и в campaign summary. В campaign usage имеет приоритет над возможным stale-значением из старого standalone leaf run. Раньше поля были всегда `0`.
+
+### Почему не режем контекст ревьюеру
+
+Отдельный пункт «дать ревьюеру только diff» я сознательно **не включил как общее правило**. Ранее уже были ложные blockers именно из-за размытых критериев; ревьюер начинает выдумывать проверки и провоцирует дополнительный rework-цикл, который свежевает ревьюера и съедает больше токенов, чем экономит короткий prompt. Оставляем: acceptance + criteria + filesHint + diff. Из лишнего убраны только инструкции, основанные на недоверенных заметках worker, там где они не нужны.
+
+Живое доказательство: synthetic campaign `tf-token-opt-mx0bewp7-08dc61` — 2/2 done, merge и bd close зелёные; clean-skip path снова проходит после обработки `{steps.final-cycles.output}` как пропущенного выхода. В result и campaign summary записаны реальные `66,801` fresh и `200,704` cacheRead, совпадающие с usage campaign run state. Полный `npm test`: 258/258.

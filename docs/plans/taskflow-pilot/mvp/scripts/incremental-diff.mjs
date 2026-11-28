@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import process from 'node:process';
 
@@ -38,6 +39,24 @@ try {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, `diff-cycle-${cycle}.patch`), patch, 'utf8');
   fs.writeFileSync(path.join(dir, 'fix-summary.json'), `${JSON.stringify({ cycle, summary: fixSummary }, null, 2)}\n`, 'utf8');
+  const hashFile = (file) => {
+    if (!file || !fs.existsSync(file)) return '<missing>';
+    return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  };
+  const criteriaFile = process.env.TF_MVP_CRITERIA_FILE || '';
+  const acceptanceFile = process.env.TF_MVP_ACCEPTANCE_FILE || '';
+  const testCommand = process.env.TF_MVP_TEST_COMMAND || '';
+  const fingerprint = createHash('sha256')
+    .update(JSON.stringify({
+      cycle,
+      patch: createHash('sha256').update(patch).digest('hex'),
+      criteria: hashFile(criteriaFile),
+      acceptance: hashFile(acceptanceFile),
+      testCommand,
+      fixSummary,
+    }))
+    .digest('hex');
+  fs.writeFileSync(path.join(dir, 'review-fingerprint.txt'), `${fingerprint}\n`, 'utf8');
   fs.rmSync(current, { recursive: true, force: true });
   console.log(`INCREMENTAL DIFF OK cycle-${cycle}`);
 } catch (e) {

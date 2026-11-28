@@ -56,7 +56,7 @@ if (!Number.isInteger(maxCycles) || maxCycles < 1 || maxCycles > 20) fail('--max
 const reuseReviewerSession = String(opts.reuseReviewerSession || 'false');
 if (!['true', 'false'].includes(reuseReviewerSession)) fail('--reuseReviewerSession must be true or false');
 const workerModel = opts.workerModel || 'openai-codex/gpt-6-luna';
-const reviewerModel = opts.reviewerModel || 'openai-codex/gpt-6-luna';
+const reviewerModel = opts.reviewerModel || 'opencode-go/hy4-flash-free';
 for (const [label, value] of [['--workerModel', workerModel], ['--reviewerModel', reviewerModel]]) {
   if (!/^[^\s]+$/.test(value)) fail(`${label} must be a non-empty model id without whitespace`);
 }
@@ -156,6 +156,10 @@ if (reuseReviewerSession === 'false') {
   for (const phase of cycleFlow.phases) {
     if (/^review/.test(phase.id)) delete phase.session;
   }
+} else {
+  for (const phase of cycleFlow.phases) {
+    if (/^review/.test(phase.id)) delete phase.cache;
+  }
 }
 fs.writeFileSync(path.join(tasksDir, `${cycleName}.json`), `${JSON.stringify(cycleFlow, null, 2)}\n`, 'utf8');
 if (repo !== slash(flowProjectRoot)) {
@@ -194,6 +198,7 @@ Object.assign(mainFlow.args, {
   forceEscalation: { ...mainFlow.args.forceEscalation, default: 'false' },
   bdBin: { ...mainFlow.args.bdBin, default: bdBin },
   mergeLock: { ...mainFlow.args.mergeLock, default: mergeLock },
+  flowProjectRoot: { ...mainFlow.args.flowProjectRoot, default: slash(flowProjectRoot) },
 });
 applyModels(mainFlow);
 fs.mkdirSync(path.dirname(out), { recursive: true });

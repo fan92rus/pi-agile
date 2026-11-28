@@ -9,7 +9,7 @@
 1. **Merge target** — в `base` (текущая branch тестового репо), а не в фиксированный `main`.
 2. **bd export** — отдельный финальный script phase после успешного merge.
 3. **Worker tools** — давать `bash`, но worker не должен вызывать `bd`, коммитить или пушить. Нарушение ловится gates.
-4. **Models** — по умолчанию worker и reviewer'ы на `openai-codex/gpt-6-luna`. Taskflow 0.2.1 не интерполирует `{args.X}` в поле `model`, поэтому модель задаётся генератором (`--workerModel`, `--reviewerModel`) или правкой сгенерированного flow, а не аргументом ранна.
+4. **Models** — по умолчанию worker на `openai-codex/gpt-6-luna`, reviewer'ы на `opencode-go/hy4-flash-free`. Taskflow 0.2.1 не интерполирует `{args.X}` в поле `model`, поэтому модель задаётся генератором (`--workerModel`, `--reviewerModel`) или правкой сгенерированного flow, а не аргументом ранна.
 
 ## Генерация flow под bd-лист
 
@@ -35,6 +35,8 @@ node docs/plans/taskflow-pilot/mvp/scripts/make-task-flow.mjs \
 - `--reuseReviewerSession true|false` — переиспользовать ли сессии reviewer'ов между циклами; по умолчанию `false`.
 
 Worker/fix всегда переиспользуют `{args.sessionId}` с `cleanup: keep`. Reviewer'ы по умолчанию работают в свежих сессиях и получают только инкрементальный diff и untrusted fix summary. Переиспользование reviewer-сессии остаётся опцией для случаев, когда важна преемственность предыдущих blockers.
+
+`review-gate` после первых двух ревью пропускает `fix` и весь `final-cycles`, если оба reviewer'а дали `pass`. Финальные reviewer'ы кешируются по incremental diff + criteria + acceptance + fix summary. При `reuseReviewerSession true` cross-run cache у них отключается, потому что taskflow запрещает кешировать сессионные фазы.
 
 ## Входные аргументы
 

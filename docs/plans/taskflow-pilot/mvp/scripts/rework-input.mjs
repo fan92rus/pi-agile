@@ -10,10 +10,9 @@ const blockers = [];
 for (const [i, review] of reviews.entries()) {
   const label = i === 0 ? 'correctness' : 'guardrails';
   const verdict = String(review.verdict || '').toLowerCase();
-  if (verdict !== 'pass') {
-    const list = Array.isArray(review.blockers) ? review.blockers : [review.blockers || review.reason || 'review did not pass'];
-    for (const item of list) blockers.push(`[-${label}] ${typeof item === 'string' ? item : JSON.stringify(item)}`);
-  }
+  const list = Array.isArray(review.blockers) ? [...review.blockers] : [];
+  if (verdict !== 'pass' && !list.length) list.push(review.reason || 'review did not pass');
+  for (const item of list) blockers.push(`[-${label}] ${typeof item === 'string' ? item : JSON.stringify(item)}`);
 }
 const needsFix = blockers.length > 0;
 const dir = path.join(cwd, '.taskflow-mvp');

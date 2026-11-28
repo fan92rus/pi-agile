@@ -19,10 +19,10 @@ try {
   const blockers = [];
   for (const [i, review] of reviews.entries()) {
     const label = i === 0 ? 'correctness' : 'guardrails';
-    if (String(review.verdict || '').toLowerCase() !== 'pass') {
-      const list = Array.isArray(review.blockers) ? review.blockers : [review.blockers || review.reason || 'review did not pass'];
-      for (const item of list) blockers.push(`[-${label}] ${typeof item === 'string' ? item : JSON.stringify(item)}`);
-    }
+    const verdict = String(review.verdict || '').toLowerCase();
+    const list = Array.isArray(review.blockers) ? [...review.blockers] : [];
+    if (verdict !== 'pass' && !list.length) list.push(review.reason || 'review did not pass');
+    for (const item of list) blockers.push(`[-${label}] ${typeof item === 'string' ? item : JSON.stringify(item)}`);
   }
   const exhausted = cycle >= max;
   const done = blockers.length === 0 || exhausted;

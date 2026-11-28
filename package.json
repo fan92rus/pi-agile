@@ -42,6 +42,6 @@
     "package.json"
   ],
   "scripts": {
-    "test": "node --test tests/agile-loop.test.mjs tests/pi-agile-tools.test.mjs tests/campaign-report.test.mjs tests/campaign-generator.test.mjs tests/merge-resolution.test.mjs tests/merge-lock.test.mjs tests/wave-overlap.test.mjs"
+    "test": "node --test tests/agile-loop.test.mjs tests/pi-agile-tools.test.mjs tests/campaign-report.test.mjs tests/campaign-generator.test.mjs tests/review-gate.test.mjs tests/merge-resolution.test.mjs tests/merge-lock.test.mjs tests/wave-overlap.test.mjs"
   }
 }

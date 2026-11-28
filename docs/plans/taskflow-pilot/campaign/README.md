@@ -16,8 +16,11 @@ node docs/plans/taskflow-pilot/campaign/make-campaign-flow.mjs \
   --worktreeRoot D:/tmp/tf-campaign-worktrees \
   --testCommand 'npm test' \
   --maxCycles 3 \
-  --concurrency 3
+  --concurrency 3 \
+  --reviewerModel opencode-go/hy4-flash-free
 ```
+
+`--reviewerModel` по умолчанию `opencode-go/hy4-flash-free`: ревьюеры — самая дорогая часть leaf flow, а дешёвая модель на этой пачке задач дала сопоставимый вердикт. Worker остаётся на `openai-codex/gpt-6-luna`.
 
 По умолчанию беруться только ready-листы, у которых в описании есть `Files:` и `Acceptance:`. Это отсекает операционные задачи вроде ff-merge/лендинга.
 

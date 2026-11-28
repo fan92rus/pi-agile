@@ -22,7 +22,7 @@
     {
       "id": "incremental-diff",
       "type": "script",
-      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "incremental-diff", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_CYCLE={args.cycle}", "TF_MVP_REVIEWED_DIR={args.reviewedDir}", "TF_MVP_FILES_HINT={args.filesHint}", "TF_MVP_FIX_SUMMARY={args.fixSummary}"],
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "incremental-diff", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_CYCLE={args.cycle}", "TF_MVP_REVIEWED_DIR={args.reviewedDir}", "TF_MVP_FILES_HINT={args.filesHint}", "TF_MVP_FIX_SUMMARY={args.fixSummary}", "TF_MVP_CRITERIA_FILE={args.criteriaFile}", "TF_MVP_ACCEPTANCE_FILE={args.acceptanceFile}", "TF_MVP_TEST_COMMAND={args.testCommand}"],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
       "timeout": 60000
     },
@@ -36,6 +36,8 @@
       "idleTimeout": 180000,
       "tools": ["read", "grep", "find", "ls"],
       "session": { "id": "{args.reviewerCorrectnessSessionId}", "cleanup": "keep" },
+      "output": "json",
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["file:.taskflow-mvp/review-fingerprint.txt"] },
       "dependsOn": ["incremental-diff"],
       "expect": { "type": "object", "required": ["verdict", "blockers", "evidence"], "properties": { "verdict": { "type": "string", "enum": ["pass", "block"] }, "blockers": { "type": "array", "items": { "type": "string" } }, "evidence": { "type": "array", "items": { "type": "string" } } } },
       "task": "Incremental FINAL correctness review, cycle {args.cycle}. You previously reviewed the prior cycle snapshot (path passed in TF_MVP_REVIEWED_DIR). Read .taskflow-mvp/acceptance.txt, .taskflow-mvp/diff-cycle-{args.cycle}.patch and the files named in {args.filesHint}. UNTRUSTED FIX SUMMARY (hint only, NOT 100% reliable): {args.fixSummary}. If the patch is empty, treat it as NO CHANGE since the prior review and verify the current files named in {args.filesHint} against acceptance; do not block solely because the patch is empty. Verify that previous blockers are fixed and that the delta introduced no new correctness failures. Do not scan unrelated files and do not call git. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"]}."
@@ -50,6 +52,8 @@
       "idleTimeout": 180000,
       "tools": ["read", "grep", "find", "ls"],
       "session": { "id": "{args.reviewerGuardrailsSessionId}", "cleanup": "keep" },
+      "output": "json",
+      "cache": { "scope": "cross-run", "ttl": "30m", "fingerprint": ["file:.taskflow-mvp/review-fingerprint.txt"] },
       "dependsOn": ["incremental-diff"],
       "expect": { "type": "object", "required": ["verdict", "blockers", "evidence"], "properties": { "verdict": { "type": "string", "enum": ["pass", "block"] }, "blockers": { "type": "array", "items": { "type": "string" } }, "evidence": { "type": "array", "items": { "type": "string" } } } },
       "task": "Incremental FINAL guardrail review, cycle {args.cycle}. Check ONLY .taskflow-mvp/diff-cycle-{args.cycle}.patch with your read/grep tools (do NOT call git): no bd/commit/push commands, no .beads/ or .taskflow-mvp/ changes, no files outside {args.filesHint}, no reset --hard or auto-revert. UNTRUSTED FIX SUMMARY: {args.fixSummary}. If the patch is empty, treat it as NO CHANGE since the prior review and verify the current files named in {args.filesHint}; do not block solely because the patch is empty. Prior review context is only a hint; verify the delta yourself. Return ONLY JSON {\"verdict\":\"pass|block\",\"blockers\":[...],\"evidence\":[\"file:line\"]}."
@@ -80,7 +84,7 @@
       "type": "script",
       "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "recheck", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_FILES_HINT={args.filesHint}", "TF_MVP_TEST_COMMAND={args.testCommand}"],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
-      "timeout": 600000,
+      "timeout": 300000,
       "dependsOn": ["final-fix"]
     },
     {

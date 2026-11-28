@@ -70,6 +70,11 @@
       "type": "string",
       "default": "",
       "description": "shared lock directory for phases touching the base repo"
+    },
+    "flowProjectRoot": {
+      "type": "string",
+      "default": "D:/Documents/Repositories/pi-agile",
+      "description": "host project root that owns saved flows and run states"
     }
   },
   "phases": [
@@ -249,7 +254,7 @@
         "scope": "cross-run",
         "ttl": "30m",
         "fingerprint": [
-          "file:{args.worktreeCwd}/.taskflow-mvp/review-fingerprint.txt"
+          "file:.taskflow-mvp/review-fingerprint.txt"
         ]
       },
       "dependsOn": [
@@ -305,7 +310,7 @@
         "scope": "cross-run",
         "ttl": "30m",
         "fingerprint": [
-          "file:{args.worktreeCwd}/.taskflow-mvp/review-fingerprint.txt"
+          "file:.taskflow-mvp/review-fingerprint.txt"
         ]
       },
       "dependsOn": [
@@ -329,6 +334,23 @@
       "dependsOn": [
         "review-correctness",
         "review-guardrails"
+      ]
+    },
+    {
+      "id": "review-gate",
+      "type": "script",
+      "run": [
+        "node",
+        "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs",
+        "review-gate",
+        "TF_MVP_WORKTREE_CWD={args.worktreeCwd}",
+        "TF_MVP_REVIEW_CORRECTNESS_JSON={steps.review-correctness.output}",
+        "TF_MVP_REVIEW_GUARDRAILS_JSON={steps.review-guardrails.output}"
+      ],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 300000,
+      "dependsOn": [
+        "rework-input"
       ]
     },
     {
@@ -381,10 +403,27 @@
           }
         }
       },
+      "when": "{steps.review-gate.json.needsFix} == true",
       "dependsOn": [
-        "rework-input"
+        "rework-input",
+        "review-gate"
       ],
       "task": "Continue the SAME worker session. Status from rework-input: {steps.rework-input.output}. If blockers exist, read .taskflow-mvp/blockers.json and fix ONLY those blockers in at most 8 turns. If no blockers, verify nothing changed and return {\"summary\":\"no changes required\",\"filesChanged\":[],\"decisions\":[]}. Same hard rules: never call bd, never commit/push, never edit .beads/ or .taskflow-mvp/ except .taskflow-mvp/worker.json. If you changed files, run `{args.testCommand}` locally with bash and fix every failure; deterministic phases will still re-verify. If blocked by a decision, call contact_supervisor with reason need_decision. Return ONLY JSON {\"summary\":\"...\",\"filesChanged\":[...],\"decisions\":[...]}."
+    },
+    {
+      "id": "fix-noop",
+      "type": "script",
+      "run": [
+        "node",
+        "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs",
+        "fix-noop"
+      ],
+      "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
+      "timeout": 300000,
+      "when": "{steps.review-gate.json.skipFinal} == true",
+      "dependsOn": [
+        "review-gate"
+      ]
     },
     {
       "id": "recheck",
@@ -399,8 +438,10 @@
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
       "timeout": 300000,
+      "join": "any",
       "dependsOn": [
-        "fix"
+        "fix",
+        "fix-noop"
       ]
     },
     {
@@ -457,8 +498,10 @@
         "testCommand": "{args.testCommand}"
       },
       "output": "json",
+      "when": "{steps.review-gate.json.finalCycleNeeded} == true",
       "dependsOn": [
-        "snapshot"
+        "snapshot",
+        "review-gate"
       ]
     },
     {
@@ -473,13 +516,16 @@
         "TF_MVP_BRANCH={args.branch}",
         "TF_MVP_GATES_OUTPUT={steps.gates.output}",
         "TF_MVP_RECHECK_OUTPUT={steps.recheck.output}",
-        "TF_MVP_FINAL_CYCLE_JSON={steps.final-cycles.json}",
+        "TF_MVP_FINAL_CYCLE_JSON={steps.final-cycles.output}",
+        "TF_MVP_REVIEW_GATE_JSON={steps.review-gate.output}",
         "TF_MVP_MERGE_LOCK={args.mergeLock}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-repo",
       "timeout": 300000,
+      "join": "any",
       "dependsOn": [
-        "final-cycles"
+        "final-cycles",
+        "review-gate"
       ]
     },
     {
@@ -552,7 +598,9 @@
         "TF_MVP_WORKTREE_CWD={args.worktreeCwd}",
         "TF_MVP_BRANCH={args.branch}",
         "TF_MVP_TASK_ID={args.taskId}",
-        "TF_MVP_FINAL_CYCLE_JSON={steps.final-cycles.json}"
+        "TF_MVP_FINAL_CYCLE_JSON={steps.final-cycles.output}",
+        "TF_MVP_REVIEW_GATE_JSON={steps.review-gate.output}",
+        "TF_MVP_FLOW_PROJECT_ROOT={args.flowProjectRoot}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
       "timeout": 300000,

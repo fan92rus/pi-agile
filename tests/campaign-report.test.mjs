@@ -13,9 +13,10 @@ function tempRepo() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'campaign-report-'));
 }
 
-function run(repo, taskList, campaignName) {
+function run(repo, taskList, campaignName, flowRoot) {
   const args = [script, repo, taskList];
   if (campaignName) args.push(campaignName);
+  if (flowRoot) args.push(flowRoot);
   return spawnSync(process.execPath, args, { cwd: repo, encoding: 'utf8', windowsHide: true });
 }
 
@@ -47,6 +48,61 @@ test('campaign report prints a merged summary and writes the campaign artifact',
     assert.deepEqual(artifact, printed);
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('campaign report backfills token usage from the run state', () => {
+  const repo = tempRepo();
+  const flowRoot = tempRepo();
+  try {
+    const results = path.join(repo, '.pi', 'taskflows', 'results');
+    fs.mkdirSync(results, { recursive: true });
+    const leafFile = path.join(results, 'T-OK.json');
+    fs.writeFileSync(leafFile, JSON.stringify({ ...result('merged'), freshTokens: 999, cacheReadTokens: 999 }));
+    const runs = path.join(flowRoot, '.pi', 'taskflows', 'runs', 'wave-tokens');
+    fs.mkdirSync(runs, { recursive: true });
+    fs.writeFileSync(path.join(runs, 'run.json'), JSON.stringify({
+      phases: { 'leaf-T-OK': { usage: { input: 100, output: 20, cacheRead: 300 } } },
+    }));
+
+    const runResult = run(repo, 'T-OK', 'wave-tokens', flowRoot);
+    assert.equal(runResult.status, 0, runResult.stderr);
+    const printed = JSON.parse(runResult.stdout);
+    assert.deepEqual(printed.tokens, { fresh: 120, cacheRead: 300 });
+    assert.deepEqual(printed.tasks[0].tokens, { fresh: 120, cacheRead: 300 });
+    const leaf = JSON.parse(fs.readFileSync(leafFile, 'utf8'));
+    assert.equal(leaf.freshTokens, 120);
+    assert.equal(leaf.cacheReadTokens, 300);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(flowRoot, { recursive: true, force: true });
+  }
+});
+
+test('campaign report overrides stale tokens even when actual usage is zero', () => {
+  const repo = tempRepo();
+  const flowRoot = tempRepo();
+  try {
+    const results = path.join(repo, '.pi', 'taskflows', 'results');
+    fs.mkdirSync(results, { recursive: true });
+    const leafFile = path.join(results, 'T-ZERO.json');
+    fs.writeFileSync(leafFile, JSON.stringify({ ...result('merged'), freshTokens: 999, cacheReadTokens: 999 }));
+    const runs = path.join(flowRoot, '.pi', 'taskflows', 'runs', 'wave-zero');
+    fs.mkdirSync(runs, { recursive: true });
+    fs.writeFileSync(path.join(runs, 'run.json'), JSON.stringify({
+      phases: { 'leaf-T-ZERO': { usage: { input: 0, output: 0, cacheRead: 0 } } },
+    }));
+
+    const runResult = run(repo, 'T-ZERO', 'wave-zero', flowRoot);
+    assert.equal(runResult.status, 0, runResult.stderr);
+    const printed = JSON.parse(runResult.stdout);
+    assert.deepEqual(printed.tasks[0].tokens, { fresh: 0, cacheRead: 0 });
+    const leaf = JSON.parse(fs.readFileSync(leafFile, 'utf8'));
+    assert.equal(leaf.freshTokens, 0);
+    assert.equal(leaf.cacheReadTokens, 0);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(flowRoot, { recursive: true, force: true });
   }
 });
 
