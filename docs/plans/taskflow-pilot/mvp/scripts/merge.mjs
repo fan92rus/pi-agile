@@ -44,6 +44,12 @@ try {
   const baseBranch = run(['branch', '--show-current'], repo);
   if (!baseBranch) throw new Error('base repo is in detached HEAD state');
   run(['checkout', baseBranch], repo);
+  // bd close/export can leave .beads staged or unstaged even under the lock.
+  // Commit it before merging so git merge never refuses to overwrite it.
+  if (runAllow(['status', '--porcelain', '--', '.beads/'], repo).stdout.trim()) {
+    run(['add', '--', '.beads/'], repo);
+    run(['commit', '-m', 'chore(bd): export issues before merge'], repo);
+  }
   run(['rebase', baseSha], worktree);
   test(command, worktree);
   const merged = runAllow(['merge', '--no-edit', '--no-ff', branch], repo);
