@@ -214,7 +214,7 @@
     {
       "id": "plan-apply",
       "type": "script",
-      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/plan-apply.mjs", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_REPO={args.repo}", "TF_MVP_BD_BIN={args.bdBin}", "TF_MVP_PLANNING_JSON={steps.plan.output}"],
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/plan-apply.mjs", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_REPO={args.repo}", "TF_MVP_BD_BIN={args.bdBin}", "TF_MVP_TASK_ID={args.taskId}", "TF_MVP_PLANNING_JSON={steps.plan.output}"],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
       "timeout": 300000,
       "dependsOn": ["plan"]
