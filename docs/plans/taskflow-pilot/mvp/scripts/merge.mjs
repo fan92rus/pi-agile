@@ -46,16 +46,12 @@ try {
   run(['checkout', baseBranch], repo);
   // bd close/export can leave .beads staged or unstaged even under the lock.
   // Commit it before merging so git merge never refuses to overwrite it.
-  const beadsDirt = runAllow(['status', '--porcelain', '--', '.beads/'], repo).stdout
-    .split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  if (beadsDirt.length) {
-    const paths = beadsDirt.flatMap((line) => {
-      const raw = line.slice(3).trim();
-      const parts = raw.includes(' -> ') ? raw.split(' -> ') : [raw];
-      return parts.map((file) => file.startsWith('"') && file.endsWith('"') ? file.slice(1, -1) : file);
-    });
-    const unexpected = paths.filter((file) => file !== '.beads/issues.jsonl');
-    if (unexpected.length) throw new Error(`unexpected .beads changes before merge: ${unexpected.join(', ')}`);
+  const otherBeadsDirt = runAllow(
+    ['status', '--porcelain', '--', '.beads/', ':(exclude).beads/issues.jsonl'], repo,
+  ).stdout.trim();
+  if (otherBeadsDirt) throw new Error(`unexpected .beads changes before merge: ${otherBeadsDirt}`);
+  const exportDirt = runAllow(['status', '--porcelain', '--', '.beads/issues.jsonl'], repo).stdout.trim();
+  if (exportDirt) {
     run(['add', '--', '.beads/issues.jsonl'], repo);
     run(['commit', '-m', 'chore(bd): export issues before merge'], repo);
   }
