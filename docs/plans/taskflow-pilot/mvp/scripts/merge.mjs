@@ -49,7 +49,11 @@ try {
   const beadsDirt = runAllow(['status', '--porcelain', '--', '.beads/'], repo).stdout
     .split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   if (beadsDirt.length) {
-    const paths = beadsDirt.map((line) => line.slice(3).trim());
+    const paths = beadsDirt.flatMap((line) => {
+      const raw = line.slice(3).trim();
+      const parts = raw.includes(' -> ') ? raw.split(' -> ') : [raw];
+      return parts.map((file) => file.startsWith('"') && file.endsWith('"') ? file.slice(1, -1) : file);
+    });
     const unexpected = paths.filter((file) => file !== '.beads/issues.jsonl');
     if (unexpected.length) throw new Error(`unexpected .beads changes before merge: ${unexpected.join(', ')}`);
     run(['add', '--', '.beads/issues.jsonl'], repo);
