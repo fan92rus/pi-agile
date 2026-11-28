@@ -106,3 +106,23 @@ Supervisor ответил `ALPHA`. Worker продолжил в том же turn
 4. Нужна вторая пара reviewer после fix: первая пара evaluates пре-fix diff, а fix может изменить код.
 5. merge phase должен коммитить worker changes в feature branch до rebase, иначе rebase падает на unstaged changes.
 6. `bd close` делает грязным `.beads/issues.jsonl`; `bd-export` должен разрешить только это загрязнение и закоммитить отдельным commit.
+
+## Campaign vs agile-loop на одной пачке задач
+
+Одни и те же два реальных bd-листа с пересекающимися файлами:
+
+```text
+pi-agile-wa6.1 — waveA() в lib/wave-overlap.mjs + тест
+pi-agile-wa6.2 — waveB() в lib/wave-overlap.mjs + тест
+```
+
+Оба прогона шли с `concurrency/maxParallel = 2`, `testCommand = npm test`, одним спринтом и авто-мержем. Первая попытка agile-loop была отброшена: ревьюер `zcode/glm-5.4` вне `modelScope`; в-table ниже только успешный прогон с `opencode-go/hy4-flash-free`.
+
+| Прогон | Результат | Wall | Children / фазы | Tokens | Cost | Turn'ы | bd |
+|---|---|---:|---:|---:|---:|---:|---|
+| taskflow campaign `tf-campaign-real-overlap-mx05rjzt-51ed66` | 2 merged, 3/3 done | 775.8 s | 2 flow-фазы (внутри 19 phased-шагов на лист) | 320,117 fresh + 659,712 cacheRead | $0.0405 | 46 | оба листа + эпик закрыты |
+| agile-loop `4dfb8128-321e-4423-b582-4d06b542ccd3` | 2 merged, 0 failed | 1091.8 s (по status; analytics: 985.2 s) | 11 детей | 191,938 (172,455 in / 19,483 out) | $0.0092 | 70 | оба листа закрыты, эпик остался открытым |
+
+Оба финальных состояния прошли `npm test`: 246/246. Модуль содержит обе функции, а тестовый файл — оба теста.
+
+Вывод: на этой пачке taskflow campaign был быстрее примерно на 21–29% по wall-clock, но дороже примерно в 4.4 раза по учтённой стоимости. Сравнение не полностью сопоставимо: у campaign ревьюеры были `gpt-6-luna` с fresh sessions, у agile-loop — `hy4-flash-free`; accounting токенов тоже разный (taskflow считает usage всех agent-фаз, agile-loop считает totalTokens детей). Для выбор движка по стоимости нужно повторять замер на той же модели ревьюера.
