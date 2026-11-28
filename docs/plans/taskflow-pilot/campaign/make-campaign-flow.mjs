@@ -64,8 +64,8 @@ function eligible(row) {
 
 let tasks;
 if (opts.tasks) {
-  tasks = opts.tasks.split(',').map((id) => id.trim()).filter(Boolean)
-    .map((id) => {
+  const taskIds = [...new Set(opts.tasks.split(',').map((id) => id.trim()).filter(Boolean))];
+  tasks = taskIds.map((id) => {
       try { return JSON.parse(bd(['show', id, '--json'])); }
       catch { fail(`invalid bd show JSON for ${id}`); }
     })
@@ -122,6 +122,7 @@ phases.push({
 
 const flow = {
   name,
+  tasks: tasks.map((row) => String(row.id)),
   concurrency,
   strictInterpolation: false,
   phases,
