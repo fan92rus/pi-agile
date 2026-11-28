@@ -16,7 +16,7 @@ node docs/plans/taskflow-pilot/campaign/make-campaign-flow.mjs \
   --worktreeRoot D:/tmp/tf-campaign-worktrees \
   --testCommand 'npm test' \
   --maxCycles 3 \
-  --concurrency 1
+  --concurrency 3
 ```
 
 По умолчанию беруться только ready-листы, у которых в описании есть `Files:` и `Acceptance:`. Это отсекает операционные задачи вроде ff-merge/лендинга.
@@ -41,9 +41,9 @@ node docs/plans/taskflow-pilot/campaign/make-campaign-flow.mjs \
 action=run name=tf-campaign-mvp
 ```
 
-## Почему concurrency=1 по умолчанию
+## Почему parallelism безопасен
 
-Каждый leaf-engine мержит в одну и ту же базовую ветку и вызывает `bd export`. Параллельные мержи легко конфликтуют, а `main` должен оставаться чистым для `preflight` следующего листа. `concurrency > 1` можно использовать только для листов с непересекающимися файлами и после отдельного прогона с конфликтными файлами.
+Leaf-и работают в отдельных worktree и могут править пересекающиеся файлы: совместимые изменения смержатся обычным `git merge`, а текстовые additive-конфликты разрешаются union-резолвером (обе стороны сохраняются, артефакт `.taskflow-mvp/merge-resolution.json`). Фазы, которые трогают общую базовую ветку (`preflight`, `merge-gate`, `merge`, `bd-owner`, `bd-export`, `cleanup`), сериализуются через общий lock (`--mergeLock`). Неразрешённый конфликт не игнорируется: `merge.mjs` записывает `.taskflow-mvp/merge-conflict.json`, откатывает merge и сообщает о `needs attention`.
 
 ## Ограничения v1
 

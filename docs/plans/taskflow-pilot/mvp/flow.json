@@ -65,6 +65,11 @@
       "type": "string",
       "default": "bd",
       "description": "bd executable; override with a shim for tests"
+    },
+    "mergeLock": {
+      "type": "string",
+      "default": "",
+      "description": "shared lock directory for phases touching the base repo"
     }
   },
   "phases": [
@@ -81,7 +86,8 @@
         "TF_MVP_TASK_ID={args.taskId}",
         "TF_MVP_ACCEPTANCE_FILE={args.acceptanceFile}",
         "TF_MVP_CRITERIA_FILE={args.criteriaFile}",
-        "TF_MVP_BD_BIN={args.bdBin}"
+        "TF_MVP_BD_BIN={args.bdBin}",
+        "TF_MVP_MERGE_LOCK={args.mergeLock}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-repo",
       "timeout": 60000,
@@ -467,7 +473,8 @@
         "TF_MVP_BRANCH={args.branch}",
         "TF_MVP_GATES_OUTPUT={steps.gates.output}",
         "TF_MVP_RECHECK_OUTPUT={steps.recheck.output}",
-        "TF_MVP_FINAL_CYCLE_JSON={steps.final-cycles.json}"
+        "TF_MVP_FINAL_CYCLE_JSON={steps.final-cycles.json}",
+        "TF_MVP_MERGE_LOCK={args.mergeLock}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-repo",
       "timeout": 60000,
@@ -486,7 +493,8 @@
         "TF_MVP_WORKTREE_CWD={args.worktreeCwd}",
         "TF_MVP_BRANCH={args.branch}",
         "TF_MVP_TASK_ID={args.taskId}",
-        "TF_MVP_TEST_COMMAND={args.testCommand}"
+        "TF_MVP_TEST_COMMAND={args.testCommand}",
+        "TF_MVP_MERGE_LOCK={args.mergeLock}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-repo",
       "timeout": 300000,
@@ -505,7 +513,8 @@
         "TF_MVP_REPO={args.repo}",
         "TF_MVP_WORKTREE_CWD={args.worktreeCwd}",
         "TF_MVP_TASK_ID={args.taskId}",
-        "TF_MVP_BD_BIN={args.bdBin}"
+        "TF_MVP_BD_BIN={args.bdBin}",
+        "TF_MVP_MERGE_LOCK={args.mergeLock}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-repo",
       "timeout": 60000,
@@ -522,7 +531,8 @@
         "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs",
         "bd-export",
         "TF_MVP_REPO={args.repo}",
-        "TF_MVP_BD_BIN={args.bdBin}"
+        "TF_MVP_BD_BIN={args.bdBin}",
+        "TF_MVP_MERGE_LOCK={args.mergeLock}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-repo",
       "timeout": 60000,
@@ -560,7 +570,8 @@
         "TF_MVP_REPO={args.repo}",
         "TF_MVP_WORKTREE_CWD={args.worktreeCwd}",
         "TF_MVP_BRANCH={args.branch}",
-        "TF_MVP_TASK_ID={args.taskId}"
+        "TF_MVP_TASK_ID={args.taskId}",
+        "TF_MVP_MERGE_LOCK={args.mergeLock}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-repo",
       "timeout": 60000,

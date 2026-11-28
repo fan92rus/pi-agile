@@ -7,7 +7,9 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
@@ -43,8 +45,10 @@ const maxCycles = Number(opts.maxCycles || 3);
 if (!Number.isInteger(maxCycles) || maxCycles < 1 || maxCycles > 20) fail('--maxCycles must be an integer from 1 to 20');
 const reuseReviewerSession = String(opts.reuseReviewerSession || 'false');
 if (!['true', 'false'].includes(reuseReviewerSession)) fail('--reuseReviewerSession must be true or false');
-const concurrency = Number(opts.concurrency || 1);
+const concurrency = Number(opts.concurrency || 3);
 if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4) fail('--concurrency must be an integer from 1 to 4');
+const repoKey = createHash('sha256').update(repo).digest('hex').slice(0, 12);
+const mergeLock = slash(path.resolve(opts.mergeLock || path.join(os.tmpdir(), `tf-leaf-mvp-merge-${repoKey}.lock`)));
 const name = opts.name || 'tf-campaign-mvp';
 if (!/^(?!\.\.?$)[A-Za-z0-9._-]+$/.test(name)) fail('--name contains unsafe characters');
 const out = slash(path.resolve(opts.out || path.join(repo, '.pi', 'taskflows', `${name}.json`)));
@@ -94,6 +98,7 @@ for (const row of tasks) {
     '--worktree', worktree,
     '--branch', `${branchPrefix}/${taskId}`,
     '--bdBin', bdBin,
+    '--mergeLock', mergeLock,
     '--testCommand', testCommand,
     '--maxCycles', String(maxCycles),
     '--reuseReviewerSession', reuseReviewerSession,
@@ -114,7 +119,7 @@ const leafIds = phases.map((phase) => phase.id);
 phases.push({
   id: 'campaign-report',
   type: 'script',
-  run: ['node', reportScript, repo, tasks.map((row) => String(row.id)).join(','), name],
+  run: ['node', reportScript, repo, '{args.taskIds}', name],
   timeout: 60000,
   dependsOn: leafIds,
   final: true,
@@ -122,9 +127,15 @@ phases.push({
 
 const flow = {
   name,
-  tasks: tasks.map((row) => String(row.id)),
   concurrency,
   strictInterpolation: false,
+  args: {
+    taskIds: {
+      type: 'string',
+      default: tasks.map((row) => String(row.id)).join(','),
+      description: 'CSV of campaign task ids',
+    },
+  },
   phases,
 };
 fs.writeFileSync(out, `${JSON.stringify(flow, null, 2)}\n`, 'utf8');
@@ -136,4 +147,5 @@ console.log(JSON.stringify({
   maxCycles,
   reuseReviewerSession,
   worktreeRoot,
+  mergeLock,
 }, null, 2));

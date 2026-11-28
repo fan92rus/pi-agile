@@ -12,6 +12,7 @@
 
 import fs from 'node:fs';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -41,6 +42,8 @@ const opts = parseArgs(process.argv.slice(2));
 const taskId = opts.taskId || fail('--taskId is required');
 if (!/^(?!\.\.?$)[A-Za-z0-9._-]+$/.test(taskId)) fail('--taskId contains unsafe characters');
 const repo = slash(path.resolve(opts.repo || process.cwd()));
+const repoKey = createHash('sha256').update(repo).digest('hex').slice(0, 12);
+const mergeLock = slash(path.resolve(opts.mergeLock || path.join(os.tmpdir(), `tf-leaf-mvp-merge-${repoKey}.lock`)));
 const worktree = slash(path.resolve(opts.worktree || fail('--worktree is required')));
 const branch = opts.branch || `tf-leaf-mvp/${taskId}`;
 const bdBin = opts.bdBin || (process.platform === 'win32' ? 'C:/tools/bd.exe' : 'bd');
@@ -190,6 +193,7 @@ Object.assign(mainFlow.args, {
   maxCycles: { ...mainFlow.args.maxCycles, default: String(maxCycles) },
   forceEscalation: { ...mainFlow.args.forceEscalation, default: 'false' },
   bdBin: { ...mainFlow.args.bdBin, default: bdBin },
+  mergeLock: { ...mainFlow.args.mergeLock, default: mergeLock },
 });
 applyModels(mainFlow);
 fs.mkdirSync(path.dirname(out), { recursive: true });
@@ -203,5 +207,5 @@ console.log(JSON.stringify({
   cycleFlow: slash(path.join(tasksDir, `${cycleName}.json`)),
   loopFlow: slash(path.join(tasksDir, `${loopName}.json`)),
   taskId, repo, worktree, branch, filesHint, acceptanceFile, criteriaFile,
-  bdBin, testCommand, maxCycles, repeatMax: loopFlow.phases[0].repeat.max, reuseReviewerSession, workerModel, reviewerModel,
+  bdBin, mergeLock, testCommand, maxCycles, repeatMax: loopFlow.phases[0].repeat.max, reuseReviewerSession, workerModel, reviewerModel,
 }, null, 2));
