@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.3] - 2026-11-29
+
+### Added
+- Deterministic seeded property tests for dynamic campaign queue conservation, report status/reason cleanliness and planner non-mutation invariants (24 cases per property, no external dependency).
+- Dynamic report now names failed leaf results when the queue itself is clean.
+
 ## [0.2.2] - 2026-11-29
 
 ### Fixed

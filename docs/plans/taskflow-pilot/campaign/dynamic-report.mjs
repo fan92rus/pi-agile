@@ -62,6 +62,8 @@ summary.queue = queueState;
 if (queueState.pending.length || queueState.active.length || queueState.skipped.length) {
   summary.status = 'failed';
   summary.reason = `campaign queue is not clean: ${queueState.pending.length} pending, ${queueState.active.length} active, ${queueState.skipped.length} skipped`;
+} else if (summary.status === 'failed') {
+  summary.reason = 'one or more leaf results failed';
 }
 const output = `${JSON.stringify(summary, null, 2)}\n`;
 fs.writeFileSync(campaignArtifactPath(config), output, 'utf8');
