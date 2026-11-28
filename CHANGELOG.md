@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.0] - 2026-11-29
+
+### Added
+- Packaged tf campaign/mvp assets are installed into `<project>/.pi/taskflows/tf/` on session start; a version marker refreshes them after a plugin update.
+- `agile-solve` now runs the installed tf generator path and treats `agile_run`/`agile-loop.js` as legacy.
+
+### Changed
+- `package.json` ships the tf asset trees and installs them with the plugin.
+
 ## [Unreleased]
 
 ### Breaking

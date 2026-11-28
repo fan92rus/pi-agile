@@ -13,6 +13,7 @@ import { Type } from "@sinclair/typebox";
 
 import { planLaunch, type LaunchInput } from "./launch.ts";
 import { statusReport } from "./status.ts";
+import { installTaskflowAssets, packageRoot, readVersion } from "./taskflow-install.ts";
 
 function textResult(text: string) {
   return { content: [{ type: "text" as const, text }] };
@@ -23,6 +24,16 @@ function errorText(tool: string, e: unknown) {
 }
 
 export default function piAgileExtension(pi: ExtensionAPI): void {
+  const root = packageRoot();
+  const version = readVersion(root);
+  pi.on("session_start", (_event, ctx) => {
+    try {
+      installTaskflowAssets({ sourceRoot: root, projectRoot: ctx.cwd, version });
+    } catch (e) {
+      console.warn(`pi-agile: taskflow asset install skipped: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  });
+
   pi.registerTool({
     name: "agile_run",
     label: "agile_run",

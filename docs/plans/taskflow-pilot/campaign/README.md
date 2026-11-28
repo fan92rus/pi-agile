@@ -14,6 +14,11 @@ Campaign layer не вводит новый движок. Он только:
 
 ## Генерация
 
+При установке/обновлении плагина pi-agile эти исходники (`campaign/`, `mvp/`)
+копируются в `<repo>/.pi/taskflows/tf/`. Активный `agile-solve` запускает генератор
+именно оттуда; путь `docs/plans/taskflow-pilot/...` остаётся источником для разработки
+самого плагина.
+
 ```bash
 node docs/plans/taskflow-pilot/campaign/make-campaign-flow.mjs \
   --repo D:/Documents/Repositories/pi-agile \

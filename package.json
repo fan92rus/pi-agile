@@ -1,6 +1,6 @@
 {
   "name": "pi-agile",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Autonomous Agile/Kanban engine for pi — agent discovers tasks, delegates workers, reviews, and iterates in sprints",
   "keywords": [
@@ -37,11 +37,13 @@
   "files": [
     "extensions",
     "skills",
+    "docs/plans/taskflow-pilot/campaign",
+    "docs/plans/taskflow-pilot/mvp",
     "README.md",
     "CHANGELOG.md",
     "package.json"
   ],
   "scripts": {
-    "test": "node --test tests/agile-loop.test.mjs tests/pi-agile-tools.test.mjs tests/campaign-report.test.mjs tests/campaign-generator.test.mjs tests/review-gate.test.mjs tests/merge-resolution.test.mjs tests/merge-lock.test.mjs tests/wave-overlap.test.mjs"
+    "test": "node --test tests/agile-loop.test.mjs tests/pi-agile-tools.test.mjs tests/taskflow-install.test.mjs tests/campaign-report.test.mjs tests/campaign-generator.test.mjs tests/review-gate.test.mjs tests/merge-resolution.test.mjs tests/merge-lock.test.mjs tests/wave-overlap.test.mjs"
   }
 }

@@ -52,7 +52,7 @@ flow не создаём.
 ### 1. Сгенерировать campaign flow
 
 ```bash
-node <repo>/docs/plans/taskflow-pilot/campaign/make-campaign-flow.mjs \
+node <repo>/.pi/taskflows/tf/campaign/make-campaign-flow.mjs \
   --repo <repo> \
   --bdBin <bd> \
   --epic <epic-id> \
@@ -63,6 +63,11 @@ node <repo>/docs/plans/taskflow-pilot/campaign/make-campaign-flow.mjs \
   --reviewerModel opencode-go/hy4-flash-free \
   [--worktreeRoot <root>]
 ```
+
+Исходники tf (`campaign/`, `mvp/`) раскладываются плагином в
+`<repo>/.pi/taskflows/tf/` при старте сессии; этоmanaged-копия, не генерированные flow.
+Если каталога нет, перезапусти Pi/`/reload` — установка происходит на `session_start`.
+При разработке самого плагина источник — `docs/plans/taskflow-pilot/` в его репозитории.
 
 Генератор пишет `<repo>/.pi/taskflows/<name>.json`, готовые leaf flow
 `tf-leaf-mvp-<taskId>.json` (плюс loop/final-cycle) и копирует campaign JSON в
