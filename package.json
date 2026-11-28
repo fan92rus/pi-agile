@@ -1,6 +1,6 @@
 {
   "name": "pi-agile",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "Autonomous Agile/Kanban engine for pi — agent discovers tasks, delegates workers, reviews, and iterates in sprints",
   "keywords": [

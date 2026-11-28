@@ -25,9 +25,16 @@ if (fs.existsSync(decisionDir)) {
     catch { fail(`invalid lead decision file ${file}`); }
     const taskId = String(decision.taskId || path.basename(file, '.json'));
     if (!/^[A-Za-z0-9._-]+$/.test(taskId)) fail(`unsafe lead decision task id ${taskId}`);
-    bd(['label', 'remove', taskId, 'tf-needs-lead']);
-    bd(['label', 'add', taskId, 'tf-queued']);
-    bd(['update', taskId, '--append-notes', `Lead decision: ${String(decision.instructions || decision.decision || 'approved')}`]);
+    for (const args of [
+      ['label', 'remove', taskId, 'tf-needs-lead'],
+      ['label', 'add', taskId, 'tf-queued'],
+      ['update', taskId, '--append-notes', `Lead decision: ${String(decision.instructions || decision.decision || 'approved')}`],
+    ]) {
+      const applied = bd(args);
+      if (applied.error || applied.status !== 0) {
+        fail(`lead decision bd ${args.join(' ')} failed: ${applied.stderr || applied.error?.message || 'unknown error'}`);
+      }
+    }
     if (!queue.pending.includes(taskId) && !queue.active.includes(taskId) && !queue.completed.includes(taskId)) {
       queue.pending.push(taskId);
     }
@@ -40,15 +47,29 @@ const eligible = (row) => {
   return row?.id && row.status !== 'closed'
     && /(?:Files:|Файлы:)/.test(description) && description.includes('Acceptance:');
 };
+queue.skipped = Array.isArray(queue.skipped) ? queue.skipped : [];
 let taskId = null;
 while (queue.pending.length) {
-  const candidate = String(queue.pending.shift());
+  const candidate = String(queue.pending[0]);
   const shown = bd(['show', candidate, '--json']);
-  if (shown.error || shown.status !== 0) continue;
+  if (shown.error || shown.status !== 0) {
+    queue.pending.shift();
+    queue.skipped.push({ id: candidate, reason: shown.stderr || shown.error?.message || 'bd show failed' });
+    continue;
+  }
   let parsed;
-  try { parsed = JSON.parse(shown.stdout); } catch { continue; }
+  try { parsed = JSON.parse(shown.stdout); } catch {
+    queue.pending.shift();
+    queue.skipped.push({ id: candidate, reason: 'invalid bd show JSON' });
+    continue;
+  }
   const issue = Array.isArray(parsed) ? parsed[0] : parsed;
-  if (!eligible(issue)) continue;
+  if (!eligible(issue)) {
+    queue.pending.shift();
+    queue.skipped.push({ id: candidate, reason: 'not an eligible open code leaf' });
+    continue;
+  }
+  queue.pending.shift();
   taskId = candidate;
   break;
 }

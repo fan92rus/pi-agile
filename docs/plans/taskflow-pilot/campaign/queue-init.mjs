@@ -18,7 +18,10 @@ for (const taskId of config.initialTasks || []) {
   if (labeled.error || labeled.status !== 0) {
     fail(`bd label add failed for ${taskId}: ${labeled.stderr || labeled.error?.message || 'unknown error'}`);
   }
-  bd(['label', 'remove', String(taskId), 'tf-needs-lead']);
+  const released = bd(['label', 'remove', String(taskId), 'tf-needs-lead']);
+  if (released.error || released.status !== 0) {
+    fail(`bd label remove failed for ${taskId}: ${released.stderr || released.error?.message || 'unknown error'}`);
+  }
 }
 const queue = {
   version: 2,

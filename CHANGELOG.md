@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.2] - 2026-11-29
+
+### Fixed
+- Dynamic campaign queue now records unusable ids as skipped, fails closed on non-empty pending/active/skipped, finalizes merged active tasks, and checks every bd label/update command.
+
 ## [0.2.1] - 2026-11-29
 
 ### Added
