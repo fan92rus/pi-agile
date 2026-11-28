@@ -9,3 +9,6 @@ test('wave overlap module loads', () => {
 test('waveB returns its wave marker', () => {
   assert.equal(wave.waveB(), 'WAVE B OK');
 });
+test('waveA returns its success marker', () => {
+  assert.equal(wave.waveA(), 'WAVE A OK');
+});
