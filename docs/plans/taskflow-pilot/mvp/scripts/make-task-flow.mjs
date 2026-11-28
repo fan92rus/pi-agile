@@ -78,7 +78,7 @@ try { parsed = JSON.parse(bdShow.stdout); } catch { fail('bd show returned inval
 const issue = Array.isArray(parsed) ? parsed.find((row) => row?.id === taskId) || parsed[0] : parsed;
 if (!issue?.id || issue.status === 'closed') fail(`task ${taskId} is missing or already closed`);
 const description = String(issue.description || '');
-const MARKERS = ['Files:', 'Acceptance:', 'Метод измерения:'];
+const MARKERS = ['Files:', 'Файлы:', 'Acceptance:', 'Метод измерения:'];
 function field(markers) {
   const found = markers
     .map((marker) => ({ marker, at: description.lastIndexOf(marker) }))
@@ -91,8 +91,8 @@ function field(markers) {
 }
 
 const filesHint = opts.filesHint
-  || field(['Files:']).replace(/\.$/, '').split(/[,;]/).map((s) => s.trim()).filter(Boolean).join(',')
-  || fail('filesHint not provided and no Files: field found in bd description');
+  || field(['Files:', 'Файлы:']).replace(/\.$/, '').split(/[,;]/).map((s) => s.trim()).filter(Boolean).join(',')
+  || fail('filesHint not provided and no Files:/Файлы: field found in bd description');
 const acceptanceClause = field(['Acceptance:']) || fail('no Acceptance: field found in bd description');
 const measure = field(['Метод измерения:']);
 const acceptanceFile = slash(path.join(artifactsDir, 'acceptance.md'));

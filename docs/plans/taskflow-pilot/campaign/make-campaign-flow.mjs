@@ -66,9 +66,10 @@ function bd(args) {
 }
 function eligible(row) {
   const description = String(row?.description || '');
-  return row?.id && row?.status !== 'closed' && description.includes('Files:') && description.includes('Acceptance:');
+  return row?.id && row?.status !== 'closed' && /(?:Files:|Файлы:)/.test(description) && description.includes('Acceptance:');
 }
 
+if (opts.tasks && opts.epic) fail('--tasks and --epic cannot be used together');
 let tasks;
 if (opts.tasks) {
   const taskIds = [...new Set(opts.tasks.split(',').map((id) => id.trim()).filter(Boolean))];
@@ -77,6 +78,16 @@ if (opts.tasks) {
       catch { fail(`invalid bd show JSON for ${id}`); }
     })
     .map((row) => Array.isArray(row) ? row[0] : row);
+} else if (opts.epic) {
+  let children;
+  try { children = JSON.parse(bd(['children', opts.epic, '--json'])); }
+  catch { fail(`bd children returned invalid JSON for ${opts.epic}`); }
+  tasks = (Array.isArray(children) ? children : []).filter((row) => row?.id).filter((row) => {
+    let descendants;
+    try { descendants = JSON.parse(bd(['children', String(row.id), '--json'])); }
+    catch { fail(`bd children returned invalid JSON for ${row.id}`); }
+    return Array.isArray(descendants) && descendants.length === 0 && eligible(row);
+  });
 } else {
   let rows;
   try { rows = JSON.parse(bd(['ready', '--json'])); }
@@ -142,7 +153,13 @@ const flow = {
   },
   phases,
 };
-fs.writeFileSync(out, `${JSON.stringify(flow, null, 2)}\n`, 'utf8');
+const campaignJson = `${JSON.stringify(flow, null, 2)}\n`;
+fs.writeFileSync(out, campaignJson, 'utf8');
+const hostCampaignPath = slash(path.join(flowProjectRoot, '.pi', 'taskflows', `${name}.json`));
+if (out !== hostCampaignPath) {
+  fs.mkdirSync(path.dirname(hostCampaignPath), { recursive: true });
+  fs.writeFileSync(hostCampaignPath, campaignJson, 'utf8');
+}
 console.log(JSON.stringify({
   flow: out,
   name,

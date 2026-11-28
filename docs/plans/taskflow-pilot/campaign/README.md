@@ -1,5 +1,10 @@
 # Campaign layer over tf-leaf-mvp
 
+**Это активный путь кампаний:** он вызывается через skill
+[`agile-solve`](../../../../skills/agile-solve/SKILL.md), который генерирует flow,
+запускает его через `taskflow` и читает статус из артефактов. Старый `agile_run`
+(`workflows/agile-loop.js`) в этом пути **не используется**.
+
 Campaign layer не вводит новый движок. Он только:
 
 1. берёт ready-листы из bd;
@@ -22,13 +27,17 @@ node docs/plans/taskflow-pilot/campaign/make-campaign-flow.mjs \
 
 `--reviewerModel` по умолчанию `opencode-go/hy4-flash-free`: ревьюеры — самая дорогая часть leaf flow, а дешёвая модель на этой пачке задач дала сопоставимый вердикт. Worker остаётся на `openai-codex/gpt-6-luna`.
 
-По умолчанию беруться только ready-листы, у которых в описании есть `Files:` и `Acceptance:`. Это отсекает операционные задачи вроде ff-merge/лендинга.
+Поддерживаются оба маркера кодового листа в описании bd-задачи: `Files:` **или** `Файлы:`, плюс обязательный `Acceptance:`. Без них задача не попадает в кампанию — это отсекает операционные задачи вроде ff-merge/лендинга.
 
-Явный набор задач:
+Источник задач (взаимоисключающие варианты):
 
 ```bash
---tasks pi-agile-aaa,pi-agile-bbb
+--epic pi-agile-xxx        # открытые листья эпика через bd children
+--tasks pi-agile-aaa,pi-agile-bbb  # явный набор
+# без флагов — готовые листы из bd ready --json
 ```
+
+Сгенерированный campaign JSON копируется также в `.pi/taskflows/` host project root; leaf flow (`tf-leaf-mvp-<taskId>.json`) остаётся в репозитории.
 
 ## Запуск
 
@@ -38,15 +47,20 @@ node docs/plans/taskflow-pilot/campaign/make-campaign-flow.mjs \
 .pi/taskflows/tf-campaign-mvp.json
 ```
 
-Запуск через taskflow из каталога проекта:
+Запуск через taskflow из host project root (долгий прогон — с явным таймаутом):
 
 ```text
-action=run name=tf-campaign-mvp
+taskflow({ action: 'run', name: '<name>', cwd: '<host project root>' })
 ```
+
+Отдельного `action=status` нет: состояние прогона лежит в
+`<host root>/.pi/taskflows/runs/<name>/*.json`, результаты листов — в
+`<repo>/.pi/taskflows/results/<taskId>.json`, итог — в
+`<repo>/.pi/taskflows/results/campaign-<name>.json`.
 
 ## Почему parallelism безопасен
 
-Leaf-и работают в отдельных worktree и могут править пересекающиеся файлы: совместимые изменения смержатся обычным `git merge`, а текстовые additive-конфликты разрешаются union-резолвером (обе стороны сохраняются, артефакт `.taskflow-mvp/merge-resolution.json`). Фазы, которые трогают общую базовую ветку (`preflight`, `merge-gate`, `merge`, `bd-owner`, `bd-export`, `cleanup`), сериализуются через общий lock (`--mergeLock`). Неразрешённый конфликт не игнорируется: `merge.mjs` записывает `.taskflow-mvp/merge-conflict.json`, откатывает merge и сообщает о `needs attention`.
+Leaf-и работают в отдельных worktree и могут правитьпересекающиеся файлы: совместимые изменения смержатся обычным `git merge`, а только текстовые additive-конфликты разрешаются union-резолвером (обе стороны сохраняются, артефакт `.taskflow-mvp/merge-resolution.json`). Не-additive конфликт НЕ резолвится автоматически. Фазы, которые трогают общую базовую ветку (`preflight`, `merge-gate`, `merge`, `bd-owner`, `bd-export`, `cleanup`), сериализуются через общий lock (`--mergeLock`). Неразрешённый конфликт не игнорируется: `merge.mjs` записывает `.taskflow-mvp/merge-conflict.json`, откатывает merge и сообщает о `needs attention`.
 
 ## Ограничения v1
 
