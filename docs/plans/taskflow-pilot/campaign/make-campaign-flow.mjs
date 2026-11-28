@@ -111,6 +111,7 @@ for (const row of tasks) {
     type: 'flow',
     use: leafFlowName,
     with: { repo, worktreeCwd: worktree },
+    timeout: 1_800_000,
     output: 'json',
   });
 }

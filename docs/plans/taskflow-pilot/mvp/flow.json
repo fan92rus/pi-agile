@@ -90,7 +90,7 @@
         "TF_MVP_MERGE_LOCK={args.mergeLock}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-repo",
-      "timeout": 60000,
+      "timeout": 300000,
       "idempotent": false
     },
     {
@@ -107,7 +107,7 @@
         "TF_MVP_BD_BIN={args.bdBin}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
-      "timeout": 60000,
+      "timeout": 300000,
       "dependsOn": [
         "preflight"
       ]
@@ -196,7 +196,7 @@
         "TF_MVP_CRITERIA_FILE={args.criteriaFile}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
-      "timeout": 60000,
+      "timeout": 300000,
       "dependsOn": [
         "gates"
       ]
@@ -325,7 +325,7 @@
         "TF_MVP_REVIEW_GUARDRAILS_JSON={steps.review-guardrails.output}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
-      "timeout": 60000,
+      "timeout": 300000,
       "dependsOn": [
         "review-correctness",
         "review-guardrails"
@@ -414,7 +414,7 @@
         "TF_MVP_CRITERIA_FILE={args.criteriaFile}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
-      "timeout": 60000,
+      "timeout": 300000,
       "dependsOn": [
         "recheck"
       ]
@@ -431,7 +431,7 @@
         "TF_MVP_FILES_HINT={args.filesHint}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
-      "timeout": 60000,
+      "timeout": 300000,
       "dependsOn": [
         "diff-final"
       ]
@@ -477,7 +477,7 @@
         "TF_MVP_MERGE_LOCK={args.mergeLock}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-repo",
-      "timeout": 60000,
+      "timeout": 300000,
       "dependsOn": [
         "final-cycles"
       ]
@@ -517,7 +517,7 @@
         "TF_MVP_MERGE_LOCK={args.mergeLock}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-repo",
-      "timeout": 60000,
+      "timeout": 300000,
       "idempotent": false,
       "dependsOn": [
         "merge"
@@ -535,7 +535,7 @@
         "TF_MVP_MERGE_LOCK={args.mergeLock}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-repo",
-      "timeout": 60000,
+      "timeout": 300000,
       "idempotent": false,
       "dependsOn": [
         "bd-owner"
@@ -555,7 +555,7 @@
         "TF_MVP_FINAL_CYCLE_JSON={steps.final-cycles.json}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
-      "timeout": 60000,
+      "timeout": 300000,
       "dependsOn": [
         "bd-export"
       ]
@@ -574,7 +574,7 @@
         "TF_MVP_MERGE_LOCK={args.mergeLock}"
       ],
       "cwd": "D:/tmp/tf-leaf-mvp-repo",
-      "timeout": 60000,
+      "timeout": 300000,
       "dependsOn": [
         "report"
       ],

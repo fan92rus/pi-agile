@@ -54,7 +54,9 @@ test('generator deduplicates explicit tasks and records the unique ids', () => {
     assert.equal(result.status, 0, result.stderr);
     const flow = JSON.parse(fs.readFileSync(out, 'utf8'));
     assert.equal(flow.args.taskIds.default, 'T-A');
-    assert.equal(flow.phases.filter((phase) => phase.type === 'flow').length, 1);
+    const leafPhase = flow.phases.find((phase) => phase.type === 'flow');
+    assert.ok(leafPhase);
+    assert.equal(leafPhase.timeout, 1_800_000);
     const reportPhase = flow.phases.find((phase) => phase.id === 'campaign-report');
     assert.equal(reportPhase.run[3], '{args.taskIds}');
     assert.equal(reportPhase.run.at(-1), 'tf-dedupe');
