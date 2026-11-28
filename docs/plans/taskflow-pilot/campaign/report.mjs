@@ -2,15 +2,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-const [repo, taskList] = process.argv.slice(2);
+const [repo, taskList, campaignName] = process.argv.slice(2);
 if (!repo || !taskList) {
-  console.error('usage: node report.mjs <repo> <taskId,taskId,...>');
+  console.error('usage: node report.mjs <repo> <taskId,taskId,...> [campaignName]');
   process.exit(1);
 }
 const tasks = taskList.split(',').map((id) => id.trim()).filter(Boolean);
 const resultsDir = path.join(repo, '.pi', 'taskflows', 'results');
 const rows = [];
-let failed = false;
+let failed = tasks.length === 0;
+if (failed) rows.push({ status: 'invalid-task-list', reason: 'task list must contain at least one task' });
 for (const taskId of tasks) {
   const file = path.join(resultsDir, `${taskId}.json`);
   if (!fs.existsSync(file)) {
@@ -38,5 +39,15 @@ for (const taskId of tasks) {
     blockers: result.blockers || [],
   });
 }
-console.log(JSON.stringify({ status: failed ? 'failed' : 'merged', tasks: rows }, null, 2));
+const summary = { status: failed ? 'failed' : 'merged', tasks: rows };
+const output = JSON.stringify(summary, null, 2);
+console.log(output);
+if (campaignName) {
+  if (path.basename(campaignName) !== campaignName || campaignName === '.' || campaignName === '..' || /[\\/]/.test(campaignName)) {
+    console.error('campaignName must be a single filename component');
+    process.exit(1);
+  }
+  fs.mkdirSync(resultsDir, { recursive: true });
+  fs.writeFileSync(path.join(resultsDir, `campaign-${campaignName}.json`), `${output}\n`);
+}
 if (failed) process.exit(1);
