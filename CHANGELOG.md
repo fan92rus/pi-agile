@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.4] - 2026-11-29
+
+### Docs
+- `agile-solve` and the campaign README now describe dynamic queue mode, `tf-queued`/`tf-needs-lead` labels and the lead-decision file contract.
+
 ## [0.2.3] - 2026-11-29
 
 ### Added
