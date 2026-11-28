@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.1] - 2026-11-29
+
+### Added
+- Leaf flows now include a read-only planning phase after gates and before review; it can create follow-up bd tasks only through a validating script, with `needsLeadDecision` parked for the leading agent.
+- Campaign generator supports `--mode dynamic`: a static slot chain re-reads the bd queue each slot, so tasks created during a run can be executed without mutating the Taskflow DAG.
+
 ## [0.2.0] - 2026-11-29
 
 ### Added

@@ -1,9 +1,33 @@
 #!/usr/bin/env node
+/** Initialize the campaign queue from the selected bd leaf ids. */
 import fs from 'node:fs';
 import path from 'node:path';
-const [queuePath, ...taskIds] = process.argv.slice(2);
-if (!queuePath) throw new Error('usage: queue-init.mjs <queue.json> [task-id ...]');
-const queue = { version: 1, pending: [...new Set(taskIds)], active: [], completed: [] };
-fs.mkdirSync(path.dirname(path.resolve(queuePath)), { recursive: true });
-fs.writeFileSync(queuePath, `${JSON.stringify(queue, null, 2)}\n`);
-console.log(JSON.stringify(queue));
+import { spawnSync } from 'node:child_process';
+
+const fail = (message) => { console.error(`QUEUE INIT FAIL: ${message}`); process.exit(1); };
+const [configPath] = process.argv.slice(2);
+if (!configPath) fail('usage: node queue-init.mjs <config.json>');
+const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+const [bin, ...prefix] = String(config.bdBin || 'bd').match(/\S+/g) || ['bd'];
+const bd = (args) => spawnSync(bin, [...prefix, ...args], {
+  cwd: config.repo, encoding: 'utf8', shell: false, windowsHide: true,
+});
+for (const taskId of config.initialTasks || []) {
+  if (!/^[A-Za-z0-9._-]+$/.test(String(taskId))) fail(`unsafe task id ${taskId}`);
+  const labeled = bd(['label', 'add', String(taskId), 'tf-queued']);
+  if (labeled.error || labeled.status !== 0) {
+    fail(`bd label add failed for ${taskId}: ${labeled.stderr || labeled.error?.message || 'unknown error'}`);
+  }
+  bd(['label', 'remove', String(taskId), 'tf-needs-lead']);
+}
+const queue = {
+  version: 2,
+  pending: [...(config.initialTasks || [])],
+  active: [],
+  completed: [],
+  decisionDir: config.decisionDir,
+  createdAt: new Date().toISOString(),
+};
+fs.mkdirSync(path.dirname(config.queuePath), { recursive: true });
+fs.writeFileSync(config.queuePath, `${JSON.stringify(queue, null, 2)}\n`, 'utf8');
+process.stdout.write(`${JSON.stringify(queue)}\n`);

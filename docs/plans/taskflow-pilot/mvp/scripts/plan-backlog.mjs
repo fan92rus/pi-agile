@@ -1,20 +1,42 @@
 #!/usr/bin/env node
-import { spawnSync } from 'node:child_process';
+/** Read-only backlog snapshot for the leaf planning phase. */
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
-const positional = process.argv.slice(2);
-const envArgs = Object.fromEntries(positional.filter((arg) => arg.startsWith('TF_MVP_')).map((arg) => {
-  const split = arg.indexOf('=');
-  return split < 0 ? [arg, ''] : [arg.slice(0, split), arg.slice(split + 1)];
-}));
-const [bdBin = envArgs.TF_MVP_BD_BIN || 'bd', repo = envArgs.TF_MVP_REPO || envArgs.TF_MVP_WORKTREE_CWD || process.cwd()] = positional.filter((arg) => !arg.startsWith('TF_MVP_'));
-const result = spawnSync(bdBin, ['ready', '--json'], { cwd: repo, encoding: 'utf8', windowsHide: true, shell: process.platform === 'win32' });
-if (result.error || result.status !== 0) throw new Error(`bd ready failed: ${result.stderr || result.error?.message}`);
+function commandParts(value) {
+  const parts = String(value || 'bd').match(/\S+/g) || ['bd'];
+  return [parts[0], parts.slice(1)];
+}
+
+const bdBin = process.env.TF_MVP_BD_BIN || 'bd';
+const repo = process.env.TF_MVP_REPO || process.env.TF_MVP_WORKTREE_CWD || process.cwd();
+const worktree = process.env.TF_MVP_WORKTREE_CWD || repo;
+const currentId = process.env.TF_MVP_TASK_ID || '';
+const [bin, prefix] = commandParts(bdBin);
+const result = spawnSync(bin, [...prefix, 'ready', '--json'], {
+  cwd: repo, encoding: 'utf8', shell: false, windowsHide: true,
+});
+if (result.error || result.status !== 0) {
+  throw new Error(`bd ready failed: ${result.stderr || result.error?.message || 'unknown error'}`);
+}
 let rows;
 try { rows = JSON.parse(result.stdout); } catch { throw new Error('bd ready returned invalid JSON'); }
-const leaves = (Array.isArray(rows) ? rows : []).filter((row) => row?.id && row.status !== 'closed' && /(?:Files:|Файлы:)/.test(row.description || '') && /Acceptance:/.test(row.description || ''));
-const planningContextPath = path.join(envArgs.TF_MVP_WORKTREE_CWD || repo, '.taskflow-mvp', 'planning-context.json');
-fs.mkdirSync(path.dirname(planningContextPath), { recursive: true });
-fs.writeFileSync(planningContextPath, `${JSON.stringify(leaves, null, 2)}\n`, 'utf8');
-console.log(JSON.stringify(leaves));
+const eligible = (row) => {
+  const description = String(row?.description || '');
+  return row?.id && row.id !== currentId && row.status !== 'closed'
+    && /(?:Files:|Файлы:)/.test(description) && description.includes('Acceptance:');
+};
+const backlog = (Array.isArray(rows) ? rows : []).filter(eligible).map((row) => ({
+  id: String(row.id),
+  title: String(row.title || ''),
+  description: String(row.description || '').slice(0, 1200),
+}));
+const dir = path.join(worktree, '.taskflow-mvp');
+fs.mkdirSync(dir, { recursive: true });
+fs.writeFileSync(path.join(dir, 'planning-context.json'), `${JSON.stringify({
+  currentTaskId: currentId,
+  generatedAt: new Date().toISOString(),
+  backlog,
+}, null, 2)}\n`, 'utf8');
+process.stdout.write(`${JSON.stringify({ count: backlog.length, currentTaskId: currentId })}\n`);

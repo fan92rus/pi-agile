@@ -75,6 +75,21 @@
       "type": "string",
       "default": "D:/Documents/Repositories/pi-agile",
       "description": "host project root that owns saved flows and run states"
+    },
+    "plannerModel": {
+      "type": "string",
+      "default": "openai-codex/gpt-6-luna",
+      "description": "model used only by the read-only planning agent"
+    },
+    "queueParent": {
+      "type": "string",
+      "default": "",
+      "description": "bd epic under which planner-created follow-up tasks are filed"
+    },
+    "queuePath": {
+      "type": "string",
+      "default": "",
+      "description": "campaign queue JSON appended by plan-apply"
     }
   },
   "phases": [
@@ -193,7 +208,7 @@
     {
       "id": "planning-context",
       "type": "script",
-      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/plan-backlog.mjs", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_REPO={args.repo}", "TF_MVP_BD_BIN={args.bdBin}"],
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "plan-backlog", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_REPO={args.repo}", "TF_MVP_BD_BIN={args.bdBin}", "TF_MVP_TASK_ID={args.taskId}"],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
       "timeout": 300000,
       "dependsOn": ["gates"]
@@ -209,12 +224,12 @@
       "output": "json",
       "expect": {"type": "object", "required": ["action"], "properties": {"action": {"type": "string", "enum": ["none", "spawn", "needsLeadDecision"]}}},
       "dependsOn": ["planning-context"],
-      "task": "Read .taskflow-mvp/planning-context.json. Recommend none, spawn or needsLeadDecision based on work/backlog; read-only. Return JSON with action, rationale, optional question, and children [{title,description}] for spawn."
+      "task": "Read .taskflow-mvp/planning-context.json and the work result below. Decide whether follow-up work should be split into new bd tasks. Do not edit files, call bd, commit or push. The current task is already running and must not be changed. Return JSON only: {\"action\":\"none|spawn|needsLeadDecision\",\"reason\":\"...\",\"leadQuestion\":\"...\",\"children\":[{\"title\":\"...\",\"description\":\"Files: ...\\nAcceptance: ...\"}]}. Children are for spawn/needsLeadDecision only, at most 3.\n\nWORK RESULT:\n{steps.work.output}"
     },
     {
       "id": "plan-apply",
       "type": "script",
-      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/plan-apply.mjs", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_REPO={args.repo}", "TF_MVP_BD_BIN={args.bdBin}", "TF_MVP_TASK_ID={args.taskId}", "TF_MVP_PLANNING_JSON={steps.plan.output}"],
+      "run": ["node", "D:/Documents/Repositories/pi-agile/docs/plans/taskflow-pilot/mvp/scripts/phase-runner.mjs", "plan-apply", "TF_MVP_WORKTREE_CWD={args.worktreeCwd}", "TF_MVP_REPO={args.repo}", "TF_MVP_BD_BIN={args.bdBin}", "TF_MVP_TASK_ID={args.taskId}", "TF_MVP_QUEUE_PARENT={args.queueParent}", "TF_MVP_QUEUE_PATH={args.queuePath}", "TF_MVP_FLOW_PROJECT_ROOT={args.flowProjectRoot}", "TF_MVP_PLANNING_JSON={steps.plan.output}"],
       "cwd": "D:/tmp/tf-leaf-mvp-worktrees/8en",
       "timeout": 300000,
       "dependsOn": ["plan"]

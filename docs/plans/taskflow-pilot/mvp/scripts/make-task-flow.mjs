@@ -57,7 +57,12 @@ const reuseReviewerSession = String(opts.reuseReviewerSession || 'false');
 if (!['true', 'false'].includes(reuseReviewerSession)) fail('--reuseReviewerSession must be true or false');
 const workerModel = opts.workerModel || 'openai-codex/gpt-6-luna';
 const reviewerModel = opts.reviewerModel || 'opencode-go/hy4-flash-free';
-for (const [label, value] of [['--workerModel', workerModel], ['--reviewerModel', reviewerModel]]) {
+const plannerModel = opts.plannerModel || workerModel;
+const flowName = opts.flowName || `tf-leaf-mvp-${taskId}`;
+if (!/^(?!\.\.?$)[A-Za-z0-9._-]+$/.test(flowName)) fail('--flowName contains unsafe characters');
+const queueParent = opts.queueParent || '';
+const queuePath = opts.queuePath || '';
+for (const [label, value] of [['--workerModel', workerModel], ['--reviewerModel', reviewerModel], ['--plannerModel', plannerModel]]) {
   if (!/^[^\s]+$/.test(value)) fail(`${label} must be a non-empty model id without whitespace`);
 }
 const out = slash(path.resolve(opts.out || path.join(repo, '.pi', 'taskflows', `tf-leaf-mvp-${taskId}.json`)));
@@ -141,6 +146,7 @@ function sharedDefaults(args) {
 function applyModels(flow) {
   for (const phase of flow.phases) {
     if (phase.id === 'work' || phase.id === 'fix' || phase.id === 'final-fix') phase.model = workerModel;
+    if (phase.id === 'plan') phase.model = plannerModel;
     if (/^review/.test(phase.id)) phase.model = reviewerModel;
   }
 }
@@ -178,7 +184,7 @@ if (repo !== slash(flowProjectRoot)) {
 }
 
 const mainFlow = loadTemplate('flow.json');
-mainFlow.name = `tf-leaf-mvp-${taskId}`;
+mainFlow.name = flowName;
 for (const phase of mainFlow.phases) {
   if (phase.id === 'final-cycles') phase.use = loopName;
 }
@@ -199,12 +205,15 @@ Object.assign(mainFlow.args, {
   bdBin: { ...mainFlow.args.bdBin, default: bdBin },
   mergeLock: { ...mainFlow.args.mergeLock, default: mergeLock },
   flowProjectRoot: { ...mainFlow.args.flowProjectRoot, default: slash(flowProjectRoot) },
+  plannerModel: { ...mainFlow.args.plannerModel, default: plannerModel },
+  queueParent: { ...mainFlow.args.queueParent, default: queueParent },
+  queuePath: { ...mainFlow.args.queuePath, default: queuePath },
 });
 applyModels(mainFlow);
 fs.mkdirSync(path.dirname(out), { recursive: true });
 const mainJson = `${JSON.stringify(mainFlow, null, 2)}\n`;
 fs.writeFileSync(out, mainJson, 'utf8');
-const hostMainPath = slash(path.join(tasksDir, `tf-leaf-mvp-${taskId}.json`));
+const hostMainPath = slash(path.join(tasksDir, `${flowName}.json`));
 if (out !== hostMainPath) fs.writeFileSync(hostMainPath, mainJson, 'utf8');
 
 console.log(JSON.stringify({
@@ -212,5 +221,5 @@ console.log(JSON.stringify({
   cycleFlow: slash(path.join(tasksDir, `${cycleName}.json`)),
   loopFlow: slash(path.join(tasksDir, `${loopName}.json`)),
   taskId, repo, worktree, branch, filesHint, acceptanceFile, criteriaFile,
-  bdBin, mergeLock, testCommand, maxCycles, repeatMax: loopFlow.phases[0].repeat.max, reuseReviewerSession, workerModel, reviewerModel,
+  bdBin, mergeLock, testCommand, maxCycles, repeatMax: loopFlow.phases[0].repeat.max, reuseReviewerSession, workerModel, reviewerModel, plannerModel, flowName, queueParent, queuePath,
 }, null, 2));

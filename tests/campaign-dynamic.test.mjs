@@ -5,16 +5,103 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-const campaign = path.resolve('docs/plans/taskflow-pilot/campaign');
-test('queue helpers initialize, allocate, and report dynamic slots', () => {
+const repoRoot = path.resolve('.');
+const campaignScript = path.join(repoRoot, 'docs', 'plans', 'taskflow-pilot', 'campaign', 'make-campaign-flow.mjs');
+
+function fixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'campaign-dynamic-'));
-  const queue = path.join(dir, 'queue.json');
-  const run = (script, ...args) => spawnSync(process.execPath, [path.join(campaign, script), ...args], { encoding: 'utf8' });
-  let result = run('queue-init.mjs', queue, 'a', 'b');
-  assert.equal(result.status, 0, result.stderr);
-  result = run('prepare-slot.mjs', queue);
-  assert.deepEqual(JSON.parse(result.stdout), { ready: true, taskId: 'a' });
-  result = run('dynamic-report.mjs', queue);
-  assert.deepEqual(JSON.parse(result.stdout), { pending: ['b'], active: ['a'], completed: [] });
-  fs.rmSync(dir, { recursive: true, force: true });
+  const pilot = path.join(dir, 'docs', 'plans', 'taskflow-pilot');
+  fs.mkdirSync(pilot, { recursive: true });
+  for (const part of ['campaign', 'mvp']) {
+    fs.cpSync(path.join(repoRoot, 'docs', 'plans', 'taskflow-pilot', part), path.join(pilot, part), { recursive: true });
+  }
+  const shim = path.join(dir, 'bd.mjs');
+  fs.writeFileSync(shim, [
+    'const issues = {',
+    '  "D-1": { id: "D-1", status: "open", title: "One", description: "Files: a.mjs Acceptance: works", dependencies: [{ id: "E-1", type: "parent-child" }] },',
+    '  "D-2": { id: "D-2", status: "open", title: "Two", description: "Files: b.mjs Acceptance: works", dependencies: [{ id: "E-1", type: "parent-child" }] },',
+    '};',
+    'const args = process.argv.slice(2);',
+    'if (args[0] === "ready") { console.log(JSON.stringify(Object.values(issues))); process.exit(0); }',
+    'if (args[0] === "show") { console.log(JSON.stringify(issues[args[1]])); process.exit(0); }',
+    'if (args[0] === "label") { process.exit(0); }',
+    'process.exit(1);',
+    '',
+  ].join('\n'));
+  return { dir, bdBin: `node ${shim.replaceAll('\\', '/')}` };
+}
+
+test('dynamic mode emits a static slot chain and a config artifact', () => {
+  const fx = fixture();
+  try {
+    const out = path.join(fx.dir, 'dynamic.json');
+    const result = spawnSync(process.execPath, [campaignScript,
+      '--repo', fx.dir, '--bdBin', fx.bdBin, '--tasks', 'D-1,D-2',
+      '--mode', 'dynamic', '--slots', '2', '--concurrency', '1', '--name', 'dyn', '--out', out,
+    ], { cwd: fx.dir, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    const flow = JSON.parse(fs.readFileSync(out, 'utf8'));
+    assert.equal(flow.concurrency, 1);
+    assert.equal(flow.mode, undefined);
+    assert.deepEqual(flow.phases.map((phase) => phase.id), [
+      'queue-init',
+      'prepare-slot-0', 'leaf-slot-0',
+      'prepare-slot-1', 'leaf-slot-1',
+      'campaign-report',
+    ]);
+    assert.equal(flow.phases[2].use, 'tf-dynamic-slot-dyn-0');
+    assert.equal(flow.phases[4].use, 'tf-dynamic-slot-dyn-1');
+    assert.ok(flow.args.configPath.default.endsWith('config.json'));
+    const config = JSON.parse(fs.readFileSync(flow.args.configPath.default, 'utf8'));
+    assert.equal(config.queueParent, 'E-1');
+    assert.deepEqual(config.initialTasks, ['D-1', 'D-2']);
+  } finally { fs.rmSync(fx.dir, { recursive: true, force: true }); }
+});
+
+test('queue helpers allocate each queued task once and idle remaining slots', () => {
+  const fx = fixture();
+  try {
+    const out = path.join(fx.dir, 'dynamic.json');
+    const generated = spawnSync(process.execPath, [campaignScript,
+      '--repo', fx.dir, '--bdBin', fx.bdBin, '--tasks', 'D-1,D-2',
+      '--mode', 'dynamic', '--slots', '3', '--concurrency', '1', '--name', 'dynq', '--out', out,
+    ], { cwd: fx.dir, encoding: 'utf8' });
+    assert.equal(generated.status, 0, generated.stderr);
+    const flow = JSON.parse(fs.readFileSync(out, 'utf8'));
+    const configPath = flow.args.configPath.default;
+    const run = (script, ...args) => spawnSync(process.execPath, [path.join(repoRoot, 'docs', 'plans', 'taskflow-pilot', 'campaign', script), configPath, ...args], { encoding: 'utf8' });
+    assert.equal(run('queue-init.mjs').status, 0);
+    assert.deepEqual(JSON.parse(run('prepare-slot.mjs', '0').stdout).taskId, 'D-1');
+    assert.deepEqual(JSON.parse(run('prepare-slot.mjs', '1').stdout).taskId, 'D-2');
+    assert.equal(JSON.parse(run('prepare-slot.mjs', '2').stdout).ready, false);
+    const q = JSON.parse(fs.readFileSync(path.join(fx.dir, '.pi', 'taskflows', 'queue-dynq.json'), 'utf8'));
+    assert.deepEqual(q.active, ['D-1', 'D-2']);
+    assert.deepEqual(q.pending, []);
+  } finally { fs.rmSync(fx.dir, { recursive: true, force: true }); }
+});
+
+test('lead decisions release parked tasks before slot selection', () => {
+  const fx = fixture();
+  try {
+    const out = path.join(fx.dir, 'dynamic.json');
+    const generated = spawnSync(process.execPath, [campaignScript,
+      '--repo', fx.dir, '--bdBin', fx.bdBin, '--tasks', 'D-1',
+      '--mode', 'dynamic', '--slots', '1', '--concurrency', '1', '--name', 'dynlead', '--out', out,
+    ], { cwd: fx.dir, encoding: 'utf8' });
+    assert.equal(generated.status, 0, generated.stderr);
+    const flow = JSON.parse(fs.readFileSync(out, 'utf8'));
+    const config = JSON.parse(fs.readFileSync(flow.args.configPath.default, 'utf8'));
+    fs.writeFileSync(path.join(config.decisionDir, 'D-2.json'), JSON.stringify({
+      taskId: 'D-2', instructions: 'proceed with b.mjs',
+    }));
+    const qPath = path.join(fx.dir, '.pi', 'taskflows', 'queue-dynlead.json');
+    fs.writeFileSync(qPath, JSON.stringify({ version: 2, pending: [], active: [], completed: [] }));
+    const prepare = spawnSync(process.execPath, [
+      path.join(repoRoot, 'docs', 'plans', 'taskflow-pilot', 'campaign', 'prepare-slot.mjs'),
+      flow.args.configPath.default, '0',
+    ], { encoding: 'utf8' });
+    assert.equal(prepare.status, 0, prepare.stderr);
+    assert.equal(JSON.parse(prepare.stdout).taskId, 'D-2');
+    assert.ok(fs.existsSync(path.join(config.decisionDir, 'D-2.json.applied')));
+  } finally { fs.rmSync(fx.dir, { recursive: true, force: true }); }
 });

@@ -2,8 +2,9 @@
 /**
  * Build a campaign flow from bd leaves by reusing the generated one-task MVP.
  *
- * No new execution engine: every leaf is a saved tf-leaf-mvp flow, and the
- * campaign is a Taskflow DAG with one `flow` phase per leaf.
+ * static mode: one saved leaf flow per initial leaf.
+ * dynamic mode: a static chain of slots; each slot regenerates its saved flow
+ * from the current bd queue, so leaves created during the run can be executed.
  */
 
 import fs from 'node:fs';
@@ -34,24 +35,33 @@ const campaignDir = here;
 const pilotDir = path.resolve(campaignDir, '..');
 const leafGenerator = slash(path.join(pilotDir, 'mvp', 'scripts', 'make-task-flow.mjs'));
 const reportScript = slash(path.join(campaignDir, 'report.mjs'));
+const dynamicReportScript = slash(path.join(campaignDir, 'dynamic-report.mjs'));
+const queueInitScript = slash(path.join(campaignDir, 'queue-init.mjs'));
+const prepareSlotScript = slash(path.join(campaignDir, 'prepare-slot.mjs'));
 const flowProjectRoot = slash(path.resolve(campaignDir, '../../../..'));
 
 const opts = parseArgs(process.argv.slice(2));
 const repo = slash(path.resolve(opts.repo || process.cwd()));
 const bdBin = opts.bdBin || (process.platform === 'win32' ? 'C:/tools/bd.exe' : 'bd');
-const worktreeRoot = slash(path.resolve(opts.worktreeRoot || path.join(repo, '.taskflow-mvp', 'worktrees')));
+const worktreeRoot = slash(path.resolve(opts.worktreeRoot || path.join(path.parse(repo).root, 'tmp', 'tf-campaign-worktrees')));
 const mode = opts.mode || 'static';
 if (!['static', 'dynamic'].includes(mode)) fail('--mode must be static or dynamic');
 const branchPrefix = opts.branchPrefix || 'tf-campaign';
 const testCommand = opts.testCommand || 'npm test';
 const maxCycles = Number(opts.maxCycles || 3);
 if (!Number.isInteger(maxCycles) || maxCycles < 1 || maxCycles > 20) fail('--maxCycles must be an integer from 1 to 20');
+const slots = Number(opts.slots || 10);
+if (!Number.isInteger(slots) || slots < 1 || slots > 50) fail('--slots must be an integer from 1 to 50');
 const reuseReviewerSession = String(opts.reuseReviewerSession || 'false');
 if (!['true', 'false'].includes(reuseReviewerSession)) fail('--reuseReviewerSession must be true or false');
 const reviewerModel = opts.reviewerModel || 'opencode-go/hy4-flash-free';
-if (!/^[^\s]+$/.test(reviewerModel)) fail('--reviewerModel must be a non-empty model id without whitespace');
+const plannerModel = opts.plannerModel || 'openai-codex/gpt-6-luna';
+for (const [label, value] of [['--reviewerModel', reviewerModel], ['--plannerModel', plannerModel]]) {
+  if (!/^[^\s]+$/.test(value)) fail(`${label} must be a non-empty model id without whitespace`);
+}
 const concurrency = Number(opts.concurrency || 3);
 if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4) fail('--concurrency must be an integer from 1 to 4');
+if (mode === 'dynamic' && concurrency !== 1) fail('--concurrency must be 1 in dynamic mode');
 const repoKey = createHash('sha256').update(repo).digest('hex').slice(0, 12);
 const mergeLock = slash(path.resolve(opts.mergeLock || path.join(os.tmpdir(), `tf-leaf-mvp-merge-${repoKey}.lock`)));
 const name = opts.name || 'tf-campaign-mvp';
@@ -100,79 +110,138 @@ for (const row of tasks) {
   if (!eligible(row)) fail(`task ${row?.id || '?'} is not an eligible code leaf`);
 }
 if (!tasks.length) fail('no eligible bd leaves found');
+const taskIds = tasks.map((row) => String(row.id));
+for (const taskId of taskIds) {
+  if (!/^(?!\.\.?$)[A-Za-z0-9._-]+$/.test(taskId)) fail(`unsafe task id: ${taskId}`);
+}
+
+let queueParent = opts.queueParent || opts.epic || '';
+if (!queueParent && tasks[0]?.dependencies) {
+  const parent = tasks[0].dependencies.find((dep) => dep?.type === 'parent-child' || dep?.dependency_type === 'parent-child');
+  if (parent?.id) queueParent = String(parent.id);
+}
 
 fs.mkdirSync(path.join(path.parse(out).dir), { recursive: true });
 const phases = [];
-for (const row of tasks) {
-  const taskId = String(row.id);
-  if (!/^(?!\.\.?$)[A-Za-z0-9._-]+$/.test(taskId)) fail(`unsafe task id: ${taskId}`);
-  const leafFlowName = `tf-leaf-mvp-${taskId}`;
-  const worktree = slash(path.join(worktreeRoot, taskId));
-  const args = [
-    '--taskId', taskId,
-    '--repo', repo,
-    '--worktree', worktree,
-    '--branch', `${branchPrefix}/${taskId}`,
-    '--bdBin', bdBin,
-    '--mergeLock', mergeLock,
-    '--testCommand', testCommand,
-    '--maxCycles', String(maxCycles),
-    '--reuseReviewerSession', reuseReviewerSession,
-    '--reviewerModel', reviewerModel,
-    '--out', slash(path.join(repo, '.pi', 'taskflows', `${leafFlowName}.json`)),
-  ];
-  const generated = spawnSync(process.execPath, [leafGenerator, ...args], { cwd: repo, encoding: 'utf8' });
-  if (generated.error || generated.status !== 0) fail(`leaf generator failed for ${taskId}: ${(generated.stderr || generated.error?.message || '').trim()}`);
+const flowArgs = {
+  taskIds: {
+    type: 'string',
+    default: taskIds.join(','),
+    description: 'CSV of initial campaign task ids',
+  },
+};
+
+if (mode === 'static') {
+  for (const taskId of taskIds) {
+    const leafFlowName = `tf-leaf-mvp-${taskId}`;
+    const worktree = slash(path.join(worktreeRoot, taskId));
+    const genArgs = [
+      '--taskId', taskId,
+      '--repo', repo,
+      '--worktree', worktree,
+      '--branch', `${branchPrefix}/${taskId}`,
+      '--bdBin', bdBin,
+      '--mergeLock', mergeLock,
+      '--testCommand', testCommand,
+      '--maxCycles', String(maxCycles),
+      '--reuseReviewerSession', reuseReviewerSession,
+      '--reviewerModel', reviewerModel,
+      '--plannerModel', plannerModel,
+    ];
+    if (queueParent) genArgs.push('--queueParent', queueParent);
+    genArgs.push('--out', slash(path.join(repo, '.pi', 'taskflows', `${leafFlowName}.json`)));
+    const generated = spawnSync(process.execPath, [leafGenerator, ...genArgs], { cwd: repo, encoding: 'utf8' });
+    if (generated.error || generated.status !== 0) fail(`leaf generator failed for ${taskId}: ${(generated.stderr || generated.error?.message || '').trim()}`);
+    phases.push({
+      id: `leaf-${taskId}`,
+      type: 'flow',
+      use: leafFlowName,
+      with: { repo, worktreeCwd: worktree },
+      output: 'json',
+    });
+  }
   phases.push({
-    id: `leaf-${taskId}`,
-    type: 'flow',
-    use: leafFlowName,
-    with: { repo, worktreeCwd: worktree },
-    output: 'json',
+    id: 'campaign-report',
+    type: 'script',
+    run: ['node', reportScript, repo, '{args.taskIds}', name, flowProjectRoot],
+    timeout: 60000,
+    dependsOn: phases.map((phase) => phase.id),
+    final: true,
+  });
+} else {
+  const slotArtifactDir = slash(path.join(repo, '.pi', 'taskflows', `slots-${name}`));
+  const queuePath = slash(path.join(repo, '.pi', 'taskflows', `queue-${name}.json`));
+  const decisionDir = slash(path.join(flowProjectRoot, '.pi', 'taskflows', 'lead-decisions'));
+  const configPath = slash(path.join(slotArtifactDir, 'config.json'));
+  const slotsNames = Array.from({ length: slots }, (_, index) => `tf-dynamic-slot-${name}-${index}`);
+  const config = {
+    name, mode, repo, bdBin, worktreeRoot, branchPrefix, testCommand, maxCycles,
+    slots: slotsNames, slotsCount: slots, reuseReviewerSession, reviewerModel,
+    plannerModel, mergeLock, queueParent, queuePath, decisionDir, flowProjectRoot,
+    leafGenerator, queueInitScript, prepareSlotScript, dynamicReportScript,
+    slotArtifactDir, initialTasks: taskIds,
+  };
+  fs.mkdirSync(slotArtifactDir, { recursive: true });
+  fs.mkdirSync(decisionDir, { recursive: true });
+  fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+  for (const slotName of slotsNames) {
+    const noopFlow = {
+      name: slotName,
+      phases: [{
+        id: 'idle',
+        type: 'script',
+        run: ['node', '-e', 'console.log(JSON.stringify({status:"idle"}))'],
+        output: 'json',
+        final: true,
+      }],
+    };
+    fs.writeFileSync(slash(path.join(flowProjectRoot, '.pi', 'taskflows', `${slotName}.json`)), `${JSON.stringify(noopFlow, null, 2)}\n`, 'utf8');
+  }
+  flowArgs.configPath = { type: 'string', default: configPath, description: 'dynamic campaign config' };
+  phases.push({
+    id: 'queue-init',
+    type: 'script',
+    run: ['node', queueInitScript, configPath],
+    timeout: 60000,
+  });
+  let previous = 'queue-init';
+  for (let index = 0; index < slots; index += 1) {
+    const prepareId = `prepare-slot-${index}`;
+    const leafId = `leaf-slot-${index}`;
+    phases.push({
+      id: prepareId,
+      type: 'script',
+      run: ['node', prepareSlotScript, configPath, String(index)],
+      timeout: 300000,
+      dependsOn: [previous],
+    });
+    phases.push({
+      id: leafId,
+      type: 'flow',
+      use: slotsNames[index],
+      with: { repo, worktreeCwd: slash(path.join(worktreeRoot, `slot-${index}`)) },
+      output: 'json',
+      dependsOn: [prepareId],
+    });
+    previous = leafId;
+  }
+  phases.push({
+    id: 'campaign-report',
+    type: 'script',
+    run: ['node', dynamicReportScript, configPath],
+    timeout: 60000,
+    dependsOn: [previous],
+    final: true,
   });
 }
 
-if (mode === 'dynamic') {
-  const queuePath = slash(path.join(repo, '.taskflow-mvp', `queue-${name}.json`));
-  const queueInit = slash(path.join(campaignDir, 'queue-init.mjs'));
-  const prepareSlot = slash(path.join(campaignDir, 'prepare-slot.mjs'));
-  const dynamicReport = slash(path.join(campaignDir, 'dynamic-report.mjs'));
-  phases.unshift({ id: 'queue-init', type: 'script', run: ['node', queueInit, queuePath, ...tasks.map((row) => String(row.id))], timeout: 60000 });
-  for (let index = 0; index < tasks.length; index += 1) {
-    const leafId = `leaf-${tasks[index].id}`;
-    const prepareId = `prepare-slot-${index}`;
-    const phase = phases.find((entry) => entry.id === leafId);
-    phase.with.queuePath = queuePath;
-    phase.with.slot = index;
-    phase.dependsOn = [prepareId];
-    phases.push({ id: prepareId, type: 'script', run: ['node', prepareSlot, queuePath], timeout: 60000, dependsOn: ['queue-init'] });
-  }
-  phases.push({ id: 'dynamic-report', type: 'script', run: ['node', dynamicReport, queuePath], timeout: 60000, dependsOn: phases.filter((phase) => phase.type === 'flow').map((phase) => phase.id) });
-}
-const leafIds = phases.filter((phase) => phase.type === 'flow').map((phase) => phase.id);
-phases.push({
-  id: 'campaign-report',
-  type: 'script',
-  run: ['node', reportScript, repo, '{args.taskIds}', name, flowProjectRoot],
-  timeout: 60000,
-  dependsOn: leafIds,
-  final: true,
-});
-
-const flow = {
+const campaignJson = `${JSON.stringify({
   name,
-  concurrency,
+  concurrency: mode === 'dynamic' ? 1 : concurrency,
   strictInterpolation: false,
-  args: {
-    taskIds: {
-      type: 'string',
-      default: tasks.map((row) => String(row.id)).join(','),
-      description: 'CSV of campaign task ids',
-    },
-  },
+  args: flowArgs,
   phases,
-};
-const campaignJson = `${JSON.stringify(flow, null, 2)}\n`;
+}, null, 2)}\n`;
 fs.writeFileSync(out, campaignJson, 'utf8');
 const hostCampaignPath = slash(path.join(flowProjectRoot, '.pi', 'taskflows', `${name}.json`));
 if (out !== hostCampaignPath) {
@@ -182,11 +251,15 @@ if (out !== hostCampaignPath) {
 console.log(JSON.stringify({
   flow: out,
   name,
-  tasks: tasks.map((row) => String(row.id)),
-  concurrency,
+  mode,
+  tasks: taskIds,
+  slots: mode === 'dynamic' ? slots : null,
+  concurrency: mode === 'dynamic' ? 1 : concurrency,
   maxCycles,
   reuseReviewerSession,
   reviewerModel,
+  plannerModel,
+  queueParent,
   flowProjectRoot,
   worktreeRoot,
   mergeLock,
