@@ -73,6 +73,7 @@ try {
     merged: status === 'merged',
     bdClosed: Boolean(artifact(join(dir, 'bd-owner.json'))?.closed) && mergeVerified,
     blockers,
+    planning: artifact(join(dir, 'planning-result.json')),
     needsAttention: status === 'merged' ? null : (needsAttentionFromCycle || blockers.join('; ') || worker?.error || String(gates || recheck || 'Taskflow did not complete successfully')),
     freshTokens: Number(process.env.TF_MVP_FRESH_TOKENS || usage.input + usage.output),
     cacheReadTokens: Number(process.env.TF_MVP_CACHE_READ_TOKENS || usage.cacheRead)
