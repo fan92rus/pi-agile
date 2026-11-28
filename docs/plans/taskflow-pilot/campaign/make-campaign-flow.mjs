@@ -39,7 +39,9 @@ const flowProjectRoot = slash(path.resolve(campaignDir, '../../../..'));
 const opts = parseArgs(process.argv.slice(2));
 const repo = slash(path.resolve(opts.repo || process.cwd()));
 const bdBin = opts.bdBin || (process.platform === 'win32' ? 'C:/tools/bd.exe' : 'bd');
-const worktreeRoot = slash(path.resolve(opts.worktreeRoot || path.join(path.parse(repo).root, 'tmp', 'tf-campaign-worktrees')));
+const worktreeRoot = slash(path.resolve(opts.worktreeRoot || path.join(repo, '.taskflow-mvp', 'worktrees')));
+const mode = opts.mode || 'static';
+if (!['static', 'dynamic'].includes(mode)) fail('--mode must be static or dynamic');
 const branchPrefix = opts.branchPrefix || 'tf-campaign';
 const testCommand = opts.testCommand || 'npm test';
 const maxCycles = Number(opts.maxCycles || 3);
@@ -130,7 +132,24 @@ for (const row of tasks) {
   });
 }
 
-const leafIds = phases.map((phase) => phase.id);
+if (mode === 'dynamic') {
+  const queuePath = slash(path.join(repo, '.taskflow-mvp', `queue-${name}.json`));
+  const queueInit = slash(path.join(campaignDir, 'queue-init.mjs'));
+  const prepareSlot = slash(path.join(campaignDir, 'prepare-slot.mjs'));
+  const dynamicReport = slash(path.join(campaignDir, 'dynamic-report.mjs'));
+  phases.unshift({ id: 'queue-init', type: 'script', run: ['node', queueInit, queuePath, ...tasks.map((row) => String(row.id))], timeout: 60000 });
+  for (let index = 0; index < tasks.length; index += 1) {
+    const leafId = `leaf-${tasks[index].id}`;
+    const prepareId = `prepare-slot-${index}`;
+    const phase = phases.find((entry) => entry.id === leafId);
+    phase.with.queuePath = queuePath;
+    phase.with.slot = index;
+    phase.dependsOn = [prepareId];
+    phases.push({ id: prepareId, type: 'script', run: ['node', prepareSlot, queuePath], timeout: 60000, dependsOn: ['queue-init'] });
+  }
+  phases.push({ id: 'dynamic-report', type: 'script', run: ['node', dynamicReport, queuePath], timeout: 60000, dependsOn: phases.filter((phase) => phase.type === 'flow').map((phase) => phase.id) });
+}
+const leafIds = phases.filter((phase) => phase.type === 'flow').map((phase) => phase.id);
 phases.push({
   id: 'campaign-report',
   type: 'script',
